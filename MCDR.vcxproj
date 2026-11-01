@@ -85,7 +85,7 @@
            SDKs nor advertises them to the JVM side. -->
       <PreprocessorDefinitions Condition="'$(Platform)'=='x64'">MCDR_HAS_DLSS=1;MCDR_HAS_NRD=1;MCDR_HAS_XESS=1;MCDR_HAS_FFX=1;MCDR_HAS_NRC=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <!-- external\ manages the five upscaler/denoiser/cache SDKs. They are vendored
-           under MCDR\external\ (see external\README.md) rather than fetched per
+           under MCDR\external\ (see docs\misc\build-and-modules.md) rather than fetched per
            build, because none of them is available from a package manager:
              external\dlss       — DLSS / NGX SDK 310.9.1  (nvsdk_ngx*.h +
                                    prebuilt nvsdk_ngx_{s,d}.lib; x64 ONLY)
@@ -218,6 +218,7 @@
     <ClInclude Include="include\mcdr_hdr_state.h" />
     <ClInclude Include="include\mcdr_rtx_support.h" />
     <ClInclude Include="include\mcdr_rt_state.h" />
+    <ClInclude Include="include\mcdr_rt_tracker.h" />
     <ClInclude Include="include\mcdr_smaa_luts.h" />
     <ClInclude Include="include\mcdr_surface_opts_state.h" />
     <ClInclude Include="include\mcdr_window_host.h" />
@@ -225,6 +226,7 @@
     <!-- Shared prelude for the module interface units below. Every .cppm #includes
          this in its global module fragment (NOMINMAX + windows/d3d12/dxgi/dcomp +
          STL + the DBG_LOG_DEBUG macro). -->
+    <ClInclude Include="resources\resource.h" />
   </ItemGroup>
   <ItemGroup>
     <!-- Module interface units. A .cppm under /std:c++latest is picked up as
@@ -245,9 +247,9 @@
     <ClCompile Include="src\module\advanced\d3d12_mesh.cppm" />
   </ItemGroup>
   <ItemGroup>
-    <!-- C ABI 适配单元，按**功能**命名与排列（不再按移植阶段 pX）。单元之间的
+    <!-- C ABI 适配单元，按功能命名与排列。单元之间的
          共同前言（prelude / mcdr_abi.h / 模块 import）在各文件顶部重复，模块
-         import 本身幂等，重复写在 /W4 下不产生任何告警。顺序：公共设施 → ABI 自检
+         import 本身幂等，重复写在 WarningLevel=Level3 下不产生任何告警。顺序：公共设施 → ABI 自检
          → 设备/资源 → 命令录制 → 图形管线 → 绘制命令 → mesh 管线 → DXGI 表面 →
          异步渲染基础设施。 -->
     <ClCompile Include="src\c_abi\abi_common.cpp" />
@@ -259,8 +261,7 @@
     <ClCompile Include="src\c_abi\abi_mesh.cpp" />
     <ClCompile Include="src\c_abi\abi_surface.cpp" />
     <ClCompile Include="src\c_abi\abi_async.cpp" />
-    <!-- P271：超分抽象层的 C ABI 外壳（8 个 mcdr_dx12Sr* 入口）。纯追加单元，
-         不碰老路径；P272 之后厂商逻辑才会从这一层下沉到 Provider。 -->
+    <!-- 超分抽象层的 C ABI 外壳（8 个 mcdr_dx12Sr* 入口）。厂商逻辑经 Provider 下沉到这一层。 -->
     <ClCompile Include="src\c_abi\abi_sr.cpp" />
     <ClCompile Include="src\c_abi\abi_framegen.cpp" />
     <!-- DLL 入口点：普通 TU（不属于任何命名模块），见文件内注释 -->
@@ -268,7 +269,7 @@
     <ClCompile Include="src\core\d3d12_descriptor_allocator.cpp" />
     <ClCompile Include="src\core\d3d12_device.cpp" />
     <ClCompile Include="src\core\d3d12_surface.cpp" />
-    <!-- P272：超分 Provider 接口层（能力表 + DLSS provider + 注册表）。与 d3d12_device.cpp
+    <!-- 超分 Provider 接口层（能力表 + DLSS provider + 注册表）。与 d3d12_device.cpp
          同属模块 mcdr.d3d12.device 的实现单元，所以不需要额外设置。 -->
     <ClCompile Include="src\advanced\d3d12_sr.cpp" />
     <ClCompile Include="src\advanced\d3d12_framegen.cpp" />
@@ -276,18 +277,20 @@
     <ClCompile Include="src\advanced\d3d12_xess.cpp" />
     <ClCompile Include="src\advanced\d3d12_xessfg.cpp" />
     <ClCompile Include="src\advanced\d3d12_fsffg.cpp" />
-    <!-- P267：SeamlessWindowHost（呈现子窗口 + GL 隔离），普通 TU -->
+    <!-- SeamlessWindowHost（呈现子窗口 + GL 隔离），普通 TU -->
     <ClCompile Include="src\core\d3d12_window_host.cpp" />
-    <!-- P197：HDR 状态单元。普通 TU（surface 是模块单元、DLSS 是普通 TU，
+    <!-- HDR 状态单元。普通 TU（surface 是模块单元、DLSS 是普通 TU，
          模块 purview 里的定义无法被普通 TU 链接，故状态单拎出来）。 -->
     <ClCompile Include="src\advanced\d3d12_hdr_state.cpp" />
     <ClCompile Include="src\advanced\d3d12_rt_state.cpp" />
-    <!-- P251：交换链建链选项（allowTearing / presentChild）状态单元，同为普通 TU。 -->
+    <!-- 交换链建链选项（allowTearing / presentChild）状态单元，同为普通 TU。 -->
     <ClCompile Include="src\core\d3d12_surface_opts_state.cpp" />
     <ClCompile Include="src\core\d3d12_async_descriptor.cpp" />
     <ClCompile Include="src\core\d3d12_async_fence.cpp" />
     <ClCompile Include="src\advanced\d3d12_rtx_probe.cpp" />
-    <!-- P108：DLSS 超分实现单元。普通 TU（与 rtx_probe 同理）：只有它 #include
+    <!-- NRD 实例清单（S4 4-c）：普通 TU，只读 NRD 自己算出来的 InstanceDesc，不碰设备和模块。 -->
+    <ClCompile Include="src\advanced\d3d12_nrd.cpp" />
+    <!-- DLSS 超分实现单元。普通 TU（与 rtx_probe 同理）：只有它 #include
          nvsdk_ngx*.h，设备模块永远不碰 NGX 类型，许可面因此收在一个文件里。 -->
     <ClCompile Include="src\advanced\d3d12_dlss.cpp" />
     <ClCompile Include="src\advanced\d3d12_mesh_base.cpp" />
@@ -301,11 +304,30 @@
     <None Include="AGENTS.MD" />
     <None Include="cpp.hint" />
     <None Include="LICENSE" />
+    <!-- 设计文档：入口 docs\overview.md -->
+    <None Include="docs\overview.md" />
+    <None Include="docs\abi\README.md" />
+    <None Include="docs\c_abi\README.md" />
+    <None Include="docs\device\README.md" />
+    <None Include="docs\surface\README.md" />
+    <None Include="docs\async\README.md" />
+    <None Include="docs\advanced\dlss.md" />
+    <None Include="docs\advanced\framegen.md" />
+    <None Include="docs\advanced\upscalers.md" />
+    <None Include="docs\advanced\rt-probe.md" />
+    <None Include="docs\advanced\mesh.md" />
+    <None Include="docs\misc\build-and-modules.md" />
+    <None Include="docs\misc\debug-and-logging.md" />
+    <None Include="resources\MCDR.APS" />
     <None Include="MCDR.slnx" />
     <None Include="README.md" />
-    <None Include="README_ZH.MD" />
+    <None Include="docs\README_ZH.MD" />
+    <None Include="scripts\sync-external.ps1" />
     <None Include="vcpkg-configuration.json" />
     <None Include="vcpkg.json" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="resources\MCDR.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

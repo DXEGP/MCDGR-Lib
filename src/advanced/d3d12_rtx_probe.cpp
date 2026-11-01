@@ -1,77 +1,46 @@
-// MCDR 超分/降噪 SDK 可用性探测实现 —— 见 include\mcdr_rtx_support.h 的设计说明。
-//
-// 这个文件是普通翻译单元（不是模块实现单元），理由和头文件一样：它被设备模块
-// 调用，而设备模块不能反过来 import 它。它自身不 import 任何 mcdr.* 模块，
-// 因此也不会形成环。
+// 超分/降噪 SDK 可用性探测实现（普通翻译单元，不是模块实现单元：设备模块要调它，设备模块不能反过来
+// import 它）。设计见 include\mcdr_rtx_support.h。
 #include <windows.h>
 #include <winver.h>  // GetFileVersionInfoW / VerQueryValueW：取 DLL 的文件版本资源
 
 #include "mcdr_rtx_support.h"
 
-// P108：NGX 运行期加载现在由 d3d12_dlss.cpp 负责（它才有设备模块注入的 dbgLog*，
-// 而逐条 LoadLibrary 取证必须写进 native 日志）。这里只声明用到的那两个入口，
-// 故意不 include mcdr_dlss_impl.h —— 探测不需要该头里的其它声明。
-// 必须是 extern "C"：普通 TU 之间只有 C 链接的名字才能对上（实现在 dlss.cpp 的
-// extern "C" 块里）。
+// NGX 运行期加载由 d3d12_dlss.cpp 负责（那边才有 dbgLog*）；这里只声明用到的入口，必须 extern "C" 才能跨普通 TU 对上。
 extern "C" {
 void* mcdr_dlss_load_runtime(void);
 const char* mcdr_dlss_runtime_path(void);
-// P108: the NVSDK_NGX_FeatureCommonInfo whose PathListInfo names the vendor directory. NGX
-// needs it to find its feature DLLs; without it the requirement query answers
-// FAIL_InvalidParameter (verified in-game and out).
+// NGX 的 FeatureCommonInfo：PathListInfo 指向厂商目录，否则 NGX 找不到特性 DLL，查询会回 FAIL_InvalidParameter。
 void* mcdr_dlss_ngx_feature_info(void);
-// P108: registers the vendor directory with the DLSS implementation, which also builds the
-// NVSDK_NGX_FeatureCommonInfo path list. MUST run before the requirement query below,
-// otherwise the query passes FeatureInfo=NULL and NGX cannot find its feature DLLs.
+// 登记厂商目录（同时建好上面的 path list）。**必须在下面的特性查询之前调用**，否则查询拿到 FeatureInfo=NULL。
 int32_t mcdr_dlss_register_vendor_dir(const char* utf8Dir, int32_t cap);
 }
 
-// JSON 一律用 vcpkg 的 nlohmann/json（vcpkg.json 已声明 nlohmann-json）。这里拼的是
-// 「字段串」（不含外侧花括号），由调用方并入更大的对象。
-// 必须放在 import std 之前：该头会 include <string>/<map> 等标准头，
-// 在 import std 之后再 include 会被 MSVC 拒绝。
+// JSON 用 vcpkg 的 nlohmann/json。这里拼的是「字段串」（不含外侧花括号），由调用方并入更大的对象。
+// 必须放在 import std 之前：该头会 include 标准头，在 import std 之后再包含会被 MSVC 拒绝。
 #include <nlohmann/json.hpp>
 
 import std;
-// ---------------------------------------------------------------------------
 // NRD：静态库，直接链进 MCDR.dll，没有运行期 DLL
-// ---------------------------------------------------------------------------
 #if defined(MCDR_HAS_NRD)
 #include "NRD.h"
 #endif
 
-// ---------------------------------------------------------------------------
 // DLSS / NGX：导入库只给入口，真正实现是运行期的 nvngx_dlss.dll
-// ---------------------------------------------------------------------------
 #if defined(MCDR_HAS_DLSS)
 #include "nvsdk_ngx.h"
 
-// 厂商建议在缺省 NVIDIA 应用 ID 时用 ProjectId + ENGINE_TYPE_CUSTOM，
-// 见 nvsdk_ngx_defs.h 中 NVSDK_NGX_Application_Identifier 的注释。
-// P108：ProjectId 用 **36 字符 GUID**（与 d3d12_dlss.cpp 的 MCDR_NGX_PROJECT_ID 逐字相同）。
-// 依据：与我们同代（310.x）的生产实现（ETS2/ATS DLAA mod，src/dlaa.cpp）就是这么写的，
-// 注释为 "any stable GUID works for unregistered apps"。两处必须一致 —— 探测与 Init 用
-// 同一个应用身份，NGX 的每次查询才归到同一个 app 上。
+// ProjectId 必须是 36 字符 GUID，且与 d3d12_dlss.cpp 的 MCDR_NGX_PROJECT_ID 逐字相同（探测与 Init 用同一个应用身份）。
 #define MCDR_NGX_PROJECT_ID "7c1f4a52-9b3e-4d68-8f21-5a6c0e2d9b74"
 #define MCDR_NGX_ENGINE_VERSION "1.0"
 
-// NGX 运行期 DLL。SDK 里同时存在 nvngx_dlss.dll（超分/帧生成）与
-// nvngx_dlssd.dll（光线重建），探测阶段只确认主运行时能加载：
-// GetFeatureRequirements 自己会去摸它需要的那些。
+// 只确认主运行时 nvngx_dlss.dll 能加载：GetFeatureRequirements 自己会去摸它需要的那些。
 #define MCDR_NGX_RUNTIME_DLL L"nvngx_dlss.dll"
 
-// NGX 在 ApplicationDataPath 下写日志/缓存，给个相对目录即可（进程工作目录）。
 #define MCDR_NGX_APPDATA L".\\ngx"
 #endif
 
-// ---------------------------------------------------------------------------
-// XeSS（Intel）：头文件只用于**取版本结构体**，不用它声明函数
-// ---------------------------------------------------------------------------
-// 故意不把 xess.h 里的 XESS_API 函数声明引进来：那些声明要配合导入库
-// （libxess.lib）才能链接，而本探测一律走 LoadLibrary + GetProcAddress，
-// 这样既不用改 AdditionalDependencies，也不会让 MCDR.dll 在缺少 libxess.dll
-// 的机器上直接加载失败。xess_version_t 自己再声明一遍（布局与上游一致，
-// 见 xess\inc\xess\xess.h:55-70：4 个 uint16_t）。
+// XeSS（Intel）：头文件只取版本结构体，不用它声明函数。一律 LoadLibrary + GetProcAddress，不改 AdditionalDependencies、
+// 缺 libxess.dll 也能加载；xess_version_t 布局照上游（4 个 uint16_t）。
 #if defined(MCDR_HAS_XESS)
 struct MCDR_XessVersion
 {
@@ -80,22 +49,15 @@ struct MCDR_XessVersion
     unsigned short patch;
     unsigned short reserved;
 };
-// xessGetVersion 是**全局**函数，不需要设备、不需要上下文，所以版本号一加载
-// DLL 就能拿到。（xessD3D12CreateContext 才需要 ID3D12Device，那属于「真能跑」
-// 那一层，本探测不做。）
+// xessGetVersion 是全局函数，不需要设备与上下文，加载 DLL 就能问版本（CreateContext 才要设备，本探测不做）。
 using mcdr_xessGetVersion_fn = int (*)(MCDR_XessVersion* pVersion);
 // xess_result_t: XESS_RESULT_SUCCESS = 0（见 xess.h 的枚举顺序）。
 #define MCDR_XESS_RESULT_SUCCESS 0
 #endif
 
-// ---------------------------------------------------------------------------
-// FidelityFX（AMD FSR）：完全没有导入库，api 就在 DLL 里
-// ---------------------------------------------------------------------------
-// 上游不发 .lib：ffx_api.h:142-166 的导出函数用 FFX_API_ENTRY = __declspec(dllexport)
-// 声明，配套的 ffx_api_loader.h:50-61 就是一份 GetProcAddress 加载器。所以这里
-// 直接照抄那 5 个入口的类型和名字（x64 上默认 __cdecl，无修饰名）。
-// 结构体声明用得到，故包含上游头；它们在 import std; 之后包含，符合本仓库
-// 既有的 vendor 头包含顺序。
+// FidelityFX（AMD FSR）：没有导入库，api 就在 DLL 里
+// 上游 ffx_api.h 用 FFX_API_ENTRY 导出、ffx_api_loader.h 就是一份 GetProcAddress 加载器，所以直接照抄
+// 那 5 个入口的类型（x64 默认 __cdecl，无修饰名）。结构体要用，故包含上游头。
 #if defined(MCDR_HAS_FFX)
 #include "ffx_api.h"
 using mcdr_ffxCreateContext_fn = PfnFfxCreateContext;
@@ -114,7 +76,6 @@ namespace
         return std::string(b);
     }
 
-    // 取本模块（MCDR.dll）所在目录，末尾带反斜杠。失败返回空串。
     std::string moduleDirectory()
     {
         wchar_t path[MAX_PATH * 2] = {};
@@ -125,18 +86,13 @@ namespace
         }
         std::wstring w(path, n);
         const std::wstring::size_type slash = w.find_last_of(L"\\/");
-        if (slash == std::wstring::npos)
-        {
-            return {};
-        }
+        if (slash == std::wstring::npos) return {};
+        
         w.resize(slash + 1);
-        // 只需要拼路径用，转成 UTF-8 交给 std::string（项目其它地方的路径都是 UTF-8）。
         const int need = ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
                                                nullptr, 0, nullptr, nullptr);
-        if (need <= 0)
-        {
-            return {};
-        }
+        if (need <= 0) return {};
+        
         std::string out(static_cast<std::size_t>(need), '\0');
         ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), out.data(), need,
                               nullptr, nullptr);
@@ -162,7 +118,6 @@ namespace
         return out;
     }
 
-    // 取已加载模块的实际路径（UTF-8）。失败返回空串。
     std::string loadedModulePath(HMODULE mod)
     {
         wchar_t path[MAX_PATH * 2] = {};
@@ -174,10 +129,7 @@ namespace
         return narrow(std::wstring(path, n));
     }
 
-    // 按「模块同目录优先、其次系统搜索路径」加载一个运行期 DLL。
-    // 顺序的理由：实机部署时厂商 DLL 与 MCDR.dll 放在一起，而进程工作目录未必
-    // 是那里；同时系统目录里的同名声（如果用户装了驱动自带版本）也应当能用。
-    // 返回已加载的模块，失败返回 nullptr。
+    // 按「模块同目录优先、其次系统搜索路径」加载运行期 DLL：部署时厂商 DLL 与 MCDR.dll 放在一起，工作目录未必是那里。
     HMODULE loadRuntimeDll(const wchar_t* dllName)
     {
         HMODULE mod = nullptr;
@@ -194,9 +146,7 @@ namespace
         return mod;
     }
 
-    // 只查文件版本资源，不加载 DLL。XeSS / FidelityFX 的版本号都可以这样白拿，
-    // 而 FidelityFX 甚至连「加载」这一步都不必做就能报出版本。
-    // 返回形如 "2.3.0.0"；拿不到返回空串。
+    // 只查文件版本资源，不加载 DLL：返回形如 "2.3.0.0"，拿不到返回空串。
     std::string fileVersionOf(const std::wstring& fullPath)
     {
         DWORD dummy = 0;
@@ -225,7 +175,6 @@ namespace
     }
 
 #if defined(MCDR_HAS_DLSS)
-    // 把 NGX 返回码翻译成人能读的短句。只列常见的那几个，其余给十六进制。
     const char* ngxResultText(NVSDK_NGX_Result r)
     {
         switch (r)
@@ -283,17 +232,8 @@ namespace
     NVSDK_NGX_FeatureDiscoveryInfo makeDiscovery(NVSDK_NGX_Feature feature)
     {
         NVSDK_NGX_FeatureDiscoveryInfo info;
-        // P108: NOT NVSDK_NGX_Version_API. The SDK header pins that to 0x0000015
-        // (NGX_VERSION_DOT 1.5.0), but the shipped runtime is 310.9.1 and gate-checks the
-        // API struct version: with 0x15 BOTH NVSDK_NGX_D3D12_Init_with_ProjectID and
-        // NVSDK_NGX_D3D12_GetFeatureRequirements answer FAIL_InvalidParameter (0xBAD00005),
-        // even with a correct adapter and a correct NVSDK_NGX_FeatureCommonInfo path list.
-        // Measured outside the game (PowerShell P/Invoke, real IDXGIAdapter + D3D12 device):
-        //   GetFeatureRequirements(adapter, FeatureInfo=path list, SDKVersion=0x16)
-        //     -> 0x00000001 Success, FeatureSupported = 0x0 (supported), MinOSVersion "10.0.0"
-        // The header documents these "Fields below were introduced in SDK version 0x0000013 /
-        // 0x0000014" markers, so newer structs exist; 0x16 is the lowest version that works
-        // with this runtime.
+        // SDKVersion 用 0x18，**不要**用头里的 NVSDK_NGX_Version_API（0x15）：运行期 310.x 拿它做门禁，
+        // 0x15 时 Init 与 GetFeatureRequirements 一律回 FAIL_InvalidParameter (0xBAD00005)。
         info.SDKVersion = static_cast<NVSDK_NGX_Version>(0x0000018);
         info.FeatureID = feature;
         info.Identifier.IdentifierType = NVSDK_NGX_Application_Identifier_Type_Project_Id;
@@ -301,18 +241,13 @@ namespace
         info.Identifier.v.ProjectDesc.EngineType = NVSDK_NGX_ENGINE_TYPE_CUSTOM;
         info.Identifier.v.ProjectDesc.EngineVersion = MCDR_NGX_ENGINE_VERSION;
         info.ApplicationDataPath = MCDR_NGX_APPDATA;
-        // P108: NGX looks for its feature DLLs in the APPLICATION folder by default, which in
-        // a Minecraft dev run is the JDK's bin\. This path list (built by d3d12_dlss.cpp from
-        // the vendor directory) is what makes the query below answer Success instead of
-        // FAIL_InvalidParameter. NULL is still valid — it just means "not known yet".
+        // NGX 默认只在应用目录（开发跑时是 JDK 的 bin\）里找特性 DLL：这张由 d3d12_dlss.cpp 按厂商目录
+        // 建好的 path list 才让下面的查询答 Success；NULL 是合法的「还不知道」。
         info.FeatureInfo = static_cast<const NVSDK_NGX_FeatureCommonInfo*>(mcdr_dlss_ngx_feature_info());
         return info;
     }
 
-    // 查一个特性。返回 true 表示受支持；false 时 why 里带上原因。
-    // 注意：不接收适配器 —— GetFeatureRequirements 要 IDXGIAdapter，而探测阶段
-    // 设备可能还没建好，所以走的是「无适配器」重载（Adapter 传 nullptr 会失败），
-    // 这里改为只查运行期 DLL 是否存在 + 该特性在 SDK 侧是否被实现。
+    // 一个特性的查询结果。不接收适配器：探测阶段设备可能还没建好，给 GetFeatureRequirements 传 nullptr 只会失败。
     struct FeatureProbe
     {
         bool ok = false;
@@ -376,9 +311,7 @@ namespace mcdr
         s += " xess=";
         if (xessRuntime)
         {
-            // 摘要里用文件版本（2.0.2.68）而不是 xessGetVersion 的四段里只有三段
-            // 的 2.0.2：前者与 FidelityFX 段的写法一致，且能分辨 libxess.dll 的
-            // 具体构建。两个数都在 jsonFragment 里，摘要只留一个。
+            // 摘要用文件版本（2.0.2.68）而不是 xessGetVersion 的 2.0.2：能分辨具体构建；两个都在 json 里。
             if (!xessFileVersion.empty())
             {
                 s += xessFileVersion;
@@ -437,8 +370,7 @@ namespace mcdr
         return s;
     }
 
-    // nlohmann 对象 -> 「字段串」：`{"a":1,"b":2}` → `"a":1,"b":2`。
-    // 空对象返回空串，调用方据此跳过逗号。
+    // nlohmann 对象 → 「字段串」：`{"a":1,"b":2}` → `"a":1,"b":2`；空对象返回空串，调用方据此跳过逗号。
     static std::string jsonFieldsOf(const nlohmann::json& obj)
     {
         std::string text = obj.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
@@ -477,7 +409,6 @@ namespace mcdr
         j["rtx_xess_file_version"] = xessFileVersion;
         j["rtx_xess_runtime_path"] = xessRuntimePath;
         j["rtx_xess_note"] = xessNote;
-        // 注意键名是 present：只代表运行时文件在，不代表硬件支持。
         j["rtx_xess_fg_present"] = xessFrameGenPresent;
         j["rtx_xess_low_latency_present"] = xessLowLatencyPresent;
 
@@ -518,9 +449,7 @@ namespace mcdr
             s.nrdVersion = v;
             s.nrdVersionDate = NRD_VERSION_DATE;
 
-            // GetLibraryDesc() 不需要设备、不需要建实例，是 NRD 唯一一个「纯查询」
-            // 入口（见 NRD.h 的注释分组）。它给出的 supportedDenoisers 就是这次
-            // 链接进来的静态库里实际编进去的降噪器。
+            // GetLibraryDesc() 不需要设备与实例（NRD 唯一的纯查询入口）：supportedDenoisers 就是实际编进静态库的那些。
             if (const nrd::LibraryDesc* d = nrd::GetLibraryDesc(); d != nullptr)
             {
                 s.nrdVersion = std::to_string(static_cast<unsigned>(d->versionMajor)) + "." +
@@ -537,7 +466,6 @@ namespace mcdr
             }
             if (s.nrdDenoisers.empty())
             {
-                // 静态库在但清单是空的：只可能是 GetLibraryDesc 失败了。
                 s.nrdVersion += " (desc unavailable)";
             }
 #else
@@ -546,26 +474,17 @@ namespace mcdr
 #endif
         }
 
-        // adapter 只在 MCDR_HAS_DLSS 时被用到（非 x64 平台没有 NGX 导入库，
-        // 整个特性查询分支会被编译掉）。不加 [[maybe_unused]] 会在 Win32 下
-        // 触发 C4100，而本项目 /WX，告警即失败。
+        // 非 x64 平台整个特性查询分支会被编译掉，adapter 就没人用；不加 [[maybe_unused]] 会触发 C4100，而 /WX。
         void probeDlss(RtxSupport& s, [[maybe_unused]] IDXGIAdapter* adapter)
         {
             s.dlssProbed = true;
 #if defined(MCDR_HAS_DLSS)
-            // 第一步：运行期 DLL 在不在。NGX 的导入库只是入口，没有这个 DLL
-            // 一切特性都不可能可用，所以先把它探清楚，后面的失败原因才不会被
-            // 误读成「显卡不支持」。
-            // P108：加载动作**搬到 d3d12_dlss.cpp** 了（mcdr_dlss_load_runtime）。原因是
-            // 探测是普通 TU，拿不到设备模块的 dbgLog*，而「运行期没找到」正是最需要逐条
-            // 取证的那类失败：现在会按 裸名(含已拓宽的搜索路径) / JVM 给的厂商目录 /
-            // MCDR.dll 同目录 / cwd 依次尝试，每次失败都带自己的 GetLastError 打进 P108 行。
+            // 第一步：运行期 DLL 在不在。加载与逐条取证在 d3d12_dlss.cpp（探测是普通 TU，拿不到 dbgLog*）；
+            // 可执行文件只是入口，缺了 DLL 一切特性都不可用，失败原因绝不能读成「显卡不支持」。
             HMODULE mod = reinterpret_cast<HMODULE>(mcdr_dlss_load_runtime());
             if (mod == nullptr)
             {
-                // 兜底：实现侧四条候选全失败时（例如 install_log 还没接上），仍旧按
-                // 普通搜索路径与 MCDR.dll 同目录各试一次，保持原语义：报「找不到」，
-                // 绝不把「没找到 DLL」误报成「显卡不支持」。
+                // 兜底：按普通搜索路径与 MCDR.dll 同目录再试一次；语义仍是「找不到」，绝不误报成「不支持」。
                 std::wstring dllName = MCDR_NGX_RUNTIME_DLL;
                 mod = ::LoadLibraryW(dllName.c_str());
                 if (mod == nullptr && !moduleDirectory().empty())
@@ -585,8 +504,7 @@ namespace mcdr
                 return;
             }
             s.ngxRuntime = true;
-            // 路径优先用实现侧记下的那条（只有它知道是哪个候选命中的）；拿不到再回退到
-            // GetModuleFileNameW。
+            // 路径优先用实现侧记下的那条（只有它知道是哪个候选命中的）；拿不到再回退到 GetModuleFileNameW。
             if (const char* recorded = mcdr_dlss_runtime_path(); recorded != nullptr && recorded[0] != '\0')
             {
                 s.ngxRuntimePath = recorded;
@@ -608,15 +526,8 @@ namespace mcdr
                 }
             }
 
-            // P108：**必须在下面的特性查询之前**把厂商目录登记给 DLSS 实现。登记会同时
-            // 建好 NVSDK_NGX_FeatureCommonInfo 的 PathListInfo —— NGX 默认只在"应用程序
-            // 目录"（开发跑时是 JDK 的 bin\）里找特性 DLL，拿不到路径表就对 Init 与
-            // GetFeatureRequirements 一律回 FAIL_InvalidParameter (0xBAD00005)。
-            // 实测（PowerShell P/Invoke，真 IDXGIAdapter + D3D12 设备）：
-            //   GetFeatureRequirements(adapter, FeatureInfo=厂商目录) -> 0x00000001 Success,
-            //   FeatureSupported = 0x0（=支持）。
-            // 之前这里在模块的 notifyDlssDeviceReady 里才登记，时机晚于查询，于是查询一直
-            // 拿到 FeatureInfo=NULL，实机表现为 ngxRuntime=yes 却 dlssSupported=no。
+            // **必须在下面的特性查询之前**把厂商目录登记给 DLSS 实现：登记同时建好 FeatureCommonInfo 的 PathListInfo，
+            // 缺了它 Init 与 GetFeatureRequirements 一律回 FAIL_InvalidParameter (0xBAD00005)；晚登记则查询拿 NULL。
             if (!s.ngxRuntimePath.empty())
             {
                 std::wstring wdir;
@@ -648,23 +559,11 @@ namespace mcdr
                 }
             }
 
-            // 第二步：逐个特性问硬件/驱动。GetFeatureRequirements 明确不需要
-            // 先 NVSDK_NGX_Init，这正是探测阶段要的性质。
-            //
-            // 它必须拿到真实 IDXGIAdapter 才能给出准确答案（见 nvsdk_ngx.h 的参数
-            // 说明）。没有适配器时**不能**拿 nullptr 去问：那只会得到
-            // FAIL_InvalidParameter，然后把「没适配器」显示成「显卡不支持」——
-            // 对着一张 4090 报"不支持"比什么都不报更糟。所以这种情况只报
-            // 「运行期在」，并把查询留到有适配器时。
-            //
-            // P108 实测补充：**即使 MCDR.dll 自己的适配器是对的，这一步仍会在
-            // 「运行期 DLL 还没被加载」时返回 FAIL_InvalidParameter (0xBAD00005)** ——
-            // 实机拿到 ngxRuntime=yes 而 dlssSupported=no，原因就是 NGX 那时还没初始化，
-            // 它答不了这个问题。所以：
-            //   * "查不着"（FAIL_InvalidParameter / FAIL_NotInitialized）绝不能被解读成
-            //     "不支持"；这种情况下把三个支持位留空并写明原因，真正的门是 DLSS/NGX 的
-            //     Init 是否成功（见 applyDlssToTexture → mcdr_dlss_can_run），以及
-            //     queryDlss 在 Init 之后做的重探。
+            // 第二步：逐个特性问硬件/驱动。GetFeatureRequirements 不需要先 NVSDK_NGX_Init，正是探测要的性质。
+            // 没有适配器时**不能**拿 nullptr 去问：只会得到 FAIL_InvalidParameter，再把「没适配器」显示成「显卡不支持」；
+            // 这种情况只报「运行期在」，查询留到有适配器时。
+            // 「查不着」（FAIL_InvalidParameter / FAIL_NotInitialized）同样不是「不支持」：三个支持位留空并写明原因，
+            // 真正的门是 NGX 的 Init 是否成功（见 mcdr_dlss_can_run 与 Init 之后的重探）。
             if (adapter == nullptr)
             {
                 s.dlssQueried = false;
@@ -702,8 +601,6 @@ namespace mcdr
                 s.dlssFrameGenerationWhy);
             ask(NVSDK_NGX_Feature_RayReconstruction, s.dlssRayReconstruction,
                 s.dlssRayReconstructionWhy);
-            // P108：「查不着」不是「不支持」。把这一步的失败如实记下来，并让上层知道
-            // 这些位不可信；DLSS 的真正判决交给 Init。
             if (s.dlssSuperResolutionWhy.rfind("query failed:", 0) == 0)
             {
                 s.dlssQueried = false;
@@ -716,9 +613,7 @@ namespace mcdr
 #endif
         }
 
-        // -------------------------------------------------------------------
         // XeSS：加载 libxess.dll，用 xessGetVersion 拿真实版本号
-        // -------------------------------------------------------------------
         void probeXess(RtxSupport& s)
         {
             s.xessProbed = true;
@@ -734,8 +629,7 @@ namespace mcdr
             s.xessRuntime = true;
             s.xessRuntimePath = loadedModulePath(mod);
 
-            // xessGetVersion 一定要解析成功才算「运行时可问」：DLL 在但入口缺失
-            // 只说明装的是一份对不上的版本，那也必须报出来而不是当成可用。
+            // xessGetVersion 必须解析成功才算「运行时可问」：DLL 在但入口缺失 = 版本对不上，也要报出来。
             const auto getVersion = reinterpret_cast<mcdr_xessGetVersion_fn>(
                 reinterpret_cast<void*>(::GetProcAddress(mod, "xessGetVersion")));
             if (getVersion == nullptr)
@@ -755,17 +649,14 @@ namespace mcdr
             std::snprintf(vb, sizeof(vb), "%u.%u.%u", static_cast<unsigned>(v.major),
                           static_cast<unsigned>(v.minor), static_cast<unsigned>(v.patch));
             s.xessVersion = vb;
-            // 同时取文件版本资源：包名（3.0.2）与运行期自报版本（2.0.2）对不上，
-            // 两个数都报出来，看报告的人才能自己判断装的是哪一版。
+            // 同时取文件版本资源：包名（3.0.2）与运行期自报版本（2.0.2）对不上，两个都报出来。
             if (!s.xessRuntimePath.empty())
             {
                 s.xessFileVersion =
                     fileVersionOf(std::wstring(s.xessRuntimePath.begin(), s.xessRuntimePath.end()));
             }
 
-            // 帧生成与低延迟是**另外两个 DLL**。这里只确认它们能加载 —— 能加载
-            // 不等于这台机器跑得动（那要 xessD3D12CreateContext + 实际设备），
-            // 所以字段名里用的是 Present 而不是 Supported。
+            // 帧生成与低延迟是**另外两个 DLL**：能加载不等于跑得动（那要建上下文 + 真设备），故字段名用 Present。
             if (HMODULE fg = loadRuntimeDll(L"libxess_fg.dll"); fg != nullptr)
             {
                 s.xessFrameGenPresent = true;
@@ -780,30 +671,24 @@ namespace mcdr
 #endif
         }
 
-        // -------------------------------------------------------------------
-        // FidelityFX：完全没有导入库，loader DLL 的 5 个入口全靠 GetProcAddress
-        // -------------------------------------------------------------------
+        // FidelityFX：没有导入库，loader DLL 的 5 个入口全靠 GetProcAddress
         void probeFidelityFx(RtxSupport& s)
         {
             s.ffxProbed = true;
 #if defined(MCDR_HAS_FFX)
-            // 每个效果一个独立 DLL，名字与 SDK 里 bin 目录下的完全一致。
-            constexpr const wchar_t* kLoader = L"amd_fidelityfx_loader_dx12.dll";
-            constexpr const wchar_t* kUpscaler = L"amd_fidelityfx_upscaler_dx12.dll";
-            constexpr const wchar_t* kFrameGen = L"amd_fidelityfx_framegeneration_dx12.dll";
-            constexpr const wchar_t* kDenoiser = L"amd_fidelityfx_denoiser_dx12.dll";
-            constexpr const wchar_t* kRadiance = L"amd_fidelityfx_radiancecache_dx12.dll";
+            constexpr auto kLoader = L"amd_fidelityfx_loader_dx12.dll";
+            constexpr auto kUpscaler = L"amd_fidelityfx_upscaler_dx12.dll";
+            constexpr auto kFrameGen = L"amd_fidelityfx_framegeneration_dx12.dll";
+            constexpr auto kDenoiser = L"amd_fidelityfx_denoiser_dx12.dll";
+            constexpr auto kRadiance = L"amd_fidelityfx_radiancecache_dx12.dll";
 
             if (const std::string dir = moduleDirectory(); !dir.empty())
             {
                 const std::wstring wdir(dir.begin(), dir.end());
-                // 版本号只读文件资源，不必加载：即使 loader 加载失败，也能报出
-                // 「文件在，是 2.3.0.0」这种有用信息。
+                // 版本号只读文件资源不加载：即使 loader 加载失败也能报出「文件在，是 2.3.0.0」。
                 const auto versionIfPresent = [&wdir](const wchar_t* name) {
                     const std::wstring full = wdir + name;
-                    return ::GetFileAttributesW(full.c_str()) == INVALID_FILE_ATTRIBUTES
-                               ? std::string()
-                               : fileVersionOf(full);
+                    return ::GetFileAttributesW(full.c_str()) == INVALID_FILE_ATTRIBUTES ? std::string() : fileVersionOf(full);
                 };
                 if (const std::string v = versionIfPresent(kUpscaler); !v.empty())
                 {
@@ -831,16 +716,13 @@ namespace mcdr
             if (mod == nullptr)
             {
                 s.ffxLoaderLoaded = false;
-                s.ffxNote = "amd_fidelityfx_loader_dx12.dll not found (GetLastError=" +
-                            hex32(::GetLastError()) + ")";
+                s.ffxNote = "amd_fidelityfx_loader_dx12.dll not found (GetLastError=" + hex32(::GetLastError()) + ")";
                 return;
             }
             s.ffxLoaderPath = loadedModulePath(mod);
-            s.ffxLoaderVersion = fileVersionOf(std::wstring(s.ffxLoaderPath.begin(),
-                                                            s.ffxLoaderPath.end()));
+            s.ffxLoaderVersion = fileVersionOf(std::wstring(s.ffxLoaderPath.begin(),s.ffxLoaderPath.end()));
 
-            // 5 个入口必须**全部**解析到，少一个都说明这份 loader 与本 SDK 头
-            // 不匹配；只报「加载成功」会掩盖这种错配。
+            // 5 个入口必须**全部**解析到，少一个就说明这份 loader 与本 SDK 头不匹配；只报「加载成功」会掩盖错配。
             const mcdr_ffxCreateContext_fn createContext =
                 reinterpret_cast<mcdr_ffxCreateContext_fn>(
                     reinterpret_cast<void*>(::GetProcAddress(mod, "ffxCreateContext")));
@@ -871,16 +753,14 @@ namespace mcdr
     const RtxSupport& probeRtxSupport(IDXGIAdapter* adapter)
     {
         RtxSupport& s = cache();
-        // 「探测过没有」记在缓存自身（dlssProbed / nrdLinked），不用函数局部
-        // static —— 那样 resetRtxSupportCache 清不掉，第二次调用就再也探测不了。
+        // 「探测过没有」记在缓存自身（dlssProbed / nrdLinked），不用函数局部 static —— 那样 resetRtxSupportCache 清不掉。
         if (!s.dlssProbed)
         {
             probeDlss(s, adapter);
         }
         else if (adapter != nullptr && !s.dlssQueried)
         {
-            // 首次调用没带适配器（例如设备还没建好就查了能力），这次补上特性查询。
-            // 只重做 DLSS 那一步，NRD 的结果不动。
+            // 首次调用没带适配器（设备还没建好），这次补上特性查询：只重做 DLSS 那一步。
             s.dlssQueried = false;
             s.dlssQueryNote.clear();
             probeDlss(s, adapter);
@@ -889,8 +769,7 @@ namespace mcdr
         {
             probeNrd(s);
         }
-        // XeSS / FidelityFX 都不需要适配器，所以和 NRD 一样：只在没测过时测一次，
-        // 不会因为 first call 没带适配器而需要重做。
+        // XeSS / FidelityFX 都不需要适配器：和 NRD 一样只在没测过时测一次，不因首次没带适配器而重做。
         if (!s.xessProbed)
         {
             probeXess(s);

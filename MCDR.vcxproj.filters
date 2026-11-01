@@ -56,6 +56,21 @@
     <Filter Include="解决方案">
       <UniqueIdentifier>{a2e5ce29-54df-41f7-b36e-8c6c7a16533e}</UniqueIdentifier>
     </Filter>
+    <Filter Include="文档\C ABI">
+      <UniqueIdentifier>{1b3a4686-e60a-4ba9-a2f6-2c4daf04edc5}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="文档\Advanced">
+      <UniqueIdentifier>{886a28d4-57f1-460c-9713-fdac774b015b}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="文档\Build">
+      <UniqueIdentifier>{a093cb5a-8a2c-4b70-9e4c-8befe4d0aa0b}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="文档\Misc">
+      <UniqueIdentifier>{627d6cef-4755-4963-9901-701d6add23da}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="文档\Core">
+      <UniqueIdentifier>{1e51d4be-6787-40a8-b402-2d7da80d817c}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <None Include=".gitattributes">
@@ -70,7 +85,7 @@
     <None Include="README.md">
       <Filter>文档</Filter>
     </None>
-    <None Include="README_ZH.MD">
+    <None Include="docs\README_ZH.MD">
       <Filter>文档</Filter>
     </None>
     <None Include="vcpkg-configuration.json">
@@ -96,6 +111,51 @@
     </None>
     <None Include=".gitmodules">
       <Filter>Git</Filter>
+    </None>
+    <None Include="scripts\sync-external.ps1">
+      <Filter>资源文件</Filter>
+    </None>
+    <None Include="docs\c_abi\README.md">
+      <Filter>文档\C ABI</Filter>
+    </None>
+    <None Include="docs\misc\build-and-modules.md">
+      <Filter>文档\Build</Filter>
+    </None>
+    <None Include="docs\advanced\dlss.md">
+      <Filter>文档\Advanced</Filter>
+    </None>
+    <None Include="docs\misc\debug-and-logging.md">
+      <Filter>文档\Misc</Filter>
+    </None>
+    <None Include="docs\advanced\mesh.md">
+      <Filter>文档\Advanced</Filter>
+    </None>
+    <None Include="docs\advanced\framegen.md">
+      <Filter>文档\Advanced</Filter>
+    </None>
+    <None Include="docs\overview.md">
+      <Filter>文档</Filter>
+    </None>
+    <None Include="docs\advanced\rt-probe.md">
+      <Filter>文档\Advanced</Filter>
+    </None>
+    <None Include="docs\advanced\upscalers.md">
+      <Filter>文档\Advanced</Filter>
+    </None>
+    <None Include="docs\abi\README.md">
+      <Filter>文档\C ABI</Filter>
+    </None>
+    <None Include="docs\async\README.md">
+      <Filter>文档\Core</Filter>
+    </None>
+    <None Include="docs\device\README.md">
+      <Filter>文档\Core</Filter>
+    </None>
+    <None Include="docs\surface\README.md">
+      <Filter>文档\Core</Filter>
+    </None>
+    <None Include="resources\MCDR.APS">
+      <Filter>资源文件</Filter>
     </None>
   </ItemGroup>
   <ItemGroup>
@@ -124,6 +184,12 @@
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="include\mcdr_window_host.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="include\mcdr_rt_tracker.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="resources\resource.h">
       <Filter>头文件</Filter>
     </ClInclude>
   </ItemGroup>
@@ -185,6 +251,9 @@
     <ClCompile Include="src\c_abi\abi_sr.cpp">
       <Filter>源文件\C ABI</Filter>
     </ClCompile>
+    <ClCompile Include="src\c_abi\abi_framegen.cpp">
+      <Filter>源文件\C ABI</Filter>
+    </ClCompile>
     <ClCompile Include="src\core\dllmain.cpp">
       <Filter>源文件\Core</Filter>
     </ClCompile>
@@ -197,14 +266,14 @@
     <ClCompile Include="src\core\d3d12_surface.cpp">
       <Filter>源文件\Core</Filter>
     </ClCompile>
-    <ClCompile Include="src\core\d3d12_sr.cpp">
-      <Filter>源文件\Core</Filter>
+    <ClCompile Include="src\advanced\d3d12_sr.cpp">
+      <Filter>源文件\Advanced</Filter>
     </ClCompile>
-    <ClCompile Include="src\core\d3d12_fsr.cpp">
-      <Filter>源文件\Core</Filter>
+    <ClCompile Include="src\advanced\d3d12_fsr.cpp">
+      <Filter>源文件\Advanced</Filter>
     </ClCompile>
-    <ClCompile Include="src\core\d3d12_xess.cpp">
-      <Filter>源文件\Core</Filter>
+    <ClCompile Include="src\advanced\d3d12_xess.cpp">
+      <Filter>源文件\Advanced</Filter>
     </ClCompile>
     <ClCompile Include="src\core\d3d12_async_descriptor.cpp">
       <Filter>源文件\Core</Filter>
@@ -218,23 +287,37 @@
     <ClCompile Include="src\advanced\d3d12_dlss.cpp">
       <Filter>源文件\Advanced</Filter>
     </ClCompile>
+    <ClCompile Include="src\advanced\d3d12_framegen.cpp">
+      <Filter>源文件\Advanced</Filter>
+    </ClCompile>
+    <ClCompile Include="src\advanced\d3d12_fsffg.cpp">
+      <Filter>源文件\Advanced</Filter>
+    </ClCompile>
+    <ClCompile Include="src\advanced\d3d12_xessfg.cpp">
+      <Filter>源文件\Advanced</Filter>
+    </ClCompile>
     <ClCompile Include="src\advanced\smaa_luts.cpp">
       <Filter>源文件\Advanced</Filter>
     </ClCompile>
     <ClCompile Include="src\advanced\d3d12_rtx_probe.cpp">
       <Filter>源文件\Advanced</Filter>
     </ClCompile>
-    <ClCompile Include="src\core\d3d12_hdr_state.cpp">
-      <Filter>源文件\Core</Filter>
+    <ClCompile Include="src\advanced\d3d12_hdr_state.cpp">
+      <Filter>源文件\Advanced</Filter>
     </ClCompile>
-    <ClCompile Include="src\core\d3d12_rt_state.cpp">
+    <ClCompile Include="src\advanced\d3d12_rt_state.cpp">
       <Filter>源文件\Advanced</Filter>
     </ClCompile>
     <ClCompile Include="src\core\d3d12_surface_opts_state.cpp">
       <Filter>源文件\Core</Filter>
     </ClCompile>
     <ClCompile Include="src\core\d3d12_window_host.cpp">
-      <Filter>源文件</Filter>
+      <Filter>源文件\Core</Filter>
     </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="resources\MCDR.rc">
+      <Filter>资源文件</Filter>
+    </ResourceCompile>
   </ItemGroup>
 </Project>

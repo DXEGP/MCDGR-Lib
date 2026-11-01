@@ -1,7 +1,5 @@
-// abi_common.cpp — the single implementation of the error channel, string
-// marshalling and logging shared by all nine adapter implementation units of
-// module mcdr.abi.common.
-//
+// abi_common.cpp — module mcdr.abi.common: thread-local error slot, failWith* helpers, writeString.
+
 module;
 
 #include "_d3d12_module_prelude.h"
@@ -16,10 +14,8 @@ namespace mcdr::abi {
 
 namespace {
 
-// One error slot per thread. The async render thread, the descriptor workers
-// and an FFM upcall arriving from a native thread each report independently,
-// so a naive file-scope std::string would let one thread's failure overwrite
-// another's before Java ever reads it.
+// One error slot per thread (async render thread, descriptor workers, native-thread FFM upcalls all
+// report); a shared slot would lose one thread's text before Java reads it. 见 docs\c_abi\README.md §1.3
 thread_local std::string gLastError;
 
 }  // namespace
@@ -55,10 +51,8 @@ int32_t failWith(const char* what, const std::string& err) {
 
 void failVoid(const char* what, const std::string& err) {
     setLastError(what, err);
-    // Same stderr diagnostics the JNI adapters emitted, so an existing log
-    // capture still shows which entry point failed and why. The line carries the
-    // shared native prefix (see formatLogPrefix), with `mcdr` as the logger name:
-    // the error channel stays separately greppable from the `dx12` diagnostics.
+    // setLastError only fills the slot; printing happens here and nowhere else, so any failure that
+    // must log has to go through failVoid.
     char line[2304];
     const int n = d3d12_mc::formatLogPrefix(line, sizeof(line), "ERROR", "mcdr");
     if (n > 0 && static_cast<size_t>(n) < sizeof(line)) {

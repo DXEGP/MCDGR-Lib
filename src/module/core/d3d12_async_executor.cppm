@@ -1,28 +1,21 @@
-// dx12-mc 异步渲染基础设施（P33）：主 Command List 执行器
+// dx12-mc 异步渲染基础设施：主 Command List 执行器
 //
-// 职责：
-//   1. tryBeginFrame()：非阻塞开始一帧。目标 allocator 槽对应的上一帧若仍在
-//      GPU 执行（fence 未达），返回 false（调用方跳过本帧/下一帧重试），
-//      绝不阻塞主线程等待 GPU。
-//   2. addBundle()：聚合各 worker 录制好的 bundle。
-//   3. addResourceBarrier()/addTransition()：在主列表执行 barrier（bundle
-//      内禁止 barrier，故统一在此执行）。
-//   4. endFrame()：执行 barrier + ExecuteBundle 聚合，Close，提交到队列并 Signal。
-//
-// allocator ring：kFramesInFlight 组 (allocator, commandList)，逐帧轮转；
-// 复用某槽前要求该槽上一次提交的 fence 已完成（非阻塞判断）。
+// tryBeginFrame() 非阻塞：目标槽上一帧仍在 GPU 执行就返回 false，绝不阻塞主线程。
+// allocator ring 为 kFramesInFlight 组 (allocator, list)，复用某槽前要求其上帧 fence 已完成。
+// bundle 内禁止 ResourceBarrier / SetDescriptorHeaps，二者只在主列表执行。见 docs\async\README.md
 
 module;
 
 #include "_d3d12_module_prelude.h"
+#include "mcdr_rt_tracker.h"
 
 export module mcdr.d3d12.async_executor;
 
-import mcdr.error;  // mcdr::Result<T> / mcdr::Error / mcdr::err()：失败上报改走 std::expected
+import mcdr.error;  // mcdr::Result<T> / mcdr::err()
 
 namespace {
 
-// HRESULT -> "0x%08X"（模块单元不得 import 设备模块，实现单元各自持有一份）。
+// 模块单元不得 import 设备模块，故各实现单元自持一份。
 std::string hrText(HRESULT hr) {
     char buf[16]{};
     std::snprintf(buf, sizeof(buf), "0x%08X", static_cast<unsigned>(hr));
@@ -45,16 +38,15 @@ public:
     MainCommandExecutor(const MainCommandExecutor&) = delete;
     MainCommandExecutor& operator=(const MainCommandExecutor&) = delete;
 
-    // heaps 传入父列表使用的 shader-visible 描述符堆（bundle 内禁止 SetDescriptorHeaps，
-    // 故必须在父列表 Reset 后立刻绑定）；可为 nullptr。失败返回 mcdr::Error。
+    // heaps 为父列表使用的 shader-visible 堆（bundle 内禁止 SetDescriptorHeaps，须在
+    // Reset 后立刻绑定）；可为 nullptr。失败返回 mcdr::Error。
     mcdr::Result<void> init(ID3D12Device* device, ID3D12CommandQueue* queue,
                             ID3D12DescriptorHeap* heaps = nullptr);
     bool valid() const { return m_slots[0].commandList != nullptr; }
 
-    // 非阻塞开始一帧；失败（上一帧未完成 / 已在帧中 / Reset 失败）返回 false。
+    // 上一帧未完成 / 已在帧中 / Reset 失败时返回 false。
     bool tryBeginFrame();
 
-    // 聚合待执行的 bundle（当前帧内有效）。
     bool addBundle(ID3D12GraphicsCommandList* bundle);
     bool addBundles(ID3D12GraphicsCommandList* const* bundles, UINT count);
 
@@ -62,8 +54,7 @@ public:
     bool addResourceBarrier(const D3D12_RESOURCE_BARRIER& barrier);
     bool addTransition(ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after);
 
-    // 关闭主列表 -> 执行 barrier + bundle -> 提交 -> Signal。
-    // 返回本次提交的 fence 值；失败返回 0。
+    // 关闭主列表 -> 执行 barrier + bundle -> 提交 -> Signal；返回 fence 值，失败返回 0。
     UINT64 endFrame();
 
     bool isFrameInProgress() const { return m_frameInProgress; }
@@ -106,11 +97,6 @@ private:
     mutable std::mutex m_mutex;
     mutable Stats m_stats;
 };
-
-
-// ===========================================================================
-// 实现（原 dx12_async_executor.cpp，随头文件一并并入模块接口单元）
-// ===========================================================================
 
 mcdr::Result<void> MainCommandExecutor::init(ID3D12Device* device, ID3D12CommandQueue* queue,
                                             ID3D12DescriptorHeap* heaps) {
@@ -167,7 +153,6 @@ bool MainCommandExecutor::tryBeginFrame() {
     hr = slot.commandList->Reset(slot.allocator.Get(), nullptr);
     if (FAILED(hr)) return false;
 
-    // bundle 内禁止 SetDescriptorHeaps，须由父列表设置（bundle 复用其堆）。
     ID3D12DescriptorHeap* heap = m_heap;
     if (heap) {
         ID3D12DescriptorHeap* heaps[] = {heap};
@@ -197,6 +182,14 @@ bool MainCommandExecutor::addBundles(ID3D12GraphicsCommandList* const* bundles, 
 
 bool MainCommandExecutor::addResourceBarrier(const D3D12_RESOURCE_BARRIER& barrier) {
     if (!m_frameInProgress) return false;
+    if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && barrier.Transition.pResource) {
+        mcdr_rt_track_transition(barrier.Transition.pResource,
+                                 static_cast<uint32_t>(barrier.Transition.StateBefore),
+                                 static_cast<uint32_t>(barrier.Transition.StateAfter),
+                                 barrier.Transition.Subresource);
+    } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
+        mcdr_rt_track_uav(barrier.UAV.pResource);
+    }
     std::lock_guard<std::mutex> lk(m_mutex);
     m_barriers.push_back(barrier);
     return true;

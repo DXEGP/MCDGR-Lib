@@ -1,8 +1,5 @@
-// abi_command.cpp — command layer: encoder lifecycle, copies, clears, render pass, timestamp queries and the async-renderer control channel
-//
-// Group: command recording (originally abi_bridge_p3.cpp).
-// 合并自：abi_bridge_p3.cpp
-//
+// abi_command.cpp — command layer: encoder lifecycle, copies, clears, render pass, timestamp
+// queries and the async-renderer control channel. 见 docs\abi\README.md
 module;
 
 #include "_d3d12_module_prelude.h"
@@ -22,38 +19,8 @@ import mcdr.error;
 
 using namespace d3d12_mc;
 
-// ===========================================================================
-// 本文件是合并后的 C ABI 适配单元，按**功能**命名（不再按移植阶段 pX）。
-// 共享前言（prelude / mcdr_abi.h / 各模块 import）统一放在文件顶部，下面每一段
-// 保留原单元的文件头注释与代码本体，内容逐字节未改。
-// ===========================================================================
-
-// ---------------------------------------------------------------------------
-// 来源单元：abi_bridge_p3.cpp
-// ---------------------------------------------------------------------------
-
-// abi_command.cpp — command layer: encoder lifecycle, copies, clears, render（合并自 abi_bridge_p3.cpp）
-// pass, timestamp queries and the async-renderer control channel.
-//
-// Replaces jni_bridge_p3.cpp (421 lines). The translation is mechanical, with
-// three things worth calling out:
-//
-//  1. Handles need no conversion at all. mcdr_object IS d3d12_mc::Dx12Object (see
-//     mcdr_abi.h), so the old fromHandle(jlong) reinterpret_cast helpers and the
-//     per-call `jlong -> pointer` marshalling are gone.
-//
-//  2. mcdr_dx12BeginRenderPass no longer copies four Java arrays. The JNI version
-//     did GetLongArrayRegion + GetByteArrayRegion + GetIntArrayRegion +
-//     GetFloatArrayRegion, then three `new[]` allocations and three `delete[]`.
-//     The Java side now arranges the caller's data in native memory once and
-//     passes pointers, so this function only forwards them.
-//
-//  3. dx12WaitForFence keeps its unusual contract: a *timeout* is success-path
-//     semantics, not an error. Official GpuFence.awaitCompletion returns false on
-//     a zero timeout rather than throwing, and StagedVertexBuffer reclamation
-//     depends on that. Only a genuine failure (queue fence uninitialised,
-//     CreateEvent failure) sets the last error.
-
+// Handles are the native objects themselves (mcdr_object IS d3d12_mc::Dx12Object, see
+// include\mcdr_abi.h), so nothing is converted here; render-pass inputs arrive as native pointers.
 extern "C" {
 
 int64_t MCDR_CALL MCDR_D3D12_get_timestamp_frequency(void) {
@@ -92,8 +59,8 @@ void MCDR_CALL mcdr_dx12EndCommandList(mcdr_command_ctx* ctx) {
 uint64_t MCDR_CALL mcdr_dx12Submit(mcdr_command_ctx* ctx) {
     d3d12_mc::dbgLogDebug("submit: enter ctx=%p", static_cast<void*>(ctx));
     const auto r = d3d12_mc::submitCommandList(ctx);
-    // submitCommandList 只在失败时返回 err；返回值是本 ctx 的 per-command-list 序号
-    // （BUG-03，可直接交给 mcdr_dx12WaitForFence），「无可提交」时是 0。
+    // Returns this ctx's per-command-list sequence number, which mcdr_dx12WaitForFence accepts;
+    // 0 means "nothing to submit" and an empty error message means the same.
     if (!r && !r.error().message.empty()) {
         mcdr::abi::failVoid("mcdr_dx12Submit", r.error().message);
     }
@@ -101,13 +68,13 @@ uint64_t MCDR_CALL mcdr_dx12Submit(mcdr_command_ctx* ctx) {
 }
 
 int32_t MCDR_CALL mcdr_dx12WaitForFence(mcdr_command_ctx* ctx, uint64_t value, int64_t timeoutNs) {
-    // BUG-03：等待的是**这个 ctx 自己的** per-command-list fence。value 来自
-    // mcdr_dx12GetFenceValue / mcdr_dx12Submit，三者属于同一条 per-ctx 时间线，
-    // 因此帧 encoder 的 token 只会被本帧提交满足，一次性 encoder（createBuffer(data)
-    // 的上传）不会提前把它推进。
+    // Waits on THIS ctx's own per-command-list fence: value comes from
+    // mcdr_dx12GetFenceValue / mcdr_dx12Submit, all three on one timeline, so a one-shot upload
+    // encoder can never advance a frame encoder's token.
     const auto r = d3d12_mc::waitForContextFenceValue(ctx, static_cast<UINT64>(value),
                                                      static_cast<UINT64>(timeoutNs));
-    // 超时不是错误（GpuFence.awaitCompletion 语义），只有真正的失败才设 lastError。
+    // A timeout is success-path semantics (GpuFence.awaitCompletion returns false, it does not
+    // throw, and StagedVertexBuffer reclamation depends on that): only a real failure sets lastError.
     if (!r && r.error().message.find("timed out") == std::string::npos) {
         mcdr::abi::failVoid("mcdr_dx12WaitForFence", r.error().message);
     }
@@ -183,15 +150,13 @@ void MCDR_CALL mcdr_dx12CopyTextureToTexture(mcdr_command_ctx* ctx, mcdr_object*
     }
 }
 
-// P104b: in-place SMAA on a texture (the world layer). The Java side calls this from a
-// GameRenderer mixin, right after the world has rendered and before the GUI is drawn, so
-// the anti-aliasing never touches UI. Silence here is normal: mode != SMAA is a no-op.
+// In-place SMAA on the world layer, called after the world has rendered and before the GUI is
+// drawn, so the anti-aliasing never touches UI. mode != SMAA is a silent no-op (returns 0).
 int32_t MCDR_CALL mcdr_dx12ApplySmaaToTexture(mcdr_command_ctx* ctx, mcdr_object* texture) {
     return d3d12_mc::applySmaaToTexture(ctx, texture) ? 1 : 0;
 }
 
-// P106: GUI target split. The Java side calls this once per frame to hand the finished world
-// layer over to the GUI's own window-sized render target (see blitTextureToTexture).
+// Hands the finished world layer to the GUI's own window-sized render target, once per frame.
 int32_t MCDR_CALL mcdr_dx12BlitTextureToTexture(mcdr_command_ctx* ctx, mcdr_object* src,
                                                 mcdr_object* dst) {
     const auto r = d3d12_mc::blitTextureToTexture(ctx, src, dst);
@@ -202,8 +167,8 @@ int32_t MCDR_CALL mcdr_dx12BlitTextureToTexture(mcdr_command_ctx* ctx, mcdr_obje
     return 1;
 }
 
-// P121: 后置锐化（TAA / DLAA / DLSS 共用）。src -> dst 的 5-tap unsharp，amount 取 [0,1]。
-// 与 blit 同一调用点语义，但要求 src != dst（同资源就地锐化不合法，native 会返回 0）。
+// Post sharpening shared by TAA / DLAA / DLSS: a 5-tap unsharp from src to dst with
+// amount in [0,1]. src == dst is illegal (in-place sharpen returns 0).
 int32_t MCDR_CALL mcdr_dx12SharpenTextureToTexture(mcdr_command_ctx* ctx, mcdr_object* src,
                                                    mcdr_object* dst, float amount) {
     const auto r = d3d12_mc::sharpenTextureToTexture(ctx, src, dst, amount);
@@ -214,10 +179,10 @@ int32_t MCDR_CALL mcdr_dx12SharpenTextureToTexture(mcdr_command_ctx* ctx, mcdr_o
     return 1;
 }
 
-// P152: TAA resolve, native side. Same call point as SMAA (world drawn, GUI not yet), but the
-// history textures, the resolve pipeline and the jitter bookkeeping live in the device context,
-// so the JVM only pushes the per-frame values. Returns 1 = applied, 0 = skipped (mode is not
-// TAA / unsuitable target / already disabled), -1 = failed (one ERROR log, TAA disabled).
+// TAA resolve, native side. Same call point as SMAA, but history textures, the resolve pipeline
+// and jitter bookkeeping live in the device context; the JVM only pushes per-frame values.
+// 1 = applied, 0 = skipped (mode is not TAA / unsuitable target / already disabled),
+// -1 = failed (one ERROR log, TAA disabled).
 int32_t MCDR_CALL mcdr_dx12ApplyTaaToTexture(mcdr_command_ctx* ctx, mcdr_object* scene,
                                              mcdr_object* motion, float jitterX, float jitterY,
                                              float prevJitterX, float prevJitterY, float blend,
@@ -226,18 +191,15 @@ int32_t MCDR_CALL mcdr_dx12ApplyTaaToTexture(mcdr_command_ctx* ctx, mcdr_object*
                                        blend, reset, sharpenAmount);
 }
 
-// P108: DLSS. Same call point as mcdr_dx12ApplySmaaToTexture (world done, GUI not yet):
-// the world layer is upscaled from the render size into the window-sized target, which is
-// what the linear blit used to do. Silenced by the independent DLSS switch being off
-// (mcdr_dx12SetDlssEnabled — P108 / user m10920 decoupled it from the AA mode), and by any
-// earlier failure (which has already been logged exactly once).
+// DLSS upscale, same call point as SMAA: the world layer is upscaled from render size into the
+// window-sized target. Silenced by the independent DLSS switch and by any earlier failure (which
+// was already logged exactly once). 1 = applied, 0 = skipped, -1 = bad args.
 int32_t MCDR_CALL mcdr_dx12CreateDlssFeature(mcdr_command_ctx* ctx, const mcdr_dlss_input* in) {
     if (ctx == nullptr || in == nullptr) {
         return -1;
     }
-    // Create and Evaluate are one entry point on purpose: NGX may only create the feature
-    // while a command list is open, and the Java side has exactly that one window per
-    // frame (after the world, before the GUI).
+    // Create and Evaluate are one entry point on purpose: NGX may only create the feature while a
+    // command list is open, and the JVM has exactly one such window per frame.
     return d3d12_mc::applyDlssToTexture(ctx, *in) ? 1 : 0;
 }
 
@@ -248,7 +210,7 @@ int32_t MCDR_CALL mcdr_dx12EvaluateDlss(mcdr_command_ctx* ctx, const mcdr_dlss_i
     return d3d12_mc::applyDlssToTexture(ctx, *in) ? 1 : 0;
 }
 
-// P108: one-line DLSS availability/state query for the UI and the log.
+// One-line DLSS availability/state query for the UI and the log.
 int32_t MCDR_CALL mcdr_dx12QueryDlss(char* note, int32_t noteCap) {
     if (noteCap < 0 || (noteCap > 0 && note == nullptr)) {
         return -1;
@@ -270,7 +232,6 @@ void MCDR_CALL mcdr_dx12ClearDepthTexture(mcdr_command_ctx* ctx, mcdr_object* te
     }
 }
 
-// MC 26.2: CommandEncoderBackend gained clearStencilTexture(GpuTexture, int).
 int32_t MCDR_CALL mcdr_dx12ClearStencilTexture(mcdr_command_ctx* ctx, mcdr_object* texture, int32_t value) {
     if (const auto r = d3d12_mc::clearStencilTexture(ctx, texture, static_cast<int>(value)); !r) {
         return mcdr::abi::failWith("mcdr_dx12ClearStencilTexture", r.error().message);
@@ -278,9 +239,8 @@ int32_t MCDR_CALL mcdr_dx12ClearStencilTexture(mcdr_command_ctx* ctx, mcdr_objec
     return 1;
 }
 
-// P3b: region clear. GuiItemAtlas clears one slot before a STALE redraw; the
-// original whole-texture clear wiped already-baked item icons, which then never
-// re-rendered after paging back, so items disappeared.
+// Region clear: the GUI item atlas clears one slot before a STALE redraw, and a whole-texture
+// clear would wipe already-baked icons that never re-render after paging back.
 void MCDR_CALL mcdr_dx12ClearColorTextureRegion(mcdr_command_ctx* ctx, mcdr_object* texture, float r, float g,
                                                 float b, float a, int32_t x, int32_t y, int32_t width,
                                                 int32_t height) {
@@ -363,12 +323,10 @@ int32_t MCDR_CALL mcdr_dx12ReadQueryValues(mcdr_query_pool* pool, int32_t start,
     return 1;
 }
 
-// ---------------------------------------------------------------------------
-// P33 async: dedicated render thread control channel
-// ---------------------------------------------------------------------------
+// Async renderer control channel.
 
 void MCDR_CALL mcdr_dx12InitAsyncRenderer(int32_t workerCount) {
-    // initAsyncRenderer 仍然返回 bool（设备侧把它归入「无法失败」一类）。
+    // initAsyncRenderer still returns bool (the device side treats it as "cannot fail").
     if (!d3d12_mc::initAsyncRenderer(static_cast<UINT>(workerCount))) {
         mcdr::abi::failVoid("mcdr_dx12InitAsyncRenderer", std::string());
     }
@@ -397,7 +355,6 @@ int32_t MCDR_CALL mcdr_dx12AsyncRenderIsRecordingReady(mcdr_command_ctx* ctx) {
 }
 
 int32_t MCDR_CALL mcdr_dx12AsyncRenderWaitRecordingReady(mcdr_command_ctx* ctx, int64_t timeoutMs) {
-    // Replaces a Java-side Thread.sleep(1) poll worth ~1 ms/frame.
     return d3d12_mc::asyncRenderWaitRecordingReady(ctx, static_cast<UINT64>(timeoutMs)) ? 1 : 0;
 }
 
@@ -408,7 +365,39 @@ int32_t MCDR_CALL mcdr_dx12AsyncSendCommandsReady(mcdr_command_ctx* ctx) {
 
 void MCDR_CALL mcdr_dx12ClearAsyncRenderCtx(void) { d3d12_mc::clearAsyncRenderCtx(); }
 
-// P234：compute 派发。返回码 1/0/-2 由 native 决定（-2 = 没有打开的命令列表）。
+// Compute dispatch; the 1/0/-2 codes come from native (-2 = no open command list).
+int32_t MCDR_CALL mcdr_dx12DispatchComputeEx(mcdr_command_ctx* ctx, mcdr_object* pipeline,
+                                             mcdr_object* const* srvs, int32_t srvCount,
+                                             mcdr_object* const* uavs, int32_t uavCount,
+                                             const int32_t* constants, int32_t constantCount,
+                                             mcdr_object* cbv, uint64_t cbvOffset, int32_t x,
+                                             int32_t y, int32_t z) {
+    return d3d12_mc::dispatchComputeEx(ctx, pipeline, srvs, srvCount, uavs, uavCount, constants,
+                                       constantCount, cbv, cbvOffset, x, y, z);
+}
+
+int32_t MCDR_CALL mcdr_dx12NrdDenoise(mcdr_command_ctx* ctx, mcdr_object* const* textures,
+                                      int32_t textureCount, const float* matrices,
+                                      uint32_t frameIndex, uint32_t resetHistory, char* outText,
+                                      int32_t capacity) {
+    return d3d12_mc::nrdDenoise(ctx, textures, textureCount, matrices, frameIndex, resetHistory,
+                                outText, capacity);
+}
+
+int32_t MCDR_CALL mcdr_dx12DlssdEval(mcdr_command_ctx* ctx, mcdr_object* const* textures,
+                                   int32_t textureCount, uint32_t width, uint32_t height,
+                                   uint32_t outputWidth, uint32_t outputHeight,
+                                   uint32_t frameIndex, int32_t reset, const float* constants,
+                                   char* outText, int32_t capacity) {
+    return d3d12_mc::dlssdEval(ctx, textures, textureCount, width, height, outputWidth,
+                               outputHeight, frameIndex, reset, constants, outText, capacity);
+}
+
+int32_t MCDR_CALL mcdr_dx12Barrier(mcdr_command_ctx* ctx, const mcdr_barrier_desc* descs,
+                                  int32_t count) {
+    return d3d12_mc::submitBarriers(ctx, descs, count);
+}
+
 int32_t MCDR_CALL mcdr_dx12DispatchCompute(mcdr_command_ctx* ctx, mcdr_object* pipeline,
                                            mcdr_object* uavTexture, const int32_t* constants,
                                            int32_t constantCount, int32_t x, int32_t y, int32_t z) {
@@ -416,8 +405,8 @@ int32_t MCDR_CALL mcdr_dx12DispatchCompute(mcdr_command_ctx* ctx, mcdr_object* p
 }
 
 
-// P235：着色率图像的派发与绑定（1=成功 0=参数/设备问题 -1=坏句柄 -2=列表没开）。
-// P276：通用 compute 纹理 pass 的派发（转发给 SRI 那条实现，根签名相同）。
+// Shading-rate image dispatch and bind (1=ok 0=arg/device problem -1=bad handle -2=list not open).
+// The generic compute-texture pass forwards to the same implementation: one root signature.
 int32_t MCDR_CALL mcdr_dx12DispatchComputeTexture3(mcdr_command_ctx* ctx, mcdr_object* pipeline,
                                               mcdr_object* srv0, mcdr_object* srv1,
                                               mcdr_object* srv2, mcdr_object* image,

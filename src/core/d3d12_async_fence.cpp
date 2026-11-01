@@ -3,6 +3,7 @@ module;
 #include "_d3d12_module_prelude.h"
 
 module mcdr.d3d12.async_fence;
+// 本文件是该模块的实现单元：只能定义 .cppm 里声明的导出成员，挪进普通 TU 会因修饰名不一致 → LNK2001/LNK2019。
 
 import mcdr.error;
 
@@ -28,7 +29,7 @@ AsyncFenceManager::~AsyncFenceManager() { shutdown(); }
 
 mcdr::Result<void> AsyncFenceManager::init(ID3D12Device* device, ID3D12CommandQueue* queue) {
     if (!device || !queue) return mcdr::err("AsyncFenceManager::init", "device/queue is null");
-    if (m_running.load()) return {};  // 已初始化
+    if (m_running.load()) return {};
 
     m_queue = queue;
     const HRESULT hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence));
@@ -172,7 +173,6 @@ void AsyncFenceManager::monitorThread() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 
     while (m_running.load()) {
-        // 找最早的待完成 fence value。
         UINT64 minValue = UINT64_MAX;
         {
             std::lock_guard<std::mutex> lk(m_mutex);
@@ -199,7 +199,6 @@ void AsyncFenceManager::monitorThread() {
             continue;
         }
 
-        // 精准等待：fence 完成 或 有新登记 或 超时（用于重算最早值/处理超时）。
         HANDLE handles[2] = {ev, m_wakeEvent};
         DWORD r = WaitForMultipleObjects(2, handles, FALSE, 100);
         CloseHandle(ev);
@@ -209,7 +208,6 @@ void AsyncFenceManager::monitorThread() {
         } else if (r == WAIT_OBJECT_0 + 1) {
             ResetEvent(m_wakeEvent);
         }
-        // WAIT_TIMEOUT：直接下一轮重算（可能处理超时回调）。
     }
 }
 

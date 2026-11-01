@@ -1,37 +1,19 @@
-// d3d12_dlss.cpp — P108: DLSS super-resolution over NVSDK_NGX (data plane + the real
-// Evaluate call).
+// d3d12_dlss.cpp — DLSS 超分（NVSDK_NGX 数据面 + 真正的 Evaluate 调用）。
 //
-// WHY THIS IS A PLAIN TRANSLATION UNIT (not a module implementation unit):
-//   Same reason as d3d12_rtx_probe.cpp — it hides every vendor type (ID3D12Resource,
-//   NVSDK_NGX_*) behind a tiny C interface, so the device module (mcdr.d3d12.device)
-//   never includes an NGX header and never inherits the DLSS license surface. The
-//   dependency runs one way only: the module declares these entry points itself and
-//   calls them; nothing here imports a mcdr.* module.
+// 独立翻译单元：把厂商类型（ID3D12Resource / NVSDK_NGX_*）藏在极小的 C 接口后面，
+// mcdr.d3d12.device 因此永远不 include NGX 头、也不继承 DLSS 的许可面。依赖单向：模块声明
+// 这些入口并调用它们，本文件不 import 任何 mcdr.* 模块。
 //
-// WHERE IT SITS IN THE FRAME:
-//   The Java side calls mcdr_dx12EvaluateDlss at the SAME point where it used to call
-//   mcdr_dx12ApplySmaaToTexture — after the world has rendered, before the GUI. DLSS
-//   upscales the render-scaled world layer (window * dxrMcRenderScale) into the
-//   window-sized target the GUI draws over, which is exactly what the linear blit did.
-//   DLSS and SMAA are two values of the same anti-aliasing option, never both.
+// 在帧中的位置：世界渲染之后、GUI 之前，把 render-scaled 的世界层放大到窗口尺寸的目标 ——
+// 与线性 blit 相同的位置。DLSS 与 SMAA 是同一个抗锯齿选项的两个取值，绝不并存。
 //
-// FAILURE POLICY (mirrors P104b SMAA exactly):
-//   Every failure path logs at most ONE line (WARN for "not available", ERROR for
-//   "broke while running") and then pins the state, so nothing is retried per frame.
-//   DLSS never makes the frame fail: the caller falls back to the plain blit path.
+// 失败策略：每条失败路径最多打一行并按状态锁存，不逐帧重试；DLSS 永不让整帧失败。
 //
-// DEPTH CONVENTION (see the P108 report for the full evidence):
-//   Minecraft 26.x renders REVERSE-Z. Projection.java:70-74 swaps near/far before
-//   building the matrix; DepthStencilState.DEFAULT is GREATER_THAN_OR_EQUAL (mapped by
-//   d3d12_device.cpp:3676 to D3D12_COMPARISON_FUNC_GREATER_EQUAL); the depth buffer is
-//   cleared to 0.0 == far (GameRenderer.java:443/578, d3d12_device.cpp:3492-3498).
-//   DLSS therefore gets NVSDK_NGX_DLSS_Feature_Flags_DepthInverted.
+// 深度是 REVERSE-Z（投影矩阵已交换 near/far，比较函数 GREATER_EQUAL，深度清成 0 = 远），
+// 故必须声明 DepthInverted。MV 是屏幕空间的 **像素** 位移，InMVScaleX/Y 保持 1.0，且不含
+// jitter 差（jitter 由 InJitterOffsetX/Y 单独传，故不置 MVJittered）。
 //
-// MOTION VECTORS: D3D12Velocity.kt writes screen-space motion in PIXELS
-// ((uv - prevUv) * ScreenSize), so InMVScaleX/Y stay 1.0. They are computed from the
-// JITTERED current projection, so the jitter is inside them: DLSS is told both that the
-// MVs are jittered (MVJittered) and to cancel that jitter
-// (motionVectorJitterCancellation), which is the self-consistent combination.
+// 见 docs/advanced/dlss.md
 #include <windows.h>
 
 #include <d3d12.h>
@@ -39,85 +21,51 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-
-// P112 阶段 1：Streamline 接管 DLSS 的实现选择（默认仍是直连 NGX，行为与 P108 一致）。
+// DLSS 实现二选一：Streamline 接管，或直连 NGX（默认 NGX）。
 #if __has_include(<sl.h>)
 #include <sl.h>
 #include <sl_dlss.h>   // sl::DLSSMode / sl::DLSSOptions（sl.h 只含 core）
 #include <sl_reflex.h>  // P113：sl::ReflexOptions / sl::ReflexMode
-#include <sl_dlss_g.h>  // P213：sl::DLSSGOptions / sl::DLSSGMode（帧生成）
+#include <sl_dlss_g.h>
+#include <sl_dlss_d.h>  // P213：sl::DLSSGOptions / sl::DLSSGMode（帧生成）
 #define MCDR_DLSS_HAVE_STREAMLINE 1
 #else
 #define MCDR_DLSS_HAVE_STREAMLINE 0
 #endif
 
 #include "mcdr_abi.h"
-// P108: the extern "C" interface shared with the device module. It defines the transition
-// callback types (DlssTransitionFn / DlssQueryStateFn) this unit stores in its state.
+// extern "C" 接口：本单元与设备模块的边界（转换/状态查询回调类型）。
 #include "mcdr_dlss_impl.h"
+#include "mcdr_dlssd_impl.h"
 #include "mcdr_hdr_state.h"  // P197：HDR 激活状态（colorBuffersHDR）
 import std;
 
 #include "nvsdk_ngx.h"
 #include "nvsdk_ngx_helpers.h"
-
-// ---------------------------------------------------------------------------
-// Project constants (mirrors d3d12_rtx_probe.cpp so the SDK sees one application
-// identity from both call sites).
-//
-// P108: the ProjectId is a **36-character GUID string**, not a short name. Rationale: the
-// production integration that ships DLSS against this same 310.x runtime (ETS2/ATS DLAA
-// mod, `src/dlaa.cpp`) uses exactly this shape — a fixed GUID with the comment "any stable
-// GUID works for unregistered apps; ours, generated for this project". Length/charset is
-// not documented as a hard requirement (UE-style integrations use 32 hex chars without
-// dashes), so the invariant that matters is: **stable, non-empty, and GUID-shaped**.
-// Generated once for DXRMC and pinned here; changing it invalidates NGX's per-app state.
-// ---------------------------------------------------------------------------
+// ProjectId 是与 RTX 探测共享的同一身份（SDK 只认一处应用标识）：一个**稳定的 36 字符 GUID 串**，
+// 一经确定不可更改 —— 改了会让 NGX 的 per-app 状态失效。约束是"稳定、非空、GUID 形状"。
 #define MCDR_NGX_PROJECT_ID "7c1f4a52-9b3e-4d68-8f21-5a6c0e2d9b74"
 #define MCDR_NGX_ENGINE_VERSION "1.0"
 #define MCDR_NGX_APPDATA L".\\ngx"
-
-// ---------------------------------------------------------------------------
-// P108: NGX runtime discovery + diagnostics.
+// NGX 运行期发现与诊断。放在这里而不是 d3d12_rtx_probe.cpp：普通 TU 够不到设备模块的 dbgLog*，
+// 而"找不到运行期"恰恰是必须逐次记日志的失败。探测通过 mcdr_dlss_load_runtime() 调这里。
 //
-// The RTX probe used to do this itself (see d3d12_rtx_probe.cpp), but a plain TU cannot
-// reach the device module's dbgLog*, and "the runtime could not be found" is exactly the
-// failure that needs a per-attempt log line. So the loading now lives HERE, where the
-// module's log pointers are installed, and the probe calls mcdr_dlss_load_runtime().
-//
-// What NGX actually needs (verified against external\dlss\include\nvsdk_ngx_loader.h and
-// the shipped binaries):
-//   * `nvngx_dlss.dll` — the feature runtime shipped in external\dlss\bin\x64. This is
-//     the one file the loader hands to LoadLibraryW; a missing *dependency* is not
-//     possible, because nvngx_dlss.dll imports only VERSION/ADVAPI32/USER32/KERNEL32
-//     (checked with a PE import parse) and has no delay-load table at all.
-//   * `nvngx.dll` / `_nvngx.dll` — the NGX CORE, which is NOT shipped by the SDK. NGX
-//     finds it next to the *application executable* (GetModuleFileNameW(NULL)), or via
-//     the driver's registry key. In a Minecraft dev run the executable is the JDK's
-//     java.exe, so that lookup cannot succeed and NGX falls back to the registry; this is
-//     why `nvngx_dlss.dll` being present is necessary but not sufficient.
-//   * `applicationDataPath` (the 4th parameter of Init_with_ProjectID) is a directory for
-//     NGX's own logs/cache, NOT a model search path. There is no `pathToNGXModel`
-//     parameter in this SDK version.
-// ---------------------------------------------------------------------------
+// nvngx_dlss.dll 是交给 LoadLibraryW 的那一个文件（随 SDK 放在厂商目录）；它只 import
+// VERSION/ADVAPI32/USER32/KERNEL32，没有延迟加载表，不存在"缺依赖"。
+// nvngx.dll / _nvngx.dll 是 NGX 核心，SDK 不提供：NGX 去**可执行文件**旁边找或走驱动注册表。
+// 开发运行时"可执行文件"是 java.exe，所以首选必然落空，最终走注册表 —— 这是 nvngx_dlss.dll
+// 存在仍不足以 Init 成功的原因。
+// applicationDataPath（Init_with_ProjectID 的第 4 个参数）是 NGX 放日志/缓存的目录，**不是**
+// 模型搜索路径；本版 SDK 没有 pathToNGXModel 参数。
 namespace
 {
-    // -----------------------------------------------------------------------
-    // Logging. The device module owns the log (level filtering + the line format that
-    // mirrors the JVM's log4j pattern), so this unit never formats a prefix or a
-    // timestamp of its own: the module hands over its own dbgLogInfo/dbgLogWarn/
-    // dbgLogError pointers in mcdr_dlss_install_log (see the bottom of this file).
-    // Resolving those names on the module's side is what makes the boundary legal —
-    // this TU must never name a mcdr.* module entity itself.
-    // -----------------------------------------------------------------------
+    // 日志：格式与级别过滤都由设备模块负责，本单元只调它经 mcdr_dlss_install_log 交过来的
+    // dbgLogInfo/dbgLogWarn/dbgLogError，绝不自己拼前缀或时间戳，也绝不在这里命名任何 mcdr.* 实体。
     using LogFn = void (*)(const char* fmt, ...);
     LogFn gLogInfo = nullptr;
     LogFn gLogWarn = nullptr;
     LogFn gLogError = nullptr;
-
-    // B4：模块提供的私有纹理创建/销毁（见 mcdr_dlss_impl.h 的 DlssTextureDesc）。本单元从此
-    // **不再自己 CreateCommittedResource 任何纹理** —— 私有 UAV 与深度快照都从这里建，创建
-    // 即登记进模块的跟踪表，销毁回模块的延迟删除路径。两条路留一条，别再走回去。
+// B4：模块提供的私有纹理创建/销毁；本单元不再自己 CreateCommittedResource —— 创建即登记进跟踪表，销毁走延迟删除。
     using CreateTextureFn = int32_t (*)(void*, const DlssTextureDesc*, void**, void**);
     using DestroyTextureFn = void (*)(void*, void*);
     CreateTextureFn gCreateTexture = nullptr;
@@ -156,10 +104,7 @@ namespace
         va_end(ap);
         gLogError("%s", line);
     }
-
-    // -----------------------------------------------------------------------
-    // NGX result codes -> readable text.
-    // -----------------------------------------------------------------------
+// NGX result codes -> readable text.
     const char* ngxResultText(NVSDK_NGX_Result r) {
         switch (r) {
             case NVSDK_NGX_Result_Success: return "success";
@@ -174,8 +119,6 @@ namespace
             default: return nullptr;
         }
     }
-
-    // "text (0xXXXXXXXX)" when the code is a known one, plain hex otherwise.
     std::string ngxResultString(NVSDK_NGX_Result r) {
         char hex[32] = {};
         std::snprintf(hex, sizeof(hex), "0x%08X", static_cast<unsigned>(r));
@@ -184,13 +127,10 @@ namespace
         }
         return std::string(hex);
     }
-    // -----------------------------------------------------------------------
-    // State. One process-wide DLSS instance (the device is a singleton too).
-    // -----------------------------------------------------------------------
-    // P291f（用户 m03752）：每一档名义上的上采样倍数（target/render）。NGX 的动态分辨率区间是
-    // [target/nominal, target]；render 比 target/nominal 还小时，NGXDLAA::EvaluateFeature 只写一行
-    // 「Dynamic scaling error ... outside of Min ... Max」然后交出一张空纹理 —— 表现是世界全黑、
-    // GUI 正常（Illusion\run\dxrmc\sl.log 里 2289 行都是这句：render 844x440 vs Min 1280x667）。
+    // 状态：全进程一个 DLSS 实例（设备本身也是单例）。
+    // 每档名义上采样倍率（target/render）；NGX 的动态分辨率区间是 [target/nominal, target]，
+    // render 比它小时 NGXDLAA::EvaluateFeature 只写一行 dynamic scaling error 并交出空纹理
+    // —— 世界全黑、GUI 正常。
     static const double kTierNominalFactor[5] = {3.0, 2.0, 1.72, 1.5, 1.0};
     struct State
     {
@@ -205,9 +145,7 @@ namespace
         bool evalOk = false;
         bool evalFailWarned = false;  // an evaluate failure was already reported
         bool resetPending = false;    // a reset request is folded into the next Evaluate
-        // P108 (user m10920): DLSS is now an INDEPENDENT switch, not an anti-aliasing mode.
-        // The authoritative gate lives in the device module (gCtx.dlssEnabled); this mirror
-        // only exists so the status query and the log lines can report it.
+        // DLSS 是独立开关（权威门在设备模块的 gCtx.dlssEnabled），这里只是镜像，供状态查询与日志用。
         bool enabled = false;
         uint64_t submitCount = 0;     // successful Evaluate calls
         bool tooSmallWarned = false;
@@ -215,34 +153,22 @@ namespace
         NVSDK_NGX_Parameter* params = nullptr;
         NVSDK_NGX_Handle* feature = nullptr;
         ID3D12Resource* depthStencil = nullptr;  // DLSS scratch buffer, DEFAULT heap
-        // P108: DLSS must write into a resource created with ALLOW_UNORDERED_ACCESS. The
-        // JVM's GUI/present target is created with ALLOW_RENDER_TARGET only (that flag is set
-        // from usage bit 8 in d3d12_device.cpp and there is no UAV bit at all), and NGX
-        // rejects it with `FAIL_RWFlagMissing` (0xBAD00009). Adding a UAV bit to the present
-        // target would drag the whole present/blit/barrier path in, so instead DLSS writes
-        // into this private, target-sized UAV texture and the result is copied into the real
-        // output on the same command list. Self-contained: no JVM change needed.
+        // DLSS 必须写进带 ALLOW_UNORDERED_ACCESS 的资源：JVM 的 GUI/呈现目标没有 UAV 位，
+        // NGX 会回 FAIL_RWFlagMissing(0xBAD00009)。所以写进这张私有的目标尺寸 UAV 纹理，再在
+        // 同一条命令列表里拷进真正的输出 —— 不需要改 JVM 侧。
         ID3D12Resource* dlssOutput = nullptr;    // private UAV intermediate
-        // B4：这张纹理现在由**设备模块**创建（见 mcdr_dlss_impl.h 的 DlssTextureDesc）：本单元
-        // 只持有一个不透明句柄 + 裸资源指针，销毁必须交回模块（destroyTrackedTexture），
-        // **绝不**自己 Release —— 否则就又是一条绕过模块、绕过跟踪表的资源路径。
+        // B4：纹理由设备模块创建（含深度快照/MV 中间纹理）；本单元只留不透明句柄 + 裸指针，销毁交回 destroyTrackedTexture，绝不 Release。
         void* dlssOutputObject = nullptr;
-        // P108 (user m11147 follow-up): the UAV texture the JVM created through the module's
-        // `createTexture` path. Preferred over `dlssOutput` for the reasons recorded at the
-        // `ngxTarget` selection in mcdr_dlss_evaluate: this unit's own creation path produces a
-        // resource the GPU does not write to. Empty (`nullptr`) means "fall back to private".
-        // NOT owned by this unit — the module keeps the Dx12Object alive.
+        // JVM 经模块 createTexture 交付的 UAV 输出，优先于 dlssOutput；nullptr = 退回私有纹理；本单元不持有。
         ID3D12Resource* externalOutput = nullptr;
         UINT dlssOutputWidth = 0;
         UINT dlssOutputHeight = 0;
         DXGI_FORMAT dlssOutputFormat = DXGI_FORMAT_UNKNOWN;
-        // P108: tracked transitions are delegated to the device module (see transition()).
+        // 状态转换委托设备模块（见 transition()）。
         DlssTransitionFn transitionFn = nullptr;
         void* transitionCtx = nullptr;
-        // P108: the private D32 depth snapshot (see mcdr_dlss_snapshot_depth). When present it
-        // replaces the JVM's `pInDepth`, which by the time DLSS runs has already been cleared.
+        // 私有 D32 深度快照：存在时替代 JVM 的 pInDepth（DLSS 跑时它已被清空）。
         ID3D12Resource* depthSnapshot = nullptr;
-        // B4：同上 —— 深度快照也由设备模块创建，这里只留句柄。
         void* depthSnapshotObject = nullptr;
         UINT depthSnapshotWidth = 0;
         UINT depthSnapshotHeight = 0;
@@ -252,26 +178,16 @@ namespace
         UINT depthSnapshotSamples = 0;
         UINT64 depthSnapshotFrame = 0;   // frame counter at the last snapshot
         bool depthSnapshotWarned = false;
-
-        // P199 (user m0412x, "缓慢的内存泄露"): `slDLSSSetOptions` used to be called on EVERY
-        // frame, because `mcdr_dlss_create` runs per frame and the streamline branch has nothing
-        // to create. Streamline re-derives its internal DLSS resources on every call, and the
-        // measured effect was process private bytes growing ~800 MB/min with DLSS on, completely
-        // flat with DLSS off. Options only change when the tier / output size / exposure changes,
-        // so cache the last pushed set here and skip the call when nothing moved. `slOptsApplied`
-        // is cleared whenever the feature is destroyed so the next create re-pushes.
+// slDLSSSetOptions 只在选项真的变化时下发：Streamline 每次调用都会重建内部 DLSS 资源，
+// 实测逐帧调用时进程私有内存 ~800 MB/min、关掉 DLSS 则完全平坦。feature 销毁时清缓存，
+// 下次 create 重推。
         bool slOptsApplied = false;
         int32_t slOptMode = -1;
         uint32_t slOptOutW = 0;
         uint32_t slOptOutH = 0;
         float slOptPreExposure = -1.0f;
         float slOptExposureScale = -1.0f;
-
-        // P199b: the per-frame evaluate path pushes `slDLSSSetOptions` too (it builds its own
-        // `sl::DLSSOptions` for the tags it just set), so it needs its own memory of what was
-        // last applied. Keeping the two caches separate is deliberate: the create path and the
-        // evaluate path can legitimately disagree in between (a resize lands in the create path
-        // first), and sharing one cache made the options silently never re-apply.
+// 逐帧 Evaluate 路径有自己的 slDLSSSetOptions 缓存：它与 create 路径可能暂时不一致（resize 先进 create），共用一个缓存会让选项再也不重发。
         bool slEvalOptsValid = false;
         int32_t slEvalOptMode = -1;
         uint32_t slEvalOptOutW = 0;
@@ -282,51 +198,37 @@ namespace
         bool slEvalOptHdr = false;
 
         ID3D12Resource* mvBuffer = nullptr;      // intermediate for a non-RG16 MV input
-        // B4：MV 中间纹理也由设备模块创建（同一入口），这里只留句柄。
         void* mvBufferObject = nullptr;
         void* runtimeModule = nullptr;           // HMODULE of nvngx_dlss.dll once loaded
         UINT64 scratchBytes = 0;
         UINT32 mvCopyResourceState = D3D12_RESOURCE_STATE_COMMON;
-        // The size tuple the current feature was created for. A change here forces a
-        // destroy + recreate on the next Evaluate (and a history reset).
+        // 当前 feature 创建时的尺寸元组；变化即 destroy + recreate（历史重置）。
         int32_t renderWidth = 0;
         int32_t renderHeight = 0;
         int32_t targetWidth = 0;
         int32_t targetHeight = 0;
         uint32_t qualityValue = 0;
-        // P108 (user m11147): the DLSS tier is now an explicit user choice (Performance /
-        // Balanced / Quality) instead of only "closest to the render:target ratio".
-        //   requestedQuality < 0  -> the JVM never set one: fall back to chooseQuality()
-        //   requestedQuality >= 0 -> use it verbatim, and rebuild the feature when it changes
-        // `effectiveQuality` is the ACCEPTED TIER (0..3, -1 = ratio-chosen) the live feature was
-        // actually built with — after the DLAA 1:1 restriction turned tier 3 into Quality, it is
-        // 2, not the requested 3. `qualityValue` is the NGX enum (DLAA == 5); never compare the
-        // two directly (that mistake rebuilt the feature every frame).
+        // requestedQuality < 0 = JVM 没指定，按比例选档；>= 0 则原样使用，变化即重建。
+        // effectiveQuality 是**被接受的档位**（0..4，-1 = 按比例选），不是 NGX 枚举（DLAA == 5）；
+        // 两者绝不能直接比较 —— 那样会逐帧重建 feature。
         int requestedQuality = -1;
         int effectiveQuality = -1;
-        // P108ac (user m08033): the DLSS *model* (NGX "render preset" hint). The JVM turns the
-        // model button into one of NVSDK_NGX_DLSS_Hint_Render_Preset values (0 = Default,
-        // 10 = J, 11 = K, 12 = L, 13 = M, ...) and it lands here.
-        //   requestedPreset >= 0 -> set the hint for the tier being built; it is a CreateFeature
-        //   input, so a change rebuilds the feature (same mechanism as the tier).
-        // `effectivePreset` is the value the live feature was created with.
+        // 请求的 NGX render preset（0=Default，10=J，11=K，12=L，13=M）；CreateFeature 输入，变化即重建。effectivePreset 是实际建成的值。
         int requestedPreset = 0;
         int effectivePreset = 0;
         bool presetRequestLogged = false;
-        // P108aa (user m11796): true while a requested DLAA is being downgraded because
-        // render != target. State-change gate for the one-shot ERROR (it used to print per frame).
+        // DLAA 因 render != target 被降级期间为 true —— 一次性 ERROR 的状态门（曾逐帧打印）。
         bool dlaaDowngraded = false;
         bool qualityIsExplicit = false;
         bool qualityRequestLogged = false;
         int32_t featureFlags = 0;
-        // Strings for the status query and the one-time log lines.
         std::string failure;        // the stage that failed, for the status query
         std::string runtimePath;    // nvngx_dlss.dll as loaded (reported by the RTX probe)
         std::string optimalText;    // "target 1280x720, render 960x540 -> quality Balanced (...)"
         uint32_t optimalRenderW = 0;
         uint32_t optimalRenderH = 0;
         float optimalSharpness = 0.0f;
-        // Per-frame input summary: log only when a value changes (no per-frame spam).
+        // 输入摘要只在值变化时打印。
         int32_t lastRenderW = -1;
         int32_t lastRenderH = -1;
         int32_t lastTargetW = -1;
@@ -339,27 +241,15 @@ namespace
         float lastJitterY = 1e9f;
         float lastNear = 1e9f;
         float lastFar = 1e9f;
-        // P108 blocker-B: the vendor directory the JVM announced (the same `<user.dir>
-        // \dxrmc\` MCDR.dll is extracted to), whether the process DLL search path was
-        // widened for it, and whether the three descriptive lines were printed yet.
+        // JVM 声明的厂商目录、是否已为它放宽进程 DLL 搜索路径、诊断行是否已打印。
         std::wstring vendorDir;
         bool searchPathSet = false;
         bool envLogged = false;
     };
 
     State s;
-
-    // -----------------------------------------------------------------------
-    // Runtime discovery (see the file-header note). Everything here logs through the
-    // module's own dbgLog*, so a failure reads like any other native line.
-    // -----------------------------------------------------------------------
-    // The directory THIS module (MCDR.dll) was loaded from.
-    //
-    // NOT GetModuleFileNameW(nullptr): passing NULL returns the **executable**, which in a
-    // Minecraft dev run is the JDK's java.exe, so every exe-relative guess landed in
-    // `C:\Program Files\GraalVM\JDKs\25.1\bin`. That was the actual cause of the whole
-    // `ngx=no` / ERROR_MOD_NOT_FOUND investigation: the vendor DLLs sit next to MCDR.dll in
-    // `<user.dir>\dxrmc\`, and no candidate ever looked there.
+// 本模块（MCDR.dll）被加载的目录。不是 GetModuleFileNameW(nullptr)：传 NULL 返回的是**可执行
+// 文件**（开发运行时是 java.exe），厂商 DLL 实际与 MCDR.dll 同处 <user.dir>\dxrmc\。
     std::wstring moduleDirectoryW() {
         HMODULE self = nullptr;
         if (::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -380,9 +270,7 @@ namespace
         }
         return w.substr(0, slash + 1);
     }
-
-    // The directory the *executable* lives in (java.exe's bin during a dev run). Kept
-    // separate from moduleDirectoryW so the diagnostics can show both.
+// 可执行文件所在目录（开发运行时是 java.exe 的 bin），与 moduleDirectoryW 分开便于诊断对照。
     std::wstring executableDirectoryW() {
         wchar_t path[MAX_PATH * 2] = {};
         const DWORD n = ::GetModuleFileNameW(nullptr, path, static_cast<DWORD>(std::size(path)));
@@ -420,13 +308,10 @@ namespace
                               nullptr, nullptr);
         return out;
     }
-
-    // Adds `dir` to the process DLL search path. SetDllDirectoryW alone would be enough
-    // (it inserts one directory into the standard search order), but AddDllDirectory needs
-    // the default-dirs mode to take effect, so both are issued and each result is logged.
+// 把 dir 加进进程 DLL 搜索路径：SetDllDirectoryW 与 AddDllDirectory 都要调（后者需要 default-dirs 模式），各自的返回值都记日志。
     void widenSearchPath(const std::wstring& dir) {
         if (dir.empty()) {
-            logWarn("DLSS vendor directory is empty; the DLL search path is left untouched");
+            logWarn("DLSS vendor dir empty; search path untouched");
             return;
         }
         const BOOL setDefault = ::SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS |
@@ -437,27 +322,24 @@ namespace
         const DLL_DIRECTORY_COOKIE cookie = ::AddDllDirectory(dir.c_str());
         const DWORD addErr = (cookie != nullptr) ? 0u : ::GetLastError();
         s.searchPathSet = true;
-        logInfo("DLSS search path widened for \"%s\": SetDefaultDllDirectories=%s(err=%lu) "
+        logInfo("DLSS path widen %s: default=%s(%lu) "
                 "SetDllDirectoryW=%s(err=%lu) AddDllDirectory=%s(err=%lu)",
                 narrow(dir).c_str(), setDefault ? "ok" : "failed", setDefaultErr,
                 setDir ? "ok" : "failed", setDirErr, (cookie != nullptr) ? "ok" : "failed", addErr);
     }
-
-    // One line that answers "where was it looking?" for the next failure.
+// 一行回答"它到底找过哪里"。
     void logEnvOnce() {
         if (s.envLogged) {
             return;
         }
         s.envLogged = true;
-        logInfo("DLSS load environment: moduleDir=\"%s\" cwd=\"%s\" exeDir=\"%s\" vendorDir=\"%s\" "
+        logInfo("DLSS env mod=%s cwd=%s exe=%s vendor=%s "
                 "searchPathSet=%d",
                 narrow(moduleDirectoryW()).c_str(), narrow(currentDirectoryW()).c_str(),
                 narrow(executableDirectoryW()).c_str(), narrow(s.vendorDir).c_str(),
                 s.searchPathSet ? 1 : 0);
     }
-
-    // Tries every plausible location, in order, logging each attempt with its own
-    // GetLastError. Returns the module handle, or NULL after logging the whole chain.
+// 按序尝试每个可能位置，每次失败各自记 GetLastError；全链失败后返回 NULL。
     HMODULE loadRuntimeDll() {
         std::wstring name = L"nvngx_dlss.dll";
         const std::wstring modDir = moduleDirectoryW();
@@ -471,32 +353,28 @@ namespace
             DWORD flags;
         };
         std::vector<Candidate> candidates;
-        // 1) bare name: the standard search order, with a widened path this is where the
-        //    vendor directory is found.
+        // 1) 裸名字：标准搜索顺序（放宽路径后厂商目录就在其中）。
         candidates.push_back({s.searchPathSet ? L"search-path(name)" : L"bare-name", name, false, 0});
-        // 2) the directory the JVM announced (== where MCDR.dll itself was extracted).
+        // 2) JVM 声明的目录（== MCDR.dll 被解出的地方）。
         if (!s.vendorDir.empty()) {
             candidates.push_back({L"vendor-dir", s.vendorDir + L"\\" + name, false, 0});
         }
-        // 3) MCDR.dll's own directory. This is the candidate that actually resolves the
-        //    shipped layout: JVM extractLibrary() writes MCDR.dll AND the vendor DLLs into
-        //    `<user.dir>\dxrmc\`, so the runtime always sits next to this module.
+        // 3) MCDR.dll 自己的目录：extractLibrary() 把 DLL 与厂商库一起写进 <user.dir>\dxrmc\，运行期必然在旁边。
         if (!modDir.empty()) {
             candidates.push_back({L"module-dir", modDir + name, true,
                                   LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR});
         }
-        // 4) `<cwd>\dxrmc\` — the extracted vendor directory under the game directory, for
-        //    the case where the module was loaded from somewhere else.
+        // 4) <cwd>\dxrmc\：模块从别处加载时的兜底。
         if (!cwd.empty()) {
             candidates.push_back({L"cwd-dxrmc", cwd + L"\\dxrmc\\" + name, true,
                                   LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR});
         }
-        // 5) `<exeDir>\dxrmc\` — same idea for a non-dev deployment.
+        // 5) <exeDir>\dxrmc\：非开发部署同理。
         if (!exeDir.empty()) {
             candidates.push_back({L"exeDir-dxrmc", exeDir + L"dxrmc\\" + name, true,
                                   LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR});
         }
-        // 6) cwd, likewise explicit.
+        // 6) 当前工作目录。
         if (!cwd.empty()) {
             candidates.push_back({L"cwd", cwd + L"\\" + name, true,
                                   LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR});
@@ -523,7 +401,7 @@ namespace
                         static_cast<unsigned long long>(i + 1), s.runtimePath.c_str());
                 break;
             }
-            logWarn("nvngx runtime attempt %llu/%llu (%s) failed: \"%s\" -> err=%lu (%s)",
+            logWarn("nvngx load %llu/%llu (%s) failed: %s err=%lu (%s)",
                     static_cast<unsigned long long>(i + 1),
                     static_cast<unsigned long long>(candidates.size()), c.what,
                     narrow(c.useEx ? c.path : std::wstring(name)).c_str(), err,
@@ -532,41 +410,21 @@ namespace
                                                                               : "see winerror.h"));
         }
         if (found == nullptr) {
-            logWarn("nvngx_dlss.dll could not be loaded from any candidate; DLSS will report "
+            logWarn("nvngx_dlss.dll not in any candidate"
                     "itself unavailable. Note: nvngx_dlss.dll imports only system DLLs, so "
                     "ERROR_MOD_NOT_FOUND here points at the path, not at a missing dependency.");
         }
         return found;
     }
-
-    // -----------------------------------------------------------------------
-    // P108 blocker-B ROOT CAUSE: NVSDK_NGX_FeatureCommonInfo.PathListInfo.
-    //
-    // `nvsdk_ngx_defs.h:400-409` documents PathListInfo as "List of all paths in descending
-    // order of search sequence to locate a feature dll in, other than the default path -
-    // application folder"; `:519-526` repeats it for FeatureDiscoveryInfo. NGX's default is
-    // the APPLICATION folder, which in a Minecraft dev run is the JDK's `bin\`, never our
-    // vendor directory. With an empty path list NGX cannot find nvngx_dlss.dll and answers
-    // `FAIL_InvalidParameter` (0xBAD00005) to BOTH Init_with_ProjectID and
-    // GetFeatureRequirements.
-    //
-    // Measured outside the game (PowerShell P/Invoke, real IDXGIAdapter + D3D12 device):
-    //   GetFeatureRequirements(adapter, FeatureInfo = vendor path list)
-    //       -> 0x00000001 Success, FeatureSupported = 0x0 (supported), MinOSVersion "10.0.0"
-    //   In-game probe with FeatureInfo = NULL reported "query failed: invalid parameter
-    //       (0xFFFFFFFFBAD00005)", and Init_with_ProjectID likewise returned 0xBAD00005.
-    // (Init itself is NOT reachable from PowerShell: nvngx_dlss.dll exports only
-    // NVSDK_NGX_CUDA_* and NGX_SNIPPETS_*, so the D3D12 entry points must be exercised
-    // in-game.)
-    //
-    // The buffers are owned here and live for the process lifetime because NGX keeps the
-    // pointers (PathListInfo.Path is `wchar_t const* const*`).
-    // -----------------------------------------------------------------------
+// PathListInfo 必须指向厂商目录：NGX 默认只在**应用目录**里找 feature DLL（开发运行时是 java.exe
+// 的 bin），路径表为空时 Init_with_ProjectID 与 GetFeatureRequirements 都回
+// FAIL_InvalidParameter(0xBAD00005)。
+// 这些缓冲由本单元持有并活到进程结束 —— NGX 保留的是指针（PathListInfo.Path 是
+// `wchar_t const* const*`）。
     NVSDK_NGX_FeatureCommonInfo* gCommonInfo = nullptr;
     std::wstring* gPathListEntry = nullptr;    // the one wide string the list points at
     const wchar_t** gPathListArray = nullptr;  // the one-element array of path pointers
-
-    // (Re)builds the common info so PathListInfo holds `dir` (empty -> Length 0).
+// （重）建 common info，让 PathListInfo 指向 dir（dir 为空 => Length 0）。
     void rebuildCommonInfo(const std::wstring& dir) {
         if (gPathListEntry == nullptr) {
             gPathListEntry = new std::wstring();
@@ -585,9 +443,7 @@ namespace
         gCommonInfo->InternalData = nullptr;
         gCommonInfo->LoggingInfo = NVSDK_NGX_LoggingInfo{};
     }
-
-    // The pointer handed to NGX and to the RTX probe's requirement query. NULL only while the
-    // path list is still empty (then the probe keeps its old "inconclusive" behaviour).
+// 交给 NGX 与 RTX 探测的指针；路径表为空时为 NULL。
     NVSDK_NGX_FeatureCommonInfo* commonInfoForNgx() {
         if (gCommonInfo == nullptr || gPathListEntry == nullptr ||
             gCommonInfo->PathListInfo.Length == 0u) {
@@ -595,38 +451,14 @@ namespace
         }
         return gCommonInfo;
     }
-
-    // Builds the DLSS feature flags from the frame description.
-    //
-    // Re-derived from a WORKING integration shipping against the same 310.x runtime (ETS2/ATS
-    // DLAA/DLSS injection mod, `src/dlaa.cpp`). Two of the previous choices were wrong, and both are
-    // consistent with "NGX writes nothing / the world comes out black":
-    //
-    //   AutoExposure  **always on**. Reference: "AutoExposure spares us an exposure texture; it is
-    //                 ignored for LDR input anyway." We have no GPU exposure texture and used to pass
-    //                 a constant 1.0 with this flag absent — so NGX had neither a texture nor the
-    //                 flag that lets it synthesise one.
-    //   DepthInverted on — reverse-Z (see the file header).
-    //   MVLowRes      **on when render != target**. The bit means "the motion vectors are at the
-    //                 (low) render resolution", which is exactly our case: the velocity pass runs at
-    //                 render res and writes render-pixel offsets. The old code left it off and even
-    //                 documented the opposite, so NGX rescaled them as if they were display-sized.
-    //   MVJittered    **on**. D3D12Velocity.kt builds `currViewProj` from the JITTERED projection and
-    //                 then adds `PrevJitterPixels`, so both ends of every motion vector sit on the
-    //                 jittered grid — the jitter delta is inside them. Declaring that (MVJittered) is
-    //                 what lets NGX cancel it with `InJitterOffsetX/Y`; leaving it off made NGX treat
-    //                 those deltas as real motion. The old note ("jitter is frozen to 0 anyway") no
-    //                 longer holds: P110 removed the freeze, TAA and DLSS now share one Halton(2,3)
-    //                 sequence, and the flag is set unconditionally — with jitter 0 it is a no-op.
-    //   IsHDR         off — 8-bit UNORM target.
-    //
-    // Cancelling that jitter needs no extra NGX knob: `MVJittered` plus the `InJitterOffsetX/Y`
-    // already passed to `EvaluateFeature` is the whole contract. (This SDK's header has no
-    // "motion vector jitter cancellation" parameter key at all — an earlier note here claimed one.)
-    // P108ac (user m08033): the DLSS *model* is selected through NGX's "render preset" hint, one
-    // parameter key per quality tier. Only the key matching the tier the feature is built with is
-    // consulted, so set exactly that one — writing all six would be noise, and a stale value on an
-    // unused key could silently apply later when the tier changes without us.
+// 从帧描述推导 DLSS feature flags：
+//   AutoExposure 看环境变量（默认关）；没有 exposure 纹理，声明自动曝光就让 NGX 自己合成。
+//   DepthInverted 常开 —— 引擎是 reverse-Z。
+//   MVLowRes 只在 render != target 时置位：速度 pass 跑在 render 分辨率上。
+//   MVJittered **不置位** —— MV 是真实运动、不含 jitter 差，置位会让 NGX 去减一个不存在的量。
+//   IsHDR 关 —— 8 位 UNORM 目标。
+// 取消 jitter 只靠 InJitterOffsetX/Y，本版 SDK 没有额外的"MV jitter cancellation"参数。
+// render preset（DLSS 模型）只给正在构建的那一档写 hint key，写全部六个只会留下脏值。
     const char* presetHintKey(uint32_t qualityValue) {
         switch (qualityValue) {
             case NVSDK_NGX_PerfQuality_Value_DLAA:
@@ -639,16 +471,13 @@ namespace
                 return NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance;
             case NVSDK_NGX_PerfQuality_Value_UltraPerformance:
                 return NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance;
-            // Ultra Quality exists in this SDK's enum but has no hint key of its own, so it falls
-            // through to `default` (no preset written = NGX's own choice for that tier).
+            // Ultra Quality 在枚举里但没有自己的 hint key，落到 default（不写 = NGX 自选）。
             case NVSDK_NGX_PerfQuality_Value_UltraQuality:
             default:
                 return nullptr;
         }
     }
-
-    // Human-readable form of a preset value for the log lines ("Default" / "J" / "K" / "L" / "M",
-    // or the raw number for the letters NVIDIA marks as reserved).
+// preset 的可读名（Default / J / K / L / M，保留字母打原值）。
     std::string presetName(int32_t preset) {
         switch (preset) {
             case NVSDK_NGX_DLSS_Hint_Render_Preset_Default:
@@ -671,12 +500,7 @@ namespace
     }
 
     int32_t computeFeatureFlags(const mcdr_dlss_input& in) {
-        // P108x (A/B experiment, parent request): AutoExposure is OFF unless asked for via
-        // MCDR_DLSS_AUTOEXPOSURE=1. We declare "auto exposure" while passing no `pInExposureTexture`
-        // at all, and the device is removed ~1 ms after the first evaluate that has a REAL depth
-        // buffer — the earlier build, whose depth snapshot was empty, survived the same call. The
-        // reference integration ships this combination, but it is D3D11 on another DLSS build;
-        // 310.9.1 may not tolerate it. Default OFF so one run answers "is AutoExposure the trigger?".
+        // AutoExposure 由 MCDR_DLSS_AUTOEXPOSURE=1 显式开启（默认关）：声明了却不给 exposure 纹理会移除设备。
         int32_t flags = 0;
         {
             char ae[8] = {};
@@ -691,29 +515,13 @@ namespace
         if (in.renderWidth != in.targetWidth || in.renderHeight != in.targetHeight) {
             flags |= static_cast<int32_t>(NVSDK_NGX_DLSS_Feature_Flags_MVLowRes);
         }
-        // P110: the motion vectors already contain the sub-pixel jitter (see the note in the feature
-        // flag comment block above), so tell NGX to cancel it with InJitterOffsetX/Y.
-        // P134：MV 改成真实运动后不再置 MVJittered（否则 NGX 会去减一个不存在的 jitter 差）。
+        // MV 是真实运动、不含 jitter 差 => **不置** MVJittered（否则 NGX 会去减一个不存在的 jitter 差）。
         return flags;
     }
-    // -----------------------------------------------------------------------
-    // Resource helpers (this unit owns no device state, so it creates its own scratch
-    // resources directly).
-    // -----------------------------------------------------------------------
-    // P108: resources move through the DEVICE MODULE's tracked transition, never through a
-    // barrier written here.
-    //
-    // History (the bug this replaces): this helper used to take an explicit `before` state and
-    // emit the barrier itself. That assumed the previous pass left the resource in
-    // RENDER_TARGET/DEPTH_WRITE — but `endRenderPass` (P11) explicitly returns every attachment
-    // to COMMON at the end of each pass, so the assumed `before` was wrong. In release that is
-    // silently tolerated; the D3D12 debug layer reports "Before state ... does not match", and
-    // P11's own notes record that this class of mismatch leads to GPU state corruption and a TDR
-    // freeze. The module keeps a per-resource state map (`ctx->resourceState`) and its
-    // `transitionTextureTo` is idempotent, so asking it is both correct and cheaper.
-    //
-    // `s.transitionFn`/`s.transitionCtx` are supplied by the module per call; when absent (a
-    // diagnostic path that never opened a command list) transitions are simply skipped.
+    // 资源转换一律走设备模块的跟踪式 transition，绝不在这里手写 barrier：endRenderPass 每趟都会把
+    // 附件还原到 COMMON，所以调用方假设的 Before 状态是错的（release 下静默，调试层报 mismatch，
+    // 后果是状态损坏 / TDR 冻结）。transitionTextureTo 幂等且更便宜。
+    // transitionFn/transitionCtx 由模块逐调用注入；缺席（没开命令列表的诊断路径）就跳过转换。
     void transition(ID3D12Resource* res, D3D12_RESOURCE_STATES after) {
         if (res == nullptr) {
             return;
@@ -723,9 +531,7 @@ namespace
         }
         s.transitionFn(s.transitionCtx, reinterpret_cast<void*>(res), static_cast<int32_t>(after));
     }
-
-    // B4：本单元**唯一**的纹理创建入口（模块注入的 create/destroy，见 mcdr_dlss_impl.h）。
-    // 成功时 *outObject / *outResource 都填好；失败返回 false，调用方按"没有私有纹理"处理。
+// 本单元**唯一**的纹理创建入口；失败返回 false，调用方按"没有私有纹理"处理。
     bool createTrackedTexture(void* ctx, UINT width, UINT height, DXGI_FORMAT format, UINT mips,
                               UINT arraySize, UINT samples, UINT flags, void** outObject,
                               ID3D12Resource** outResource) {
@@ -736,7 +542,7 @@ namespace
             static bool s_warned = false;
             if (!s_warned) {
                 s_warned = true;
-                logWarn("the device module injected no texture-create entry — private DLSS "
+                logWarn("no texture-create entry; DLSS uses JVM textures only"
                         "textures are unavailable (older DLL/JVM pairing); only JVM-supplied "
                         "resources are used");
             }
@@ -759,8 +565,7 @@ namespace
         *outResource = static_cast<ID3D12Resource*>(res);
         return true;
     }
-
-    // 销毁（幂等，指针一起清空）。`ctx` 只用于从该 ctx 的跟踪表里摘键，可为 nullptr（shutdown）。
+// 销毁（幂等）；ctx 可为 nullptr，仅用于从该 ctx 的跟踪表摘键。
     void destroyTrackedTexture(void* ctx, void** object) {
         if (object != nullptr && *object != nullptr && gDestroyTexture != nullptr) {
             gDestroyTexture(ctx, *object);
@@ -798,25 +603,16 @@ namespace
             IID_PPV_ARGS(&s.depthStencil));
         if (FAILED(hr)) {
             s.depthStencil = nullptr;
-            logWarn("DLSS scratch buffer creation failed (%llu bytes, hr=0x%08X); DLSS disabled",
+            logWarn("DLSS scratch failed %llu bytes hr=0x%08X; disabled",
                     static_cast<unsigned long long>(bytes), static_cast<unsigned>(hr));
             return false;
         }
         s.scratchBytes = bytes;
         return true;
     }
-
-    // P108: the private UAV texture DLSS writes into (see the field comment on `dlssOutput`).
-    // Recreated only when the target size or format changes. Returns nullptr on failure (the
-    // caller then reports the reason and leaves the existing path in place).
-    //
-    // B4: the texture is created **by the device module** now (DlssTextureDesc, see
-    // mcdr_dlss_impl.h). Consequences this function must honour:
-    //   * the module owns the resource and seeds its tracked state map with COMMON, so the very
-    //     first transition in this list has a real anchor instead of a COMMON guess;
-    //   * it is released through the module's deferred-delete path — never `Release()` here;
-    //   * this unit keeps two values only: the opaque handle (`dlssOutputObject`) and the raw
-    //     pointer NGX is handed (`dlssOutput`).
+// DLSS 写进的私有 UAV 纹理；只在目标尺寸或格式变化时重建，失败返回 nullptr。
+// 纹理由**设备模块**创建（DlssTextureDesc）：跟踪表以 COMMON 起锚，释放走模块的延迟删除，
+// 绝不在这里 Release()。本单元只留不透明句柄 + 交给 NGX 的裸指针。
     ID3D12Resource* createDlssOutput(UINT width, UINT height, DXGI_FORMAT format) {
         if (s.dlssOutput != nullptr && s.dlssOutputWidth == width && s.dlssOutputHeight == height &&
             s.dlssOutputFormat == format) {
@@ -830,23 +626,14 @@ namespace
         if (width == 0 || height == 0) {
             return nullptr;
         }
-        // P108x: UAV **only**.
-        //
-        // This used to be `ALLOW_UNORDERED_ACCESS | ALLOW_RENDER_TARGET`. A write-side bisect then
-        // showed the texture could not hold a write at all: filling it from the colour input with
-        // the COPY ENGINE — same texture, same queue, no shaders, no NGX — read back all-zero both
-        // immediately and on the following frame, while the JVM target beside it read back fine
-        // (mean 17.6/16.2/11.3, alpha 255). Copying into a resource needs no flag, and NGX is the
-        // only consumer here that needs one (`FAIL_RWFlagMissing` = "UAV missing"), so the flag set
-        // itself was the problem: `UAV | RTV` is the classic case where a driver declines the
-        // unordered-access path while still reporting success.
-        // P108x: UAV **only** (see the note above); ALLOW_RENDER_TARGET removed.
+        // 只要 UAV。曾同时带 ALLOW_RENDER_TARGET，结果 GPU 静默不写入（读回全 0）—— UAV|RTV 正是
+        // 驱动拒绝无序访问路径却仍报成功的组合。
         void* obj = nullptr;
         ID3D12Resource* res = nullptr;
         if (!createTrackedTexture(s.transitionCtx, width, height, format, 1, 1, 1,
                                   static_cast<UINT>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), &obj,
                                   &res)) {
-            logWarn("DLSS private UAV output creation failed (%ux%u fmt=%d) — the device "
+            logWarn("private UAV output create failed (%ux%u fmt=%d)"
                     "module refused or failed to create it; the existing path stays in effect",
                     width, height, static_cast<int>(format));
             return nullptr;
@@ -856,16 +643,13 @@ namespace
         s.dlssOutputWidth = width;
         s.dlssOutputHeight = height;
         s.dlssOutputFormat = format;
-        logInfo("DLSS private UAV output created by the device module: %ux%u fmt=%d "
+        logInfo("private UAV output %ux%u fmt=%d (UAV, tracked)"
                 "(ALLOW_UNORDERED_ACCESS, tracked) — DLSS writes here, then the result is copied "
                 "into the JVM's target",
                 width, height, static_cast<int>(format));
         return s.dlssOutput;
     }
-
-    // -----------------------------------------------------------------------
-    // P108: NGX's own log lines are routed into the native log, so a failing Init explains
-    // itself instead of only returning a code. Signature per nvsdk_ngx_defs.h:376-379.
+// NGX 自己的日志接进 native 日志，Init 失败时能自解释。
     void NVSDK_CONV dlssNgxLogCallback(const char* message, NVSDK_NGX_Logging_Level loggingLevel,
                                        NVSDK_NGX_Feature sourceComponent) {
         (void)loggingLevel;
@@ -873,20 +657,8 @@ namespace
             logInfo("NGX[%d] %s", static_cast<int>(sourceComponent), message);
         }
     }
-
-    // NGX init. Runs at most once (success or failure); the caller already checked that
-    // a device exists.
-    // -----------------------------------------------------------------------
-    // P108: the NGX application-data directory.
-    //
-    // NGX writes its own logs/cache there and rejects a path that does not exist with
-    // `FAIL_InvalidParameter` — but the reference integration that ships DLSS against this
-    // same 310.x runtime (ETS2/ATS DLAA mod, `src/dlaa.cpp`) simply passes **the directory
-    // this DLL lives in**, which always exists and never needs creating. Measured order:
-    //   1. this module's own directory (MCDR.dll sits in `<user.dir>\dxrmc\` next to the
-    //      vendor DLLs, so this is the natural home);
-    //   2. `.\ngx`, created on demand (the previous behaviour);
-    //   3. `"."` as a last resort.
+// NGX 的 applicationDataPath：目录不存在会被回 FAIL_InvalidParameter。优先用本 DLL 所在目录
+// （必然存在、且厂商库就在旁边），其次按需创建 .\ngx，最后 "."。
     std::wstring buildAppDataPath() {
         std::wstring own = moduleDirectoryW();
         while (!own.empty() && (own.back() == L'\\' || own.back() == L'/')) {
@@ -900,7 +672,7 @@ namespace
         if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
             if (::CreateDirectoryW(fallback.c_str(), nullptr) == FALSE &&
                 ::GetLastError() != ERROR_ALREADY_EXISTS) {
-                logWarn("could not create the NGX application-data directory \"%s\" (err=%lu); "
+                logWarn("no NGX appdata dir %s (err=%lu); using cwd"
                         "falling back to the process working directory",
                         narrow(fallback).c_str(), ::GetLastError());
                 return L".";
@@ -914,20 +686,11 @@ namespace
 #if MCDR_DLSS_HAVE_STREAMLINE
     std::wstring dlssModuleDirectory();  // 定义在下面，auto 探测要先用到
 #endif
-
-    // P121：**默认走 Streamline**。
-    //   1) `MCDR_DLSS_IMPL` 显式指定优先（`ngx` 强制回退、`streamline` 强制启用）；
-    //   2) 否则 `MCDR_STREAMLINE=1` 也算启用（历史开关）；
-    //   3) 否则 auto：`sl.interposer.dll` 与 MCDR.dll 同目录就用 Streamline，不在就回退 NGX
-    //      —— 发行版按 NVIDIA 许可不带运行库（AGENTS.md「不可再分发」），这条保证那时退回 NGX。
+// 默认走 Streamline：MCDR_DLSS_IMPL 显式指定 > MCDR_STREAMLINE=1 > 按 sl.interposer.dll 是否与 MCDR.dll 同目录判定。
     bool dlssImplStreamline() {
-        // P126（用户 m14488「现在已经改到了默认 streamline」之后的实测）：以前整段被
-        // `static const bool` 缓存成**一次判定**。而 `sl.interposer.dll` 是 JVM 侧启动时
-        // 才解压到 `dxrmc/` 的，native 的第一次调用可能早于解压完成 —— 于是判定成 false 并
-        // 永久缓存，后面即使 interposer 已经在目录里也一直走 NGX（NGX 在本机建不出 feature，
-        // `0xBAD0000C out of date`，于是每帧静默 return 0，表现就是「DLSS 没出图、只剩抖动」）。
-        // 现在：环境变量每次读（显式指定就该立即生效），文件探测只在**还没看到**时重试，
-        // 见到之后才锁存 —— 不会再把一次过早的否定结果固定下来。
+        // 实现选择不能缓存成一次判定：sl.interposer.dll 是 JVM 启动时才解出的，early 判定会把 false
+        // 永久锁死（之后每帧静默返回 0，表现是"DLSS 没出图、只剩抖动"）。环境变量每次读；文件探测
+        // 只在还没看到时重试，见到才锁存。
         char buf[16] = {};
         const DWORD n = ::GetEnvironmentVariableA("MCDR_DLSS_IMPL", buf, 16);
         if (n > 0) {
@@ -954,12 +717,9 @@ namespace
 #endif
     }
 
-
-
 #if MCDR_DLSS_HAVE_STREAMLINE
     using PFn_SlDLSSSetOptions = sl::Result (*)(const sl::ViewportHandle&, const sl::DLSSOptions&);
-
-    // MCDR.dll 所在目录（带结尾反斜杠）。
+// MCDR.dll 所在目录（带结尾反斜杠）。
     std::wstring dlssModuleDirectory() {
         HMODULE self = nullptr;
         if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -973,8 +733,7 @@ namespace
         const auto slash = pathStr.find_last_of(L"\\/");
         return slash == std::wstring::npos ? std::wstring() : pathStr.substr(0, slash + 1);
     }
-
-    // 运行时取 interposer 的 slDLSSSetOptions（不引入静态导入，缺 SL 时返回 nullptr）。
+// 运行时解析 slDLSSSetOptions（不引入静态导入；缺 SL 时返回 nullptr）。
     PFn_SlDLSSSetOptions slDlssSetOptionsFn() {
         static const PFn_SlDLSSSetOptions fn = []() -> PFn_SlDLSSSetOptions {
             const std::wstring dir = dlssModuleDirectory();
@@ -993,13 +752,10 @@ namespace
         }();
         return fn;
     }
-
-    // P249：把原生 DXGI 工厂原地升级成 SL 的代理工厂（`eUseDXGIFactoryProxy` 模式下建
-    // swapchain 的唯一正确入口，语义见 mcdr_dlss_impl.h 的声明处与 sl_core_api.h:265-275）。
-    // 未走 streamline / interposer 不在 / 还没 slInit 时返回 0，调用方继续用原生工厂。
+// 把原生 DXGI 工厂原地升级成 SL 代理工厂（唯一正确入口）；未走 SL 时返回 0。
     int32_t streamlineUpgradeInterface(void** baseInterface) {
         if (baseInterface == nullptr || *baseInterface == nullptr) return 0;
-        // PFun_slUpgradeInterface 在 SDK 里是**函数类型**别名（sl_core_api.h:66），要用指针。
+        // PFun_slUpgradeInterface 是函数类型别名，要用指针。
         using PFn_Upgrade = sl::Result (*)(void**);
         static PFn_Upgrade const fn = []() -> PFn_Upgrade {
             const std::wstring dir = dlssModuleDirectory();
@@ -1009,23 +765,19 @@ namespace
             return reinterpret_cast<PFn_Upgrade>(::GetProcAddress(sl, "slUpgradeInterface"));
         }();
         if (fn == nullptr) return 0;
-        // 未 slInit 时 SL 只会回 eErrorInitNotCalled，不必自己判断初始化状态。
         void* const native = *baseInterface;
         void* upgraded = native;
         if (fn(&upgraded) != sl::Result::eOk || upgraded == nullptr) {
             *baseInterface = native;  // 失败时把原生指针原样放回去
             return 0;
         }
-        // 文档是 replace in place：成功时调用方手里那一个引用直接变成代理的引用
-        // （所以这里既不 Release 也不 AddRef，所有权由调用方转移）。
+        // replace in place：成功时调用方那一个引用直接变成代理的引用（不 AddRef/Release）。
         *baseInterface = upgraded;
         return upgraded != native ? 1 : 0;
     }
-
-    // P291n（用户 m04823）：Streamline 路径的档位解析（定义在 chooseQuality 之后）。
+// Streamline 路径的档位解析（定义在 chooseQuality 之后）。
     uint32_t resolveQualityValue(const mcdr_dlss_input& in);
-
-    // 把本帧几何 + 质量档写进 SL 的 DLSS 选项；失败时告警。
+// 把本帧几何 + 质量档写进 SL 的 DLSS 选项；失败只告警。
     int32_t streamlineApplyOptions(const mcdr_dlss_input& in) {
         const PFn_SlDLSSSetOptions fn = slDlssSetOptionsFn();
         if (fn == nullptr) return -1;
@@ -1034,9 +786,7 @@ namespace
             case NVSDK_NGX_PerfQuality_Value_DLAA:       opt.mode = sl::DLSSMode::eDLAA; break;
             case NVSDK_NGX_PerfQuality_Value_MaxQuality: opt.mode = sl::DLSSMode::eMaxQuality; break;
             case NVSDK_NGX_PerfQuality_Value_Balanced:   opt.mode = sl::DLSSMode::eBalanced; break;
-            // P291（用户 m03752）：极致性能 = 3x。它原先落进 default 被当成 MaxPerformance（2x），
-            // Streamline 于是按 2x 规划特征，我们却喂 3x 的输入 —— 评价结果全黑（只有 GUI 正常），
-            // 而 50% / 58% / 67% 恰好都与 default 的 eMaxPerformance 或已有分支吻合，所以只有这一档坏。
+            // 极致性能 = 3x：漏进 default 会按 MaxPerf(2x) 规划特征而喂 3x 输入 => 评价全黑（只有 GUI 正常）。
             case NVSDK_NGX_PerfQuality_Value_UltraPerformance: opt.mode = sl::DLSSMode::eUltraPerformance; break;
             default:                                     opt.mode = sl::DLSSMode::eMaxPerformance; break;
         }
@@ -1045,10 +795,7 @@ namespace
         opt.preExposure = in.preExposure > 0.0f ? in.preExposure : 1.0f;
         opt.exposureScale = in.exposureScale > 0.0f ? in.exposureScale : 1.0f;
         opt.useAutoExposure = sl::Boolean::eFalse;
-        // P199: this used to run on every frame (the streamline branch of `mcdr_dlss_create`
-        // has nothing else to do). Streamline re-derives its internal DLSS state per call and
-        // the measured cost was ~800 MB/min of process private bytes. Push the options only
-        // when something that actually feeds them changed.
+        // 选项只在真的变化时下发：Streamline 每次都重建内部 DLSS 资源，实测 ~800 MB/min 私有内存增长。
         const int32_t modeAsInt = static_cast<int32_t>(opt.mode);
         if (s.slOptsApplied && s.slOptMode == modeAsInt && s.slOptOutW == opt.outputWidth &&
             s.slOptOutH == opt.outputHeight && s.slOptPreExposure == opt.preExposure &&
@@ -1058,7 +805,7 @@ namespace
         const sl::ViewportHandle viewport(0);
         const sl::Result r = fn(viewport, opt);
         if (r != sl::Result::eOk) {
-            logWarn("DLSS impl=streamline — slDLSSSetOptions result=0x%X (mode=%d, out=%ux%u, "
+            logWarn("slDLSSSetOptions failed 0x%X mode=%d out=%ux%u"
                 "render=%dx%d)",
                 static_cast<unsigned>(r), static_cast<int>(opt.mode), opt.outputWidth,
                 opt.outputHeight, static_cast<unsigned>(in.renderWidth),
@@ -1071,7 +818,7 @@ namespace
         s.slOptOutH = opt.outputHeight;
         s.slOptPreExposure = opt.preExposure;
         s.slOptExposureScale = opt.exposureScale;
-        logInfo("slDLSSSetOptions applied (mode=%d, out=%ux%u, preExposure=%.3f, "
+        logInfo("slDLSSSetOptions ok mode=%d out=%ux%u preExp=%.3f"
                 "exposureScale=%.3f; later frames reuse it until one of these changes)",
                 modeAsInt, opt.outputWidth, opt.outputHeight, opt.preExposure, opt.exposureScale);
         return 0;
@@ -1085,31 +832,25 @@ namespace
         s.initAttempted = true;
         s.device = device;
         if (dlssImplStreamline()) {
-            // P112：SL 拥有 NGX。这里绝不能调用 NVSDK_NGX_D3D12_Init_*（同进程双 NGX 冲突，
-            // P111 实测 sl.log 里 getNGXFeatureRequirements 报 0xbad00005）。
+            // SL 拥有 NGX：这里绝不能调 NVSDK_NGX_D3D12_Init_*（同进程双 NGX 冲突，0xBAD00005）。
             logInfo("DLSS impl=streamline — native NGX init skipped "
                     "(Streamline owns the runtime; evaluate lands in phase 2)");
             s.failure = "streamline mode: native NGX init skipped by design";
             return false;
         }
-
-        // P108：**固定用 SDK 常量 `NVSDK_NGX_Version_API`(0x15)，不再做版本扫描**。
-        // 依据：与我们的 DLL 同代（310.x）的生产实现（ETS2/ATS DLAA mod，src/dlaa.cpp，
-        // 作者注明 "verified against the public NVIDIA DLSS SDK headers + DLSS Programming
-        // Guide"）在同一个 310.x 运行库上用 **0x15 成功 Init**。所以 0x15 是对的，之前
-        // 0x16+ 报 out of date 正是"声明比核心新"；而 0x15 下的 FAIL_InvalidParameter
-        // (0xBAD00005) 是**参数**问题，靠下面的能力诊断把原因具名化，而不是靠猜版本。
+// 固定用 SDK 常量 NVSDK_NGX_Version_API(0x15)，不做版本扫描：同代运行库上 0x15 能成功
+// Init，0x16+ 只报 out of date。0x15 下的 0xBAD00005 是参数问题，靠能力诊断指名。
         const std::wstring appDataPath = buildAppDataPath();
-        logInfo("NGX Init (sdkVersion=NVSDK_NGX_Version_API=0x%X, projectId=\"%s\", "
+        logInfo("NGX init 0x%X project=%s "
                 "engineType=%d, engineVersion=\"%s\", appDataPath=\"%s\", featureInfo=%s)",
                 static_cast<unsigned>(NVSDK_NGX_Version_API), MCDR_NGX_PROJECT_ID,
                 static_cast<int>(NVSDK_NGX_ENGINE_TYPE_CUSTOM), MCDR_NGX_ENGINE_VERSION,
                 narrow(appDataPath).c_str(), commonInfoForNgx() != nullptr ? "pathlist" : "null");
-        // 参数表逐字对齐 nvsdk_ngx.h:247；**必须写在一行**（跨行时 MSVC 报 C2065）。
+        // 参数表逐字对齐 nvsdk_ngx.h:247；**必须写在一行**（跨行 MSVC 报 C2065）。
         const NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init_with_ProjectID(MCDR_NGX_PROJECT_ID, NVSDK_NGX_ENGINE_TYPE_CUSTOM, MCDR_NGX_ENGINE_VERSION, appDataPath.c_str(), device, commonInfoForNgx(), NVSDK_NGX_Version_API);
         if (NVSDK_NGX_FAILED(r)) {
             s.failure = "NVSDK_NGX_D3D12_Init_with_ProjectID";
-            logWarn("DLSS unavailable — NVSDK_NGX_D3D12_Init_with_ProjectID failed: %s "
+            logWarn("DLSS unavailable: NGX init failed %s "
                     "(appDataPath=\"%s\", featureInfo=%s)",
                     ngxResultString(r).c_str(), narrow(appDataPath).c_str(),
                     commonInfoForNgx() != nullptr ? "pathlist" : "null");
@@ -1127,10 +868,7 @@ namespace
         }
         s.params = params;
         s.paramsOk = true;
-
-        // P108：**能力诊断**（照 ETS2/ATS 那份实现的做法）。这四个参数是把
-        // `0xBAD00005` 变成"有名有姓的原因"的关键 —— `FeatureInitResult` 常直接带出
-        // 真正的失败码，`NeedsUpdatedDriver` / `MinDriverVersion*` 说明是不是驱动不匹配。
+// 能力诊断：这四个参数把 0xBAD00005 变成有名有姓的原因（FeatureInitResult / NeedsUpdatedDriver / MinDriverVersion）。
         {
             int available = -1, needsDriver = -1, initResult = 0;
             unsigned int minMajor = 0, minMinor = 0;
@@ -1144,12 +882,11 @@ namespace
                 params, NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMinor, &minMinor);
             const NVSDK_NGX_Result ri = NVSDK_NGX_Parameter_GetI(
                 params, NVSDK_NGX_Parameter_SuperSampling_FeatureInitResult, &initResult);
-            logInfo("NGX capabilities: available=%d(%s) needsUpdatedDriver=%d(%s) "
+            logInfo("NGX caps avail=%d(%s) drv=%d(%s) "
                     "minDriverVersion=%u.%u(%s/%s) featureInitResult=0x%08X(%s)",
                     available, ngxResultString(ra).c_str(), needsDriver, ngxResultString(rn).c_str(),
                     minMajor, minMinor, ngxResultString(rmj).c_str(), ngxResultString(rmn).c_str(),
                     static_cast<unsigned>(initResult), ngxResultString(ri).c_str());
-            // 这一条单独再报一次：它是"能不能用"的总答案，读到它就不用猜了。
             if (available == 0 || needsDriver == 1) {
                 logWarn("NGX says DLSS-SR is NOT usable on this system "
                         "(available=%d needsUpdatedDriver=%d minDriverVersion=%u.%u "
@@ -1158,14 +895,11 @@ namespace
             }
         }
 
-
-        logInfo("DLSS/NGX initialised (project id \"%s\", engine version \"%s\", appdata "
+        logInfo("NGX ready project=%s engine=%s"
                 "\".\\ngx\", SDK API version 0x%08X)",
                 MCDR_NGX_PROJECT_ID, MCDR_NGX_ENGINE_VERSION,
                 static_cast<unsigned>(NVSDK_NGX_Version_API));
-        // One-time optimal-settings probe, so the log carries the SDK's own ratio table
-        // even before a world is loaded. The query for the REAL target size happens in
-        // chooseQuality().
+        // 一次性最优设置探测：世界还没加载也能把 SDK 的比例表写进日志。
         {
             unsigned int ow = 0, oh = 0, mw = 0, mh = 0, nw = 0, nh = 0;
             float sharp = 0.0f;
@@ -1182,16 +916,9 @@ namespace
         }
         return true;
     }
-    // Maps a render/target ratio onto the closest NVSDK_NGX_PerfQuality_Value and reports
-    // what the SDK considers optimal for that quality.
-    //
-    // WHY THIS EXISTS: the render scale is chosen independently of DLSS (dxrMcRenderScale,
-    // 25% steps), so "which DLSS quality" is not a user setting — it is whatever quality
-    // reproduces the resolution the user already picked. Choosing the closest one also
-    // keeps DLSS from rescaling the input a second time.
-    // P108 (user m11147): `forceQuality` >= 0 means the user picked the tier explicitly, so the
-    // ratio-based choice is skipped and this call only fetches what the SDK considers optimal
-    // for that tier (in particular the sharpness) — and logs the comparison table as usual.
+    // 把 render/target 比例映射到最接近的 PerfQuality_Value。渲染比例是独立设置的（25% 步进），
+    // 所以"用哪档 DLSS"不是用户选项，而是能复现该分辨率的那一档 —— 顺带避免 DLSS 二次缩放。
+    // forceQuality >= 0 时跳过比例选择，只取 SDK 对该档的最优设置（尤其是锐度）。
     uint32_t chooseQuality(NVSDK_NGX_Parameter* params, uint32_t targetW, uint32_t targetH,
                            uint32_t renderW, uint32_t renderH, int forceQuality = -1) {
         static const NVSDK_NGX_PerfQuality_Value kValues[] = {
@@ -1203,7 +930,7 @@ namespace
                                        "UltraPerformance", "UltraQuality", "DLAA"};
         const float want =
             (targetW > 0) ? (static_cast<float>(renderW) / static_cast<float>(targetW)) : 1.0f;
-        // `forceQuality` is one of kValues[]; clamp so indexing is always in range.
+        // forceQuality 是 kValues[] 的下标，先 clamp 保证索引在范围内。
         const std::size_t forcedIdx =
             (forceQuality >= 0) ? static_cast<std::size_t>(forceQuality) : 0;
         const bool forced = (forceQuality >= 0) && (forcedIdx < std::size(kValues));
@@ -1227,7 +954,6 @@ namespace
                           static_cast<double>(ratio));
             table += row;
             if (forced) {
-                // Self-documenting: this is the tier the user asked for, not the nearest one.
                 if (i == forcedIdx) {
                     best = static_cast<uint32_t>(kValues[i]);
                     bestW = ow;
@@ -1249,9 +975,8 @@ namespace
             logInfo("DLSS optimal render sizes at %ux%u: %s", targetW, targetH, table.c_str());
         }
         if (forced) {
-            // P108 (user m11147): say plainly that this tier came from the user, not from the
-            // ratio — the log must never leave the two indistinguishable.
-            logInfo("DLSS quality tier is EXPLICIT (user button): %s -> sdk optimal %ux%u, "
+            // 日志必须能区分"用户选的档"与"按比例推的档"。
+            logInfo("DLSS tier %s sdk %ux%u "
                     "sharpness %.3f (render %ux%u target %ux%u, ratio would have picked "
                     "\"nearest\")",
                     kNames[forcedIdx], bestW, bestH, static_cast<double>(bestSharp), renderW,
@@ -1276,13 +1001,9 @@ namespace
         }
         return best;
     }
-
-    // P291n（用户 m04823「dlss选项下面写着 dlss not initialized yet」的连带发现）：
-    // Streamline 模式下 NGX 由 SL 拥有，`s.initOk` 恒为 false，于是 `mcdr_dlss_create` 在
-    // 走到 `ensureFeature` 之前就返回了 —— 档位解析（含 P291f 的两道守卫）从来没执行过，
-    // `s.qualityValue` 一直是它的初值 0。而 NGX 的 0 就是 MaxPerf（2x）：UI 说"极致性能"、
-    // 交给 SL 的是 2x、我们喂 3x 的输入 → NGX 每帧 `Dynamic scaling error` + 空纹理 = 黑屏。
-    // 这里把档位解析抽成两条路径共用的函数；返回 NGX 的 PerfQualityValue。
+// 档位解析抽成两条路径共用。Streamline 模式下 NGX 由 SL 拥有、s.initOk 恒 false，create 会在
+// ensureFeature 之前返回 —— 档位解析从未执行，qualityValue 停在 0（= MaxPerf/2x），而 UI 说
+// "极致性能"、输入是 3x ⇒ 每帧 dynamic scaling error + 空纹理 = 黑屏。
     uint32_t resolveQualityValue(const mcdr_dlss_input& in) {
         static const uint32_t kTierToNgxShared[5] = {
             static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_UltraPerformance),
@@ -1297,8 +1018,7 @@ namespace
             resolvedTier = 2;  // DLAA 只在 1:1 有意义
         }
         if (resolvedTier < 0 && in.renderWidth > 0 && in.targetWidth > 0) {
-            // 没有显式档位时按实际比例挑最接近的一档（Streamline 路径拿不到 NGX 参数表，
-            // 所以用名义倍率表，而不是 NGX_DLSS_GET_OPTIMAL_SETTINGS）。
+            // 无显式档位时按实际比例挑最接近的一档（Streamline 路径拿不到 NGX 参数表，用名义倍率表）。
             const double factor = static_cast<double>(in.targetWidth) / static_cast<double>(in.renderWidth);
             double bestErr = 1e9;
             for (int32_t t = 0; t <= 4; ++t) {
@@ -1309,7 +1029,6 @@ namespace
         if (resolvedTier >= 0 && resolvedTier <= 4 && in.renderWidth > 0 && in.targetWidth > 0) {
             const double factor = static_cast<double>(in.targetWidth) / static_cast<double>(in.renderWidth);
             const double nominal = kTierNominalFactor[resolvedTier];
-            // P291f：显式档位与实际比例差超过 10% 时，以实际比例为准改判到能覆盖它的最紧一档。
             if (s.requestedQuality >= 0 && factor > nominal * 1.10) {
                 int32_t adopted = resolvedTier;
                 for (int32_t t = 0; t <= 4; ++t) {
@@ -1318,14 +1037,13 @@ namespace
                 if (adopted != resolvedTier) {
                     if (!s.tooSmallWarned) {
                         s.tooSmallWarned = true;
-                        logError("tier %d (%.2fx nominal) cannot describe render %dx%d -> target %dx%d (%.2fx); asking for tier %d instead",
+                        logError("tier %d %.2fx cannot fit %dx%d -> %dx%d %.2fx; tier %d",
                                  resolvedTier, nominal, in.renderWidth, in.renderHeight,
                                  in.targetWidth, in.targetHeight, factor, adopted);
                     }
                     resolvedTier = adopted;
                 }
             }
-            // P291f 尺寸守卫：render 小于该档名义输入时 NGX 只报一行 dynamic scaling error 并交出空纹理。
             const uint32_t needW = static_cast<uint32_t>(std::ceil(static_cast<double>(in.targetWidth) / kTierNominalFactor[resolvedTier]));
             const uint32_t needH = static_cast<uint32_t>(std::ceil(static_cast<double>(in.targetHeight) / kTierNominalFactor[resolvedTier]));
             const auto tooSmall = [](uint32_t have, uint32_t need) {
@@ -1335,7 +1053,7 @@ namespace
                 tooSmall(static_cast<uint32_t>(in.renderHeight), needH)) {
                 if (!s.tooSmallWarned) {
                     s.tooSmallWarned = true;
-                    logError("render %ux%u is smaller than tier %d nominal input (%ux%u at %.2fx) — NGX answers with a dynamic scaling error and an empty texture, i.e. a black world with a working GUI; raise the render scale",
+                    logError("render %ux%u < tier %d input %ux%u (%.2fx); raise scale",
                              in.renderWidth, in.renderHeight, resolvedTier, needW, needH,
                              kTierNominalFactor[resolvedTier]);
                 }
@@ -1362,14 +1080,11 @@ namespace
         }
         s.featureOk = false;
         s.evalOk = false;
-        // P199: the feature is gone, so the next create must re-push the options.
+        // feature 已销毁，下次 create 必须重推选项。
         s.slOptsApplied = false;
-        // P199b: same for the per-frame evaluate path's own option cache.
         s.slEvalOptsValid = false;
     }
-
-    // Creates (or recreates) the feature. Requires an OPEN command list — NGX records its
-    // own commands during CreateFeature.
+// 创建/重建 feature。要求命令列表已打开 —— NGX 在 CreateFeature 里录自己的命令。
     bool ensureFeature(ID3D12GraphicsCommandList* cmd, const mcdr_dlss_input& in) {
         if (s.createdWarned) {
             return false;  // a previous create failed: one warning, never retried
@@ -1377,21 +1092,11 @@ namespace
         const bool sizeChanged =
             (in.renderWidth != s.renderWidth) || (in.renderHeight != s.renderHeight) ||
             (in.targetWidth != s.targetWidth) || (in.targetHeight != s.targetHeight);
-        // P108 (user m11147): a tier change must rebuild too — PerfQualityValue is a
-        // CreateFeature input, so it cannot be switched by editing Evaluate parameters alone.
-        //
-        // P108aa (user m11796, DLAA): resolve the tier THIS frame would build — including the
-        // DLAA 1:1 restriction — and compare it against the tier the live feature was actually
-        // built with. The old comparison was `requestedQuality != effectiveQuality`, where
-        // `effectiveQuality` held the NGX enum, so it was wrong twice:
-        //   * after a DLAA downgrade (requested 3 vs effective 2) it stayed true forever and
-        //     re-created the feature every frame (480 creates / 24 s, ~30-40 ms each);
-        //   * even a successful DLAA build stores NVSDK_NGX_PerfQuality_Value_DLAA == 5, so
-        //     3 != 5 would have caused the same per-frame rebuild.
-        // `effectiveQuality` now stores the ACCEPTED TIER (0..3, -1 = ratio-chosen), so the
-        // downgrade becomes this round's baseline and is not re-detected every frame.
+        // 档位变化必须重建：PerfQualityValue 是 CreateFeature 输入，改 Evaluate 参数没
+        // 用。比较对象必须是**本帧会构建的那一档**（含 DLAA 1:1 限制）与 feature 实际建成的档；
+        // 绝不能拿 requestedQuality 比 NGX 枚举（DLAA 在 NGX 是 5、本项目是 4，恒不等 => 每帧重建），
+        // effectiveQuality 存被接受的档，降级因此成为基线。
         int resolvedTier = s.requestedQuality;  // -1 = no explicit tier: ratio-chosen
-        // Tier 4 = DLAA（2026-10-24：插入 Ultra Performance 之后 DLAA 从 3 挪到 4）。
         const bool dlaaMismatch =
             (resolvedTier == 4) && (in.renderWidth != in.targetWidth ||
                                     in.renderHeight != in.targetHeight);
@@ -1401,11 +1106,8 @@ namespace
         if (dlaaMismatch != s.dlaaDowngraded) {
             s.dlaaDowngraded = dlaaMismatch;
             if (dlaaMismatch) {
-                // Never silently build a "fake DLAA": DLAA is only meaningful at 1:1, and asking
-                // for it while the render scale is, say, 80% would make NGX upscale under a DLAA
-                // label. State-change only — a per-frame ERROR is how the 480-creates bug was
-                // diagnosed, so it must not survive as log spam.
-                logError("DLAA (tier 3) requested but render %dx%d != target %dx%d — falling "
+                // 绝不静默建"假 DLAA"：render != target 时降级为 Quality 并 ERROR 一次，不逐帧报。
+                logError("DLAA needs 1:1 (%dx%d vs %dx%d); Quality, set scale 100%%"
                          "back to the Quality tier for this round (accepted as the baseline). Set "
                          "the render scale to 100%% to use DLAA.",
                          in.renderWidth, in.renderHeight, in.targetWidth, in.targetHeight);
@@ -1414,11 +1116,7 @@ namespace
                         in.renderWidth, in.renderHeight, in.targetWidth, in.targetHeight);
             }
         }
-        // P291f：显式挡位与实际比例差得太远时（超过 10%），以实际比例为准重选一档 ——
-        // 实测用户那次 NGX 是按 MaxPerf（min 1280x667）评价的，而 UI 说的是极致性能（3.0x），
-        // 844x440 两边都不满足，于是每帧只拿到一张空纹理。这里把"挡位说不出的比例"改判到
-        // 能覆盖它的最紧一档；10% 的门槛保证只在挡位明显错配时动手（33% vs 3.0x 只差 1.1%，
-        // 交给下面的尺寸守卫）。
+        // 显式档位与实际比例差太远（>10%）时改判到能覆盖它的最紧一档；10% 门槛保证只在明显错配时动手。
         if (resolvedTier >= 0 && resolvedTier <= 4 && in.renderWidth > 0 && in.targetWidth > 0) {
             const double factor = static_cast<double>(in.targetWidth) / static_cast<double>(in.renderWidth);
             const double nominal = kTierNominalFactor[resolvedTier];
@@ -1431,7 +1129,7 @@ namespace
                     }
                 }
                 if (adopted != resolvedTier) {
-                    logWarn("tier %d (%.2fx nominal) cannot describe render %dx%d -> target %dx%d "
+                    logWarn("tier %d %.2fx != %dx%d -> %dx%d "
                             "(%.2fx); asking NGX for tier %d instead",
                             resolvedTier, nominal, in.renderWidth, in.renderHeight, in.targetWidth,
                             in.targetHeight, factor, adopted);
@@ -1439,15 +1137,12 @@ namespace
                 }
             }
         }
-        // P291f（用户 m03752）：render 比该档名义输入还小时，NGX 只报一行「Dynamic scaling error ...
-        // outside of Min ... Max」然后交出一张空纹理 —— 世界全黑、GUI 正常。JVM 已经把极致性能档
-        // 从 33% 改成 34%，这里留一条守卫：同类配置错误必须在日志里一眼可见，而不是又变成一块黑屏。
+        // render 比该档名义输入还小时 NGX 只写一行 dynamic scaling error 再交空纹理（世界全黑、GUI 正常）。
         if (in.renderWidth > 0 && in.targetWidth > 0 && resolvedTier >= 0 && resolvedTier <= 4) {
             const double nominal = kTierNominalFactor[resolvedTier];
             const uint32_t needW = static_cast<uint32_t>(std::ceil(static_cast<double>(in.targetWidth) / nominal));
             const uint32_t needH = static_cast<uint32_t>(std::ceil(static_cast<double>(in.targetHeight) / nominal));
-            // 0.5% 容差：实测 33%（844 vs 需要 854，差 1.1%）会被 NGX 拒绝并给出黑屏，
-            // 而 58%（1484 vs 需要 1489，差 0.34%）一直正常 —— 阈值落在两者之间。
+            // 0.5% 容差：实测差 1.1% 被拒并黑屏，差 0.34% 一正常，阈值落在两者之间。
             const auto tooSmall = [](uint32_t have, uint32_t need) {
                 return static_cast<double>(have) < static_cast<double>(need) * 0.995;
             };
@@ -1455,7 +1150,7 @@ namespace
                 tooSmall(static_cast<uint32_t>(in.renderHeight), needH)) {
                 if (!s.tooSmallWarned) {
                     s.tooSmallWarned = true;
-                    logError("render %ux%u is smaller than tier %d nominal input (%ux%u at %.2fx) — "
+                    logError("render %ux%u < tier %d input %ux%u (%.2fx)"
                              "NGX answers with a dynamic scaling error and an empty texture, i.e. a black "
                              "world with a working GUI; raise the render scale",
                              in.renderWidth, in.renderHeight, resolvedTier, needW, needH, nominal);
@@ -1466,17 +1161,14 @@ namespace
         }
         const bool qualityChanged =
             (resolvedTier >= 0) && (resolvedTier != s.effectiveQuality);
-        // P108ac (user m08033): the render preset (the DLSS "model") is a CreateFeature input as
-        // well — NGX bakes the network choice into the feature — so a model change has to rebuild
-        // the feature exactly like a tier change. `effectivePreset` is what the live feature got.
+        // render preset 也是 CreateFeature 输入（网络选择被烘进 feature），变化必须像换档一样重建。
         const bool presetChanged = (s.requestedPreset != s.effectivePreset);
         if (s.featureOk && !sizeChanged && !qualityChanged && !presetChanged) {
             return true;
         }
         if (sizeChanged || qualityChanged || presetChanged) {
             destroyFeature();
-            // A new size invalidates the history; a pure tier change does not have to, but the
-            // rebuilt feature starts with no history anyway, so reset in both cases.
+            // 尺寸变化使历史失效；重建的 feature 本来也没有历史，两种情况都重置。
             s.resetPending = true;
         }
         if (s.params == nullptr) {
@@ -1484,22 +1176,11 @@ namespace
         }
 
         if (resolvedTier >= 0) {
-            // Explicit tier from the JVM: Performance / Balanced / Quality, same order as the
-            // Java enum. The mapping is deliberate (0->MaxPerf, 1->Balanced, 2->MaxQuality).
-            // P108 (user m11796): tier 3 = DLAA. DLAA reuses this whole pipeline unchanged
-            // (depth snapshot, motion vectors, output handover, copy-back); only the
-            // PerfQualityValue and the size relationship differ: DLAA means "no upscaling", i.e.
-            // render size == target size.
-            //
-            // P110b: DLAA now gets the real sub-pixel jitter — the projection UBO carries the same
-            // Halton sequence TAA uses, InJitterOffsetX/Y is that offset in render pixels, and the
-            // MVJittered feature flag tells NGX the motion vectors are already in jittered space.
-            // The old note here said the jitter was frozen to 0 because injection "collapsed the
-            // frame"; that diagnosis was built on byte-swapped matrix data (see known_bugs.md D.25)
-            // and no longer applies.
-            // P112 (2026-10-24, user m07529): five tiers — Ultra Performance is now the first
-            // entry of `QUALITY_NAMES` on the Java side, so the table order must match that list,
-            // not NGX's enum order. 4 is still DLAA (reached through the AA mode, not the list).
+            // JVM 显式档位，顺序与 Java 枚举一致：0 -> MaxPerf、1 -> Balanced、2 -> MaxQuality、
+            // 3 -> DLAA（1:1，复用整条管线，只是不放大）、4 -> DLAA（Ultra Performance 插到列表
+            // 首位后整体后移）。这张表必须与 JVM 的 QUALITY_NAMES 顺序一致，不是 NGX 枚举顺序。
+            // DLAA 用真实的亚像素 jitter：投影 UBO 带与 TAA 相同的 Halton 序列，InJitterOffsetX/Y
+            // 是渲染像素偏移，MV 不含 jitter 差所以不置 MVJittered。
             
 static const uint32_t kTierToNgx[5] = {
                 static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_UltraPerformance),
@@ -1508,17 +1189,14 @@ static const uint32_t kTierToNgx[5] = {
                 static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_MaxQuality),
                 static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_DLAA),
             };
-            // `resolvedTier` is already 0..4 and has the DLAA 1:1 restriction applied above;
-            // a rejected DLAA was turned into Quality *before* the rebuild decision, so the
-            // accepted tier is the one remembered below.
+            // resolvedTier 已是 0..4 且 DLAA 的 1:1 限制已在上面生效 —— 下面记住的是**被接受**的那一档。
             const int tier = resolvedTier;
             if (tier < 0 || tier > 4) {
                 return false;
             }
             s.qualityValue = kTierToNgx[tier];
             s.qualityIsExplicit = true;
-            // The optimal-settings query also yields the sharpness the SDK recommends for this
-            // quality/size pair; keep using it (it is what the reference integration does).
+            // 最优设置查询同时给出该质量/尺寸下 SDK 建议的锐度，沿用它。
             chooseQuality(s.params, static_cast<uint32_t>(in.targetWidth),
                           static_cast<uint32_t>(in.targetHeight),
                           static_cast<uint32_t>(in.renderWidth),
@@ -1532,13 +1210,9 @@ static const uint32_t kTierToNgx[5] = {
         }
         s.effectiveQuality = resolvedTier;  // accepted tier (0..3), -1 = ratio-chosen
         s.featureFlags = computeFeatureFlags(in);
-
-        // P108: EVERY input the size can depend on must be on the parameter map *before* the
-        // query. Width/Height/OutWidth/OutHeight alone are not enough — with them set the call
-        // returned Success but a scratch size of 0, which the old code misread as a failure
-        // (`P108: DLSS unavailable — GetScratchBufferSize failed: success (0x00000001)`).
-        // The create flags and the perf-quality value are part of the same descriptor, so set
-        // them here too (they are also what `NGX_D3D12_CREATE_DLSS_EXT` will pass below).
+// 尺寸依赖的**每一个**输入都必须在查询前写进参数表（Width/Height/OutWidth/OutHeight 不够）：
+// 只写这四个时调用回 Success 但 scratch 大小为 0。create flags 与 perf quality 属于同一
+// 份描述，也在这里写。
         NVSDK_NGX_Parameter_SetUI(s.params, NVSDK_NGX_Parameter_Width,
                                   static_cast<unsigned>(in.renderWidth));
         NVSDK_NGX_Parameter_SetUI(s.params, NVSDK_NGX_Parameter_Height,
@@ -1551,11 +1225,7 @@ static const uint32_t kTierToNgx[5] = {
                                  s.featureFlags);
         NVSDK_NGX_Parameter_SetI(s.params, NVSDK_NGX_Parameter_PerfQualityValue,
                                  static_cast<int>(s.qualityValue));
-        // P108ac (user m08033): the DLSS model. 0 = let NGX pick per tier (the long-standing
-        // behaviour, and what an old JVM that never calls the setter gets); otherwise a specific
-        // NVSDK_NGX_DLSS_Hint_Render_Preset value. This has to happen on the same parameter map as
-        // PerfQualityValue, before NGX_D3D12_CREATE_DLSS_EXT — the preset is baked into the
-        // feature at creation, which is why `presetChanged` forces a rebuild above.
+        // preset 必须与 PerfQualityValue 同表、且在 CREATE_DLSS_EXT 之前（创建时烘进 feature）。
         if (const char* presetKey = presetHintKey(s.qualityValue)) {
             NVSDK_NGX_Parameter_SetI(s.params, presetKey, s.requestedPreset);
         }
@@ -1572,11 +1242,9 @@ static const uint32_t kTierToNgx[5] = {
                     ngxResultString(sr).c_str());
             return false;
         }
-        // A reported size of 0 is NOT an error: modern DLSS builds answer 0 and place their
-        // scratch data in internal allocations. Allocate a conservative floor anyway so a build
-        // that does use the buffer cannot read past it, and say so in the log.
+        // 报 0 不是错误（新 DLSS 把 scratch 放在内部显存）；仍按保守下限分配，免得真用缓冲的版本越界。
         if (scratch == 0) {
-            logInfo("NGX reports a scratch buffer size of 0 (modern DLSS allocates "
+            logInfo("NGX scratch size 0; using 64 MiB floor"
                     "internally); allocating a 64 MiB floor regardless");
             scratch = 64ull * 1024ull * 1024ull;
         }
@@ -1587,10 +1255,7 @@ static const uint32_t kTierToNgx[5] = {
         }
 
         NVSDK_NGX_DLSS_Create_Params cp;
-        // P108 (user m11796): DLAA is defined as "no upscaling", so the feature is created at the
-        // TARGET resolution. The requested-tier path already refuses DLAA when render != target
-        // (ERROR + fall back to Quality), so this is a belt-and-braces pin of the equal-size
-        // invariant: whatever the caller passed, a DLAA feature never upscales.
+        // DLAA = 不放大：feature 一律按 target 尺寸创建。请求档路径已拒绝 render != target，这里是等尺寸不变量的兜底。
         const bool dlssTierIsDlaa =
             s.qualityValue == static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_DLAA);
         cp.Feature.InWidth = static_cast<unsigned>(
@@ -1609,7 +1274,7 @@ static const uint32_t kTierToNgx[5] = {
         if (NVSDK_NGX_FAILED(cr) || handle == nullptr) {
             s.createdWarned = true;
             s.failure = "NGX_D3D12_CREATE_DLSS_EXT";
-            logWarn("DLSS unavailable — CreateFeature failed: %s (render %dx%d, target %dx%d, "
+            logWarn("CreateFeature %s (%dx%d -> %dx%d, "
                     "flags=0x%X, quality=%u)",
                     ngxResultString(cr).c_str(), in.renderWidth, in.renderHeight, in.targetWidth,
                     in.targetHeight, static_cast<unsigned>(s.featureFlags), s.qualityValue);
@@ -1622,9 +1287,7 @@ static const uint32_t kTierToNgx[5] = {
         s.targetWidth = in.targetWidth;
         s.targetHeight = in.targetHeight;
         s.createdThisFrame = true;
-        // P108: print EVERY flag bit we pass, not just three of them. The joint debugging of the
-        // black-world report needed exactly this: `AutoExposure` and `MVLowRes` were invisible in
-        // the old line (they were both 0), so the two wrong bits could not be seen from the log.
+        // 打印每一个 flag 位，不只三位：曾因 AutoExposure/MVLowRes 都是 0 且不可见而查不出问题。
         const auto bit = [](int32_t flags, NVSDK_NGX_DLSS_Feature_Flags f) {
             return (flags & static_cast<int32_t>(f)) != 0 ? 1 : 0;
         };
@@ -1636,7 +1299,7 @@ static const uint32_t kTierToNgx[5] = {
             case static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_DLAA): qualityName = "DLAA"; break;
             default: break;
         }
-        logInfo("DLSS feature created: render %dx%d -> target %dx%d, quality=%u (%s, %s%s), "
+        logInfo("DLSS %dx%d->%dx%d q=%u %s%s%s "
                 "flags=0x%X (AutoExposure=%d DepthInverted=%d MVLowRes=%d MVJittered=%d HDR=%d), "
                 "scratch=%llu bytes",
                 in.renderWidth, in.renderHeight, in.targetWidth, in.targetHeight, s.qualityValue,
@@ -1652,10 +1315,7 @@ static const uint32_t kTierToNgx[5] = {
                 bit(s.featureFlags, NVSDK_NGX_DLSS_Feature_Flags_MVJittered),
                 bit(s.featureFlags, NVSDK_NGX_DLSS_Feature_Flags_IsHDR),
                 static_cast<unsigned long long>(s.scratchBytes));
-        // P108ac (user m08033): which model this feature was built with, and on which NGX hint
-        // key. The raw number is printed too: the letters NVIDIA reserves (N/O) map to numbers
-        // that have no documented name, and "did the value reach NGX at all" is the question this
-        // line answers when the picture does not change.
+        // 记下本次 feature 用的 preset 与 hint key（原始数字也打：保留字母映射的数字没有可读名）。
         {
             const char* key = presetHintKey(s.qualityValue);
             logInfo("DLSS render preset = %d (%s) on %s", s.effectivePreset,
@@ -1663,9 +1323,6 @@ static const uint32_t kTierToNgx[5] = {
         }
         return true;
     }
-
-    // Logs the input package ONLY when something changed (a per-frame line would drown
-    // the log during world load).
     void logFrameChange(const mcdr_dlss_input& in, bool createdThisFrame) {
         const bool changed = createdThisFrame || in.renderWidth != s.lastRenderW ||
                              in.renderHeight != s.lastRenderH || in.targetWidth != s.lastTargetW ||
@@ -1690,7 +1347,7 @@ static const uint32_t kTierToNgx[5] = {
         s.lastNear = in.nearZ;
         s.lastFar = in.farZ;
         s.lastFlags = static_cast<uint32_t>(s.featureFlags);
-        logInfo("DLSS input: render %dx%d -> target %dx%d, depthInverted=%u near=%.3f far=%.3f "
+        logInfo("dlss %dx%d->%dx%d inv=%u z=%.3f/%.3f "
                 "depthFmt=%d, mvScale=%.2f/%.2f, exposure=%s, jitter(single-sourced from the JVM "
                 "Halton by design)=%.3f/%.3f, reset=%u, flags=0x%X, quality=%u",
                 in.renderWidth, in.renderHeight, in.targetWidth, in.targetHeight, in.depthInverted,
@@ -1701,26 +1358,14 @@ static const uint32_t kTierToNgx[5] = {
                 static_cast<unsigned>(s.featureFlags), s.qualityValue);
     }
 }  // namespace
-
-// P118：给设备/交换链模块用的决策出口（外部链接；实现走上面的 dlssImplStreamline）。
 int32_t mcdr_dlss_streamline_requested(void) { return dlssImplStreamline() ? 1 : 0; }
-
-// P208：-1 = 还没探测（非 Streamline 路径或 slIsFeatureLoaded 未跑），0 = 探测到未加载，1 = 已加载。
-// 只在“明确探测到未加载”时报不可用，避免把非 Streamline 的 NGX 路径误判成坏。
+// -1 = 未探测，0 = 探测到未加载，1 = 已加载；只在明确探测到未加载时报不可用，避免误判非 Streamline 的 NGX 路径。
 namespace { std::atomic<int32_t> gSlDlssLoaded{-1}; }
 void mcdr_dlss_note_sl_loaded(int32_t loaded) { gSlDlssLoaded.store(loaded ? 1 : 0); }
 int32_t mcdr_dlss_available(void) { return gSlDlssLoaded.load() == 0 ? 0 : 1; }
-
-// ---------------------------------------------------------------------------
-// C interface for the device module. Every string crosses as a (char*, cap) buffer,
-// because std::string does not survive a module boundary (the plain TU sees the global
-// module's std::string, the module sees import std;'s).
-// ---------------------------------------------------------------------------
+// 设备模块用的 C 接口：字符串一律走 (char*, cap) 缓冲 —— std::string 过不了模块边界。
 extern "C" {
-
-// P108: is `p` backed by committed, readable memory? Used to vet the four texture handles in
-// mcdr_dlss_input before any vtable call (see the comment in mcdr_dlss_evaluate for the crash
-// this exists to prevent). Deliberately cheap: VirtualQuery walks the VAD for the address.
+// p 是否指向已提交可读内存？四个纹理句柄在任何 vtable 调用前都要过这一关（见 evaluate 里的崩溃）。
 static bool isMappedReadable(const void* p) {
     if (p == nullptr) {
         return false;
@@ -1746,38 +1391,30 @@ void mcdr_dlss_install_log(void* logInfo, void* logWarn, void* logError) {
     gLogWarn = reinterpret_cast<LogFn>(logWarn);
     gLogError = reinterpret_cast<LogFn>(logError);
 }
-
-// B4：注入模块的私有纹理创建/销毁入口（见 mcdr_dlss_impl.h 的 DlssTextureDesc）。
-// 返回 1 = 两个入口都装上了；0 = 缺一个（此时本单元不会创建任何私有纹理）。
+// 注入模块的私有纹理创建/销毁入口；1 = 都装上，0 = 缺一个（此时本单元不创建任何私有纹理）。
 int32_t mcdr_dlss_install_texture_ops(void* createFn, void* destroyFn) {
     gCreateTexture = reinterpret_cast<CreateTextureFn>(createFn);
     gDestroyTexture = reinterpret_cast<DestroyTextureFn>(destroyFn);
     if (gCreateTexture == nullptr || gDestroyTexture == nullptr) {
-        logWarn("the device module injected no texture create/destroy entry (create=%p "
+        logWarn("no texture create/destroy entry; JVM resources only"
                 "destroy=%p) — DLSS keeps using only JVM-supplied resources",
                 createFn, destroyFn);
         return 0;
     }
-    logInfo("B4: DLSS private-texture ops installed (create=%p destroy=%p) — the private UAV and "
+    logInfo("private-texture ops installed; UAV and depth tracked"
             "the depth snapshot are now created by the device module, so their resource states stay "
             "inside its tracked map",
             createFn, destroyFn);
     return 1;
 }
-
-// Called by the RTX probe once it has loaded nvngx_dlss.dll — that path is the single
-// most useful diagnostic when Init fails, and the probe already has it.
+// RTX 探测加载完 nvngx_dlss.dll 后调用 —— 那条路径是 Init 失败时最有用的诊断。
 void mcdr_dlss_register_runtime_path(const char* path, int32_t cap) {
     if (path == nullptr || cap <= 0) {
         return;
     }
     s.runtimePath = path;
 }
-
-// P108 blocker-B: the JVM announces the directory the vendor DLLs live in (the same
-// `<user.dir>\dxrmc\` MCDR.dll is extracted to). This both widens the process DLL search
-// path — so the bare-name LoadLibraryW inside the probe can succeed — and gives the
-// loader below a path to try. Idempotent; returns 1 when the search path was widened.
+// JVM 声明厂商目录：既放宽进程 DLL 搜索路径，也给下面的加载器一个候选。幂等。
 int32_t mcdr_dlss_register_vendor_dir(const char* utf8Dir, int32_t cap) {
     if (utf8Dir == nullptr || cap <= 0) {
         return 0;
@@ -1800,26 +1437,17 @@ int32_t mcdr_dlss_register_vendor_dir(const char* utf8Dir, int32_t cap) {
     }
     s.vendorDir = wide;
     widenSearchPath(wide);
-    // P108 blocker-B root cause: tell NGX where to look for its feature DLLs. This is what
-    // turns Init/GetFeatureRequirements from FAIL_InvalidParameter into Success.
+    // 告诉 NGX 去哪里找 feature DLL —— 这是 Init/GetFeatureRequirements 从 FAIL_InvalidParameter 变 Success 的关键。
     rebuildCommonInfo(wide);
-    logInfo("NGX feature path list set to \"%s\" (nvngx feature DLLs are looked up there "
+    logInfo("NGX feature path list \"%s\""
             "instead of the application folder, which is the JVM's bin\\ in a dev run)",
             narrow(wide).c_str());
     logEnvOnce();
     return s.searchPathSet ? 1 : 0;
 }
-
-// P108: loads nvngx_dlss.dll (the probe calls this instead of doing it itself, so every
-// attempt lands in the native log with its own GetLastError). Returns the module handle as
-// an opaque pointer, or NULL.
-//
-// The handle is cached: the module is loaded once and its HMODULE is what both the probe
-// and NGX need. An earlier revision tried to re-derive the handle from the recorded path
-// string with LoadLibraryW and returned whatever came back — when the path was stale that
-// produced a non-NULL junk handle, which made the probe treat the runtime as present and
-// its own fallback never ran (observed as `ngxRuntime=no` plus GetLastError=0x7E with no
-// P108 attempt lines). Never derive the handle again.
+// 加载 nvngx_dlss.dll 并缓存 HMODULE（探测与 NGX 都用它），失败返回 NULL。
+// 绝不再从记录的路径字符串反推句柄：路径过期时会拿到非 NULL 的垃圾句柄，探测于是以为运行期
+// 可用，自己的兜底再也不跑。
 void* mcdr_dlss_load_runtime(void) {
     logEnvOnce();
     if (s.runtimeModule != nullptr) {
@@ -1832,24 +1460,16 @@ void* mcdr_dlss_load_runtime(void) {
     s.runtimeModule = reinterpret_cast<void*>(mod);
     return s.runtimeModule;
 }
-
-// Reads back the nvngx_dlss.dll path the RTX probe reported (never NULL; an empty string
-// until the probe has found it). Used for the one-time P108 availability line.
+// 探测报上来的 nvngx_dlss.dll 路径（未找到前为空串，从不 NULL）。
 const char* mcdr_dlss_runtime_path(void) { return s.runtimePath.c_str(); }
-
-// P108: the NVSDK_NGX_FeatureCommonInfo whose PathListInfo names the vendor directory, for
-// callers that must pass it to NGX themselves (the RTX probe's GetFeatureRequirements).
-// Returns NULL while no vendor directory is known.
+// PathListInfo 指向厂商目录的 common info，供 RTX 探测自己调 GetFeatureRequirements；无厂商目录时为 NULL。
 void* mcdr_dlss_ngx_feature_info(void) { return commonInfoForNgx(); }
 
 int32_t mcdr_dlss_can_run(void* device) {
     if (device == nullptr) {
         return 0;
     }
-    // P108 阻塞 B：先确保运行期 DLL 真的加载过。探测通常已经加载（probeDlss 调
-    // mcdr_dlss_load_runtime），但若 DLSS 是第一次被用到、或探测那次失败过，这里再试一次；
-    // 没有它，ngx 的入口会以 ERROR_MOD_NOT_FOUND 之类的方式失败在 Init 里，日志却看不出
-    // 是"没加载"还是"不支持"。
+    // 先确保运行期 DLL 真加载过（探测可能没跑或失败过）：没有它 Init 只会报 ERROR_MOD_NOT_FOUND，日志看不出是"没加载"还是"不支持"。
     logEnvOnce();
     if (s.runtimePath.empty()) {
         if (loadRuntimeDll() == nullptr) {
@@ -1858,16 +1478,13 @@ int32_t mcdr_dlss_can_run(void* device) {
     }
 #if MCDR_DLSS_HAVE_STREAMLINE
     if (dlssImplStreamline()) {
-        // P112 阶段 1：SL 拥有 NGX —— 既不加载也不初始化 nvngx。对 JVM 报"可用"，
-        // 让 CreateDlssFeature 被调用（那里做 slDLSSSetOptions）。
+        // SL 拥有 NGX：既不加载也不初始化 nvngx，对 JVM 报可用，让 CreateDlssFeature 去下发选项。
         return 1;
     }
 #endif
     return ensureInit(static_cast<ID3D12Device*>(device)) ? 1 : 0;
 }
-
-// flagsOut bits, mirrored by the device module's status bits:
-//   1 INIT_TRIED  2 INIT_OK  4 PARAMS_OK  8 OPTIMAL_OK  16 FEATURE_OK  32 DISABLED
+// flagsOut 位：1 INIT_TRIED 2 INIT_OK 4 PARAMS_OK 8 OPTIMAL_OK 16 FEATURE_OK 32 DISABLED
 void mcdr_dlss_query(char* note, int32_t noteCap, char* optimal, int32_t optimalCap, char* runtime,
                      int32_t runtimeCap, uint32_t* flagsOut) {
     if (flagsOut != nullptr) {
@@ -1886,9 +1503,7 @@ void mcdr_dlss_query(char* note, int32_t noteCap, char* optimal, int32_t optimal
         } else if (!s.initAttempted) {
             std::snprintf(note, static_cast<std::size_t>(noteCap), "DLSS not initialised yet");
         } else if (dlssImplStreamline() && !s.initOk) {
-            // P291n：Streamline 模式下 NGX 归 SL 所有，我们自己的 NGX init 从不执行，
-            // 所以 `initOk` 永远是 false。旧文案因此对这条路径永远报"not initialised yet"，
-            // 而实际上 DLSS 可能正在正常工作 —— 状态行必须说清"谁在拥有 NGX"。
+            // Streamline 模式下 NGX 归 SL 所有，initOk 恒 false：状态行必须说清"谁在拥有 NGX"，不能一律报 not initialised yet。
             std::snprintf(note, static_cast<std::size_t>(noteCap),
                           "Streamline owns NGX; DLSS switch is %s; tier=%u (%s), %llu evaluates so far",
                           s.enabled ? "ON" : "OFF", s.qualityValue,
@@ -1898,7 +1513,6 @@ void mcdr_dlss_query(char* note, int32_t noteCap, char* optimal, int32_t optimal
             std::snprintf(note, static_cast<std::size_t>(noteCap), "NGX init failed (%s)",
                           s.failure.empty() ? "unknown" : s.failure.c_str());
         } else if (!s.enabled) {
-            // P108 (user m10920): the switch is its own state, so report it before "active".
             std::snprintf(note, static_cast<std::size_t>(noteCap),
                           "NGX ready, DLSS switch is OFF (featureOk=%d, %llu frames submitted so far)",
                           s.featureOk ? 1 : 0, static_cast<unsigned long long>(s.submitCount));
@@ -1907,8 +1521,7 @@ void mcdr_dlss_query(char* note, int32_t noteCap, char* optimal, int32_t optimal
                           "NGX ready, DLSS ON but feature not created yet (%llu evaluates so far)",
                           static_cast<unsigned long long>(s.submitCount));
         } else {
-            // P108 (user m11147): report the tier and where it came from, so the UI and the log
-            // can be compared without guessing whether the user picked it or MCDR derived it.
+            // 报档位及其来源（用户选的还是按比例推的），UI 与日志才能对照。
             std::snprintf(note, static_cast<std::size_t>(noteCap),
                           "DLSS active, %llu frames submitted, render %dx%d -> target %dx%d, "
                           "quality=%u (%s)",
@@ -1935,13 +1548,9 @@ int32_t mcdr_dlss_create(void* commandList, const mcdr_dlss_input* in, DlssTrans
     }
     if (!s.initOk || !s.paramsOk) {
 #if MCDR_DLSS_HAVE_STREAMLINE
-        // P112 阶段 1：streamline 模式下 ensureInit 主动跳过 NGX，因此必然走到这里；
-        // 把创建/选项交给 SL 的 slDLSSSetOptions，然后返回 0（evaluate 迁到阶段 2 才出图）。
-        // P112：NGX 在 streamline 模式下从未 init，这里把创建/选项交给 SL 并返回 1 ——
-        // 返回 1 表示"特征已就绪"，JVM 才会继续调用 mcdr_dx12EvaluateDlss；返回 0 会被
-        // 当成"特征未就绪"而跳过 evaluate（P112 实测）。
+        // streamline 模式下 ensureInit 跳过 NGX：把创建/选项交给 slDLSSSetOptions 并返回 1（返回 0 会让 JVM 跳过 evaluate）。
         if (dlssImplStreamline()) {
-            // P291n：先解析档位再下发选项 —— 否则 s.qualityValue 还是初值 0（=MaxPerf）。
+            // 先解析档位再下发选项，否则 qualityValue 还是初值 0（= MaxPerf）。
             (void)resolveQualityValue(*in);
             s.initAttempted = true;  // 状态串用：SL 拥有 NGX，我们自己的 init 永远不会跑
             (void)streamlineApplyOptions(*in);
@@ -1954,7 +1563,7 @@ int32_t mcdr_dlss_create(void* commandList, const mcdr_dlss_input* in, DlssTrans
     if (cmd == nullptr) {
         return 0;
     }
-    // Install the module-provided tracked-transition callback for this call (see transition()).
+    // 为本调用装上模块提供的跟踪式转换回调。
     s.transitionFn = tl;
     s.transitionCtx = tlCtx;
     s.createdThisFrame = false;
@@ -1964,18 +1573,10 @@ int32_t mcdr_dlss_create(void* commandList, const mcdr_dlss_input* in, DlssTrans
     logFrameChange(*in, s.createdThisFrame);
     return 1;
 }
-
-// P108: the depth snapshot (see mcdr_dlss_impl.h for why this exists).
-//
-// The JVM calls this from `DeepLearningSuperSampling.captureMotionVectors()`, i.e. at the point
-// in the frame where the depth buffer still holds this frame's world depth — before vanilla's
-// `clearDepthTexture` (GameRenderer.render) wipes it to 0.0 (reverse-Z "far"). By the time DLSS
-// is evaluated the live depth is already clear, which is why the depth-aware upscale had
-// degenerated into a colour-only one.
-//
-// The passed-in depth resource is COPY_SOURCE only for the duration of this call: we ask the
-// module for its tracked state, transition, copy, and put it back exactly as it was, so the
-// JVM's state machine around the world render is untouched.
+// 深度快照。JVM 在 captureMotionVectors() 里调它 —— 此时深度缓冲还是本帧的世界深度，vanilla 的
+// clearDepthTexture 会把它清成 0（reverse-Z 的"远"），到 Evaluate 时实时深度已经没了，深度感知
+// 的放大因此退化成纯颜色放大。
+// 传入的深度资源只在本次调用期间是 COPY_SOURCE：查模块的跟踪状态、转换、拷贝、原样还原。
 int32_t mcdr_dlss_snapshot_depth(void* commandList, void* depthResource, DlssTransitionFn tl,
                                  void* tlCtx, DlssQueryStateFn stateOf) {
     if (commandList == nullptr || depthResource == nullptr || tl == nullptr) {
@@ -1992,10 +1593,7 @@ int32_t mcdr_dlss_snapshot_depth(void* commandList, void* depthResource, DlssTra
     if (w == 0 || h == 0 || dd.Format == DXGI_FORMAT_UNKNOWN) {
         return 0;
     }
-    // P76f：设备模块现在把深度纹理建在**无类型**格式上（`R32_TYPELESS` 等），否则它无法被
-    // 采样（有类型资源建别的格式的 SRV 是非法的，采样恒返回 0 —— 那是速度 pass 读到全 0
-    // 深度的原因）。但 NGX 只认具体的有类型格式，所以快照这一侧仍按具体格式建；拷贝
-    // 在同一类型族内的 TYPELESS ↔ typed 之间是合法的。
+    // 深度建在无类型格式上才能被采样，NGX 只认具体格式，故快照按具体格式建（同族拷贝合法）。
     const DXGI_FORMAT snapFormat = [](DXGI_FORMAT f) -> DXGI_FORMAT {
         switch (f) {
             case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_D32_FLOAT;
@@ -2005,20 +1603,12 @@ int32_t mcdr_dlss_snapshot_depth(void* commandList, void* depthResource, DlssTra
             default: return f;
         }
     }(dd.Format);
-    // (Re)create the private snapshot texture when the size/format changed.
-    // P108x: compare EVERYTHING a full-resource copy requires to agree, not just w/h/format. The
-    // debug layer caught the old check being too loose:
-    //   [D3D12 ERROR #944] CopyResource: Source and Destination texture resource must have equivalent
-    //   dimensions, including width, height, depth, mip levels, and array size.
-    // The copy therefore never landed and the snapshot stayed all-zero (a dead depth term for NGX).
+    // 尺寸/格式变化才重建，比较整份拷贝要求（w/h/format/mip/array/sample），否则 CopyResource 静默不落地。
     if (s.depthSnapshot == nullptr || s.depthSnapshotWidth != w || s.depthSnapshotHeight != h ||
         s.depthSnapshotFormat != snapFormat || s.depthSnapshotMips != dd.MipLevels ||
         s.depthSnapshotArray != dd.DepthOrArraySize ||
         s.depthSnapshotSamples != dd.SampleDesc.Count) {
-        // B4: created by the device module (see DlssTextureDesc in mcdr_dlss_impl.h) and released
-        // through its deferred-delete path — never Release() here. Mirror the source's
-        // mip/array/sample shape so a full copy is legal at every level. Flags stay NONE: this
-        // texture is only ever COPY_DEST / COPY_SOURCE / NON_PIXEL_SHADER_RESOURCE.
+        // B4：由设备模块创建、走延迟删除，绝不 Release；mip/array/sample 对齐源，flags 保持 NONE（只当 COPY_DEST/COPY_SOURCE/只读 SRV）。
         destroyTrackedTexture(tlCtx, &s.depthSnapshotObject);
         s.depthSnapshot = nullptr;
         s.depthSnapshotWidth = 0;
@@ -2031,7 +1621,7 @@ int32_t mcdr_dlss_snapshot_depth(void* commandList, void* depthResource, DlssTra
             s.depthSnapshot = nullptr;
             if (!s.depthSnapshotWarned) {
                 s.depthSnapshotWarned = true;
-                logWarn("depth snapshot texture creation failed (%ux%u fmt=%d) — the device "
+                logWarn("depth snapshot create failed (%ux%u fmt=%d)"
                         "module refused or failed to create it; DLSS falls back to the "
                         "JVM-supplied depth (which is already cleared by then, so the upscale "
                         "loses its depth term)",
@@ -2047,33 +1637,17 @@ int32_t mcdr_dlss_snapshot_depth(void* commandList, void* depthResource, DlssTra
         s.depthSnapshotMips = (dd.MipLevels > 1) ? dd.MipLevels : 1;
         s.depthSnapshotArray = (dd.DepthOrArraySize > 1) ? dd.DepthOrArraySize : 1;
         s.depthSnapshotSamples = dd.SampleDesc.Count;
-        logInfo("DLSS depth snapshot texture created by the device module: %ux%u fmt=%d "
+        logInfo("depth snapshot %ux%u fmt=%d (tracked)"
                 "(private, tracked, COPY_DEST/COPY_SOURCE)",
                 w, h, static_cast<int>(dd.Format));
     }
-    // Save the caller's state, copy, restore. `stateOf` may be null (older module), in which
-    // case COMMON is used as the tracked anchor and restored to COMMON.
+    // 保存调用方状态 -> 拷贝 -> 复原；stateOf 为 null 时以 COMMON 为锚并还原到 COMMON。
     const int32_t before = (stateOf != nullptr)
                                ? stateOf(tlCtx, depthResource)
                                : static_cast<int32_t>(D3D12_RESOURCE_STATE_COMMON);
-    // P108x: the JVM depth is deliberately NOT dumped here any more.
-    //
-    // The helper drains the GPU queue up to the point of insertion, so it does read real bytes —
-    // but at this call site the interesting content is not there yet: this frame's depth is
-    // written by commands the *current, still-open* command list has not submitted, so the read
-    // can only ever show the cleared value. That made the label misleading ("the source is
-    // empty") when the truth was "this reading cannot see frame-in-flight content".
-    //
-    // The trustworthy judgement is the depth actually handed to NGX at evaluate time, which is
-    // dumped as `input-depth-after-evaluate` (the snapshot when one exists). The build that moved
-    // the snapshot hook to the end of the frame's main pass reports e.g.
-    //   input-depth-after-evaluate 683x384 fmt=40 mean=14.6/16.4/13.5 max=255/254/255
-    // i.e. real depth. Anything read at an earlier point is uninformative and is omitted.
-    // P108x: `CopyTextureRegion` with an explicit box on subresource 0, NOT `CopyResource`.
-    // `CopyResource` demands identical width/height/depth/mip/array (#944 above) and silently does
-    // nothing when they differ; an explicit box copies the top mip of slice 0 regardless of the rest
-    // of the shape, which is all DLSS samples anyway.
-    // The snapshot's own state is QUERIED, never assumed — the debug layer also flagged a barrier
+    // 用 CopyTextureRegion + 显式子资源 0 的 box，不用 CopyResource（后者要求尺寸/mip/array 完全一致，
+    // 不一致时静默不拷贝）。快照自身状态必须**查询**得到，绝不假设。
+    // 在 evaluate 时读回（input-depth-after-evaluate）才是可信的判据：更早的时点读到的只能是清空值。
     tl(tlCtx, reinterpret_cast<void*>(s.depthSnapshot),
        static_cast<int32_t>(D3D12_RESOURCE_STATE_COPY_DEST));
     {
@@ -2093,20 +1667,15 @@ int32_t mcdr_dlss_snapshot_depth(void* commandList, void* depthResource, DlssTra
     tl(tlCtx, depthResource, before);  // hand the depth back exactly as it was found
     ++s.depthSnapshotFrame;
     if (s.depthSnapshotFrame == 1) {
-        logInfo("DLSS depth snapshot captured (first): %ux%u fmt=%d from resource %p; it "
+        logInfo("depth snapshot first %ux%u fmt=%d"
                 "replaces the JVM's depth at evaluate time",
                 w, h, static_cast<int>(dd.Format), depthResource);
     }
     return 1;
 }
-
-// P113：最近一帧的 SL frame token（Reflex 的 slReflexSleep 要在 Present 前用它）。
+// 最近一帧的 SL frame token（Reflex 的 sleep 要在 Present 前用它）。
 sl::FrameToken* gLastFrameToken = nullptr;
-
-
-    // P113/P115：Reflex 低延迟 + PCL 延迟标记 + 帧率限制器。
-    // 文档：ProgrammingGuideReflex.md §4（选项）/§5（Present 前 sleep）、ProgrammingGuidePCL.md（标记）。
-    // 定义在文件后部的帧生成状态；Reflex 的“FG 必须开 Reflex”联动要用它。
+// Reflex 低延迟 + PCL 标记 + 帧率限制器（ProgrammingGuideReflex.md §4/§5）；FG 必须开 Reflex。
     extern std::atomic<int32_t> gDlssgMode;
 
     using PFn_SetReflexOptions = sl::Result (*)(const sl::ReflexOptions&);
@@ -2122,20 +1691,17 @@ sl::FrameToken* gLastFrameToken = nullptr;
             sl::Result (*newFrameToken)(sl::FrameToken*&, const uint32_t*) = nullptr;
             sl::Result (*getState)(sl::ReflexState&) = nullptr;
             uint32_t frameCounter = 0;
-            // P122：Reflex 模式（0=off 1=eLowLatency 2=eLowLatencyWithBoost），默认低延迟。
+            // Reflex 模式：0=off 1=eLowLatency 2=eLowLatencyWithBoost。
             int32_t mode = 1;
             bool resolved = false;
             bool optionsApplied = false;
-            // P247：slReflexSetOptions 上一次是否真的成功。只有成功才允许 slReflexSleep /
-            // PCL 标记 —— 否则 SL 每帧都会打 "Reflex feature not yet initialized; call
-            // slReflexSetOptions() first"，而且那本来就是必然失败的调用。
+            // 只有 slReflexSetOptions 真的成功过才允许 sleep / 发标记，否则 SL 每帧报 feature not yet initialized。
             bool optionsOk = false;
             uint32_t setOptsFailures = 0;
             uint32_t frameLimitUs = 0;
             uint32_t markerFailures = 0;
             uint32_t sleepFailures = 0;
             bool sleepOkLogged = false;
-            // P213d：上一次真正下发的生效模式与限帧，用来判断“要不要重发”。
             int32_t appliedMode = -1;
             uint32_t appliedFrameLimitUs = 0;
         };
@@ -2150,8 +1716,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
         }
         void resolveReflexApi() {
             if (gReflex.resolved) return;
-            // 只有真的取到函数才 latch：`Options.load` 阶段（slInit 之前）也会走到这里，
-            // 那时 `slGetFeatureFunction` 还没准备好，latch 住就永远解析不到了。
+            // 只有真的取到函数才 latch：Options.load 阶段（slInit 之前）latch 住就永远解析不到。
             char lim[16] = {};
             const DWORD limLen = ::GetEnvironmentVariableA("MCDR_REFLEX_FRAME_LIMIT_US", lim, 16);
             if (limLen > 0) {
@@ -2187,15 +1752,10 @@ sl::FrameToken* gLastFrameToken = nullptr;
                 gReflex.getState = reinterpret_cast<decltype(gReflex.getState)>(raw);
             }
         }
-        // P247：返回 true 表示“本帧 Reflex 选项已确认下发成功”，调用方据此决定要不要
-        // slReflexSleep / 发 PCL 标记。改动前这里无条件把 optionsApplied 置 true，
-        // 早期（slInit/slSetDevice 完成前）那次失败的调用就把状态 latch 住了，
-        // 之后每帧都走“已下发”的短路分支，SL 收到的永远是无效状态。
+        // 返回 true = 本帧选项已确认下发成功；失败不要 latch，否则之后每帧短路在无效状态。
         bool applyReflexOptions() {
             if (gReflex.setOptions == nullptr) return false;
-            // P213d：帧生成必须开 Reflex —— Reflex 关闭时 Streamline 直接拒绝插帧
-            // （sl.log 里是 "DLSS-G disabled"）。用户选的 OFF 在 FG 打开期间按 ON 生效，
-            // FG 关掉后自动回到用户原值。
+            // 帧生成必须开 Reflex（关着 SL 直接拒绝插帧）；FG 期间用户的 OFF 按 ON 生效，FG 关掉后恢复原值。
             const int32_t fgMode = gDlssgMode.load();
             int32_t effective = gReflex.mode;
             if (fgMode != 0 && effective == 0) {
@@ -2212,8 +1772,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
             opt.frameLimitUs = gReflex.frameLimitUs;  // 0 = 不限帧（文档：与 mode 独立）
             const sl::Result r = gReflex.setOptions(opt);
             if (r != sl::Result::eOk) {
-                // 失败不要 latch：下一帧重试（设备/交换链就绪后通常会成功），
-                // 期间把 sleep/标记拦住，避免 SL 侧每帧刷同一条错误。
+                // 失败不 latch：下一帧重试；期间拦住 sleep/标记，避免 SL 每帧刷同一条错误。
                 gReflex.optionsOk = false;
                 gReflex.optionsApplied = false;
                 if (gReflex.setOptsFailures < 3) {
@@ -2231,8 +1790,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
             return true;
         }
         void emitMarker(sl::PCLMarker marker) {
-            // P247：Reflex/PCL 只有在 slReflexSetOptions 成功之后才有效，否则 SL 同样会
-            // 回 “feature not yet initialized” 并刷日志。
+            // Reflex/PCL 只在 setOptions 成功后才有效，否则 SL 回 feature not yet initialized。
             if (!gReflex.optionsOk) return;
             if (gReflex.marker == nullptr || gLastFrameToken == nullptr) return;
             const sl::Result r = gReflex.marker(marker, *gLastFrameToken);
@@ -2249,9 +1807,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
         gReflex.frameLimitUs = micros;
         gReflex.optionsApplied = false;  // 下次 Present 前重新下发
     }
-
-    // P117：每帧开始（世界渲染之前）—— 建本帧的 SL frame token 并发 eSimulationStart。
-    // 文档 ProgrammingGuidePCL.md:144/152：simulation/submit/present 标记必须用**同一帧**的 token。
+// 每帧开始（世界渲染前）建 SL frame token 并发 eSimulationStart；simulation/submit/present 必须同一帧 token。
     void mcdr_reflex_frame_begin(void) {
         if (!reflexEnabled()) return;
         resolveReflexApi();
@@ -2264,19 +1820,15 @@ sl::FrameToken* gLastFrameToken = nullptr;
         }
         emitMarker(sl::PCLMarker::eSimulationStart);
     }
-
-    // P117：通用标记（eSimulationEnd / eRenderSubmitStart 等由 JVM 在正确时机调）。
-    // P122：界面上的 Reflex 模式（0=off 1=on 2=on+boost），下一帧 Present 前重新下发。
+// 通用标记（eSimulationEnd / eRenderSubmitStart 由 JVM 在正确时机调）；界面改的 Reflex 模式下一帧 Present 前重发。
     void mcdr_reflex_set_mode(int32_t mode) {
         if (!reflexEnabled()) return;
-        // 只存值：`Options.load` 阶段调到这里时 SL 还没 init，不能在这里解析函数指针。
         const int32_t clamped = mode < 0 ? 0 : (mode > 2 ? 2 : mode);
         if (clamped == gReflex.mode) return;
         gReflex.mode = clamped;
         gReflex.optionsApplied = false;
     }
-
-    // P122：Reflex 是否可用（三个入口都解析到才算），供界面置灰。
+// Reflex 可用 = 三个入口都解析到，供界面置灰。
     int32_t mcdr_reflex_available(void) {
         if (!reflexEnabled()) return 0;
         resolveReflexApi();
@@ -2294,10 +1846,8 @@ sl::FrameToken* gLastFrameToken = nullptr;
     void mcdr_reflex_before_present(void) {
         if (!reflexEnabled()) return;
         resolveReflexApi();
-        // P247：只有 setOptions 确认成功后才有资格 sleep / 发标记。
         const bool reflexReady = applyReflexOptions();
-        // P131：JVM 的 frame-begin 钩子没跑到时（例如 DLSS 没在渲染），这一帧还没有 token。
-        // Reflex 的 sleep/限帧/标记全都要 token，缺了就整条链路静默失效；这里就地补一个。
+        // JVM 的 frame-begin 没跑到时本帧还没有 token；sleep/限帧/标记缺 token 就整条链路静默失效，这里就地补一个。
         if (gLastFrameToken == nullptr && gReflex.newFrameToken != nullptr) {
             sl::FrameToken* token = nullptr;
             uint32_t frameIndex = ++gReflex.frameCounter;
@@ -2317,7 +1867,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
                         static_cast<unsigned>(r));
             } else if (r == sl::Result::eOk && !gReflex.sleepOkLogged) {
                 gReflex.sleepOkLogged = true;
-                logInfo("reflex: slReflexSleep ok (mode=%d) — Reflex/PCL markers active",
+                logInfo("reflex sleep ok mode=%d; PCL markers on",
                         gReflex.appliedMode);
             }
         }
@@ -2330,7 +1880,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
     }
 
 #if MCDR_DLSS_HAVE_STREAMLINE
-    // P112：JVM 每帧送来的相机常量（sl::Constants 的数据源）。单线程（渲染线程）写入/读取。
+    // JVM 每帧送来的相机常量（sl::Constants 的数据源）；只在渲染线程读写。
     mcdr_dlss_constants gCameraConstants{};
     bool gCameraConstantsValid = false;
 
@@ -2347,26 +1897,17 @@ sl::FrameToken* gLastFrameToken = nullptr;
     using PFn_slEvaluateFeature = sl::Result (*)(sl::Feature, const sl::FrameToken&,
                                                  const sl::BaseStructure**, uint32_t,
                                                  sl::CommandBuffer*);
-    // ProgrammingGuide.md §2.11.1：slSetConstants(constants, frame, viewport)
     using PFn_slSetConstants = sl::Result (*)(const sl::Constants&, const sl::FrameToken&,
                                              const sl::ViewportHandle&);
-    // P213：帧生成的选项入口（ProgrammingGuideDLSS_G.md §6.0）。
     using PFn_SlDLSSGSetOptions = sl::Result (*)(const sl::ViewportHandle&, const sl::DLSSGOptions&);
-    // P213：帧生成的状态查询（读 numFramesActuallyPresented / status，用来验证是否真的在插帧）。
     using PFn_SlDLSSGGetState = sl::Result (*)(const sl::ViewportHandle&, sl::DLSSGState&, const sl::BaseStructure**);
-
-    // P213 阶段 2：帧生成的开关状态。0 = off，1 = on（固定倍率），2 = dynamic。
-    // 由 ABI `mcdr_dx12SetDlssgMode` 写入，渲染线程每帧读取。
+// FG 开关：0=off 1=on（固定倍率）2=dynamic；由 mcdr_dx12SetDlssgMode 写入，渲染线程读。
     std::atomic<int32_t> gDlssgMode{0};
     std::atomic<int32_t> gDlssgFrames{1};
-    // P213c：最近一次 Present 真正提交了几帧（1 = 只有应用帧，2+ = 插帧生效）。给 F3 的 output 用。
     std::atomic<int32_t> gFgPresented{1};
-    // P291e：上一帧结束时输出纹理停在哪个 D3D12_RESOURCE_STATES（0 = 未知/没有输出纹理）。
-    // JVM 侧的黑帧采样要拿它做"已知起始状态"的读回 —— 按 COMMON 硬转是非法 barrier，
-    // 读回来的是未定义内容（实测恒 0，于是 DLSS 明明正常却被熔断成永久线性 blit）。
+    // 上一帧结束时输出纹理的 state（0 = 未知）；JVM 读回必须拿它当 StateBefore，按 COMMON 硬转读回未定义内容。
     std::atomic<int32_t> gDlssOutputState{0};
-
-    // P112 阶段 2：Streamline 的每帧调用面（全部运行时解析，不引入静态导入）。
+// Streamline 的每帧调用面（全部运行时解析，不引入静态导入）。
     struct StreamlineEvalApi {
         PFn_SlDLSSSetOptions setOptions = nullptr;
         PFn_SlDLSSGSetOptions setFgOptions = nullptr;
@@ -2376,8 +1917,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
         PFn_slSetConstants setConstants = nullptr;
         PFn_slEvaluateFeature evaluate = nullptr;
     };
-
-    // P213：DLSS-G 插件可能比 DLSS 晚加载，所以解析要能重试（见 refreshFgApi）。
+// DLSS-G 插件可能比 DLSS 晚加载，解析要能重试（见 refreshFgApi）。
     HMODULE gSlInterposer = nullptr;
 
     StreamlineEvalApi& streamlineEvalApi() {
@@ -2404,7 +1944,6 @@ sl::FrameToken* gLastFrameToken = nullptr;
                 if (gff(sl::kFeatureDLSS, "slDLSSSetOptions", raw) == sl::Result::eOk) {
                     a.setOptions = reinterpret_cast<PFn_SlDLSSSetOptions>(raw);
                 }
-                // P213：帧生成的选项函数在 DLSS-G 插件里，插件没加载时这里就是 nullptr。
                 raw = nullptr;
                 if (gff(sl::kFeatureDLSS_G, "slDLSSGSetOptions", raw) == sl::Result::eOk) {
                     a.setFgOptions = reinterpret_cast<PFn_SlDLSSGSetOptions>(raw);
@@ -2418,9 +1957,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
         }();
         return api;
     }
-
-    // P112：4x4 行主序矩阵工具（sl::Constants 需要 cameraViewToClip / clipToCameraView /
-    // clipToPrevClip / prevClipToClip 四个矩阵，而 JVM 只送 viewProj 与 prevViewProj）。
+// 4x4 行主序矩阵工具：SL 要四个矩阵，JVM 只送 viewProj 与 prevViewProj。
     void mat4Multiply(const float* a, const float* b, float* out) {
         float r[16];
         for (int row = 0; row < 4; ++row) {
@@ -2434,8 +1971,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
         }
         std::memcpy(out, r, sizeof(r));
     }
-
-    // Gauss-Jordan 求逆（失败返回 false，out 保持原样）。
+// Gauss-Jordan 求逆（失败返回 false，out 保持原样）。
     bool mat4Inverse(const float* m, float* out) {
         double a[4][8] = {};
         for (int row = 0; row < 4; ++row) {
@@ -2465,10 +2001,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
         }
         return true;
     }
-    // SL 的 DLSS 评价：按 ProgrammingGuideDLSS.md 的顺序 —— tag 资源 → 设选项 → evaluate。
-    // eDisableCLStateTracking 下资源状态由我们负责（这里沿用 NGX 路径的同一组状态）。
-    // P213：DLSS-G 的函数指针是延迟解析的。插件在第一次 evaluate 之后才 load 时，
-    // 之前的 nullptr 会被永久缓存，帧生成就此静默失效——这里按 500ms 节奏重试。
+    // SL 的 DLSS 评价：tag -> options -> evaluate（eDisableCLStateTracking 下状态由我们负责）；DLSS-G 指针延迟解析、500ms 重试。
     void refreshFgApi(StreamlineEvalApi& a) {
         if (a.setFgOptions != nullptr && a.getFgState != nullptr) return;
         if (gSlInterposer == nullptr) return;
@@ -2490,18 +2023,12 @@ sl::FrameToken* gLastFrameToken = nullptr;
         }
 
     }
-
-    // P305ag：把本帧的 SR 产物交给 FG provider（XeSS-FG / FSR-FG 这类包装型后端）。
-    //
-    // 为什么在这里：逐帧 tag 原本只有一个触发点 —— `srEvaluateFrame` 成功后（`d3d12_sr.cpp:413`）。
-    // 而 DLSS 超分走的是本文件的 `mcdr_dlss_evaluate`（普通翻译单元，不 import 设备模块），
-    // `sr.backend = DLSS` 时那条路径根本不执行，XeSS-FG 因此一帧输入都收不到（实机取证：
-    // 4561 帧 tagCalls=0，setEnabled 从未下发）。走 `mcdr_fgTagDlssInputs` 这个只过 POD 的
-    // C ABI 桥，避免模块私有名的修饰名在链接期对不上（见 `d3d12_mesh_base.cpp` 的教训）。
-    //
-    // 状态为什么这么给：`out` 刚从 SR 输出恢复成 RENDER_TARGET（P273 契约），深度/MV 在 SR
-    // 结束时是只读 SRV（SL 自己的 tag 也要求 NON_PIXEL_SHADER_RESOURCE）。给错只是让 SDK
-    // 记错屏障的 Before 值，`TagFrameResource` 会返回错误码并落 breadcrumb（`P305af tag FAILED`）。
+// 把本帧 SR 产物交给 FG provider（XeSS-FG / FSR-FG 这类包装型后端）。
+// DLSS 超分走本文件的 mcdr_dlss_evaluate（普通 TU，不 import 设备模块），srEvaluateFrame 的
+// 逐帧 tag 点根本不会执行，provider 因此一帧输入都收不到。这里只过 POD 的 C ABI 桥，
+// 避免模块私有名的修饰名在链接期对不上。
+// 状态：out 刚从 SR 输出恢复成 RENDER_TARGET，深度/MV 是只读 SRV。给错只会让 SDK 记错屏障的
+// Before 值，TagFrameResource 会返回错误码。
     void tagFrameGenInputsFromDlss(ID3D12GraphicsCommandList* cmd, const mcdr_dlss_input& in) {
         if (cmd == nullptr) {
             return;
@@ -2537,15 +2064,9 @@ sl::FrameToken* gLastFrameToken = nullptr;
             return 0;
         }
         if (color == nullptr || depth == nullptr || mv == nullptr || out == nullptr) return 0;
-        // P112：输出目标优先用 JVM 交付的 UAV 纹理（s.externalOutput，见 mcdr_dlss_set_output_texture）。
-        // 直接把 GUI 目标（无 UAV 位）标成 kBufferTypeScalingOutputColor，NGX 会报
-        // FAIL_RWFlagMissing(0xBAD00009)（SL 日志里是 "[sl.dlss] NGX evaluate feature failed"）。
-        // P114（用户报告的 GUI 文字被当作运动物体）：DLSS 的 temporal history 以**自己的输出**
-        // 为反馈源。如果直接把 GUI 目标（每帧还要被 GUI 画一遍）标成 ScalingOutputColor，
-        // 历史缓冲会被 GUI 污染 —— 滑动界面时文字就被当成运动物体放大/拖出框外。
-        // NGX 路径从来没这个现象，因为它写的是私有 UAV / handover 纹理再拷回目标。
-        // 这里照做：优先 externalOutput（JVM 交付的 UAV），否则用模块私有的 dlssOutput，
-        // 只有两者都不可用才退化成直接写 GUI 目标。
+        // 输出优先用 JVM 交付的 UAV 纹理（externalOutput）：GUI 目标没有 UAV 位（FAIL_RWFlagMissing
+        // 0xBAD00009）；而且 DLSS 的 temporal history 以**自己的输出**为反馈源，直接用 GUI 目标会
+        // 让历史被 GUI 污染（滑动界面时文字被当成运动物体拖影）。两者都不可用才退化成直写 GUI 目标。
         ID3D12Resource* outResource = out;
         bool copyBack = false;
         const auto fitsTarget = [&in](ID3D12Resource* res) {
@@ -2563,10 +2084,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
         }
         s.transitionFn = tl;
         s.transitionCtx = tlCtx;
-        // 文档（ProgrammingGuideDLSS.md:155）：**资源状态由 SL 管理，宿主不要手动 transition**；
-        // 宿主的责任是 evaluate 之后恢复命令列表状态（:242-253，配合 eDisableCLStateTracking）。
-        // P117：token 由 mcdr_reflex_frame_begin() 在帧开始建好；这里复用，保证 PCL 标记与
-        // DLSS evaluate 落在**同一帧**（文档要求）。没有 frame_begin（例如 Reflex 关闭）时兜底自建。
+        // 资源状态由 SL 管理，宿主只在 evaluate 后恢复；复用 frame_begin 的 token 保证 PCL 标记与 evaluate 同帧。
         sl::FrameToken* token = gLastFrameToken;
         if (token == nullptr) {
             uint32_t frameIndex = static_cast<uint32_t>(s.submitCount);
@@ -2574,23 +2092,15 @@ sl::FrameToken* gLastFrameToken = nullptr;
         }
         const sl::ViewportHandle viewport(0);
         gLastFrameToken = token;  // P113：Reflex 在 Present 前要用它
-
-        // 1) 相机常量（每帧、尽量早；ProgrammingGuide.md §2.11.1）。没有 JVM 送来的
-        //    `mcdr_dlss_constants` 时只能跳过 —— slSetConstants 缺字段 DLSS 会拒绝该帧。
+// 相机常量（每帧、尽量早）。没有 JVM 送来的 mcdr_dlss_constants 只能跳过 —— 缺字段 SL 会拒绝该帧。
         if (gCameraConstantsValid) {
             sl::Constants cnst{};
-            // P118 修（用户报「DLSS 静止不动也有随机拖影」）：这里有三个**传参错误**，每一个都足以
-            // 让 DLSS 在完全静止时每帧取错历史：
-            //   1) 布局：JVM 送的是列主序（JOML `Matrix4f.get(float[])`），而 `sl::Constants` 的
-            //      `float4x4` 明确要求**行主序**（sl_consts.h:183-185）。原来直接 memcpy，等于把
-            //      整组矩阵转置着交给 SL —— 静止时当前/上一帧只差一个 jitter，转置会把这点差异
-            //      映射到错误的 clip 轴上，于是每个像素每帧都多出约半个像素的错误位移 ⇒ 拖影。
-            //   2) `prevClipToClip` 抄成了 `inverse(prevViewProj)`，公式是
-            //      `prevClipToClip = clipToPrevClip.inverse() = inverse(prevViewProj) * viewProj`
-            //      （sl_consts.h:193-199），少了右乘的当前帧矩阵，它根本不是"上一帧 clip → 本帧
-            //      clip"的映射。
-            //   3) 矩阵求逆/相乘用的是本文件的行主序工具（mat4Multiply/mat4Inverse），所以必须先
-            //      把列主序输入转成行主序再做数学，否则连 `clipToPrevClip` 都是转置的。
+            // 三个传参错误，任何一个都足以让静止画面每帧取错历史：
+            //   1) 布局：JVM 送列主序（JOML），sl::Constants 的 float4x4 要**行主序**；直接 memcpy 等于
+            //      整组矩阵转置着交给 SL，静止时当前/上一帧只差一个 jitter，转置会把它映射到错误的
+            //      clip 轴 ⇒ 每像素每帧约半个像素的错误位移 = 拖影。
+            //   2) prevClipToClip 抄成 inverse(prevViewProj)，正确公式见下方。
+            //   3) 求逆/相乘用的是本文件的行主序工具，所以必须先转置再算。
             const float* viewProj = gCameraConstants.viewProjection;
             const float* prevViewProj = gCameraConstants.prevViewProjection;
             float curVP[16] = {};
@@ -2606,10 +2116,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
             float invPrvVP[16] = {};
             const bool invOk = mat4Inverse(curVP, invCurVP);
             const bool invPrevOk = mat4Inverse(prvVP, invPrvVP);
-            // 行主序之后可以直接拷进 sl::float4x4（它就是行主序的 16 个 float）。
-            // P120：`cameraViewToClip` 的语义是 **view->clip**，也就是投影矩阵本身（不是 VP）。
-            // 之前塞 VP，SL 的 depth->view 反投影就多带一层世界平移，深度相关的亚像素修正会随视角
-            // 漂移 —— 用户看到的「静止时随机抖动」。
+            // cameraViewToClip = **view->clip**，即投影矩阵本身（不是 VP）；塞 VP 会让深度反投影多带一层世界平移 => 静止抖动。
             const float* projColMajor = gCameraConstants.projection;
             float curProj[16] = {};
             for (int r = 0; r < 4; ++r) {
@@ -2625,14 +2132,12 @@ sl::FrameToken* gLastFrameToken = nullptr;
                 }
             }
             if (invOk) {
-                // clipToPrevClip = clipToView * viewToViewPrev * viewToClipPrev
-                //                = inverse(curVP) * prevVP
+                // clipToPrevClip = inverse(curVP) * prevVP
                 float clipToPrev[16] = {};
                 mat4Multiply(invCurVP, prvVP, clipToPrev);
                 std::memcpy(&cnst.clipToPrevClip, clipToPrev, sizeof(clipToPrev));
                 if (invPrevOk) {
-                    // prevClipToClip 必须是上面那个的逆：inverse(prevVP) * curVP。
-                    // 旧代码写的是 inverse(prevVP)，等于把"上一帧 clip"直接当成"本帧 clip"。
+                    // prevClipToClip 是上面那个的逆：inverse(prevVP) * curVP（不是 inverse(prevVP)）。
                     float prevClipToClip[16] = {};
                     mat4Multiply(invPrvVP, curVP, prevClipToClip);
                     std::memcpy(&cnst.prevClipToClip, prevClipToClip, sizeof(prevClipToClip));
@@ -2663,16 +2168,12 @@ sl::FrameToken* gLastFrameToken = nullptr;
                                              ? sl::Boolean::eTrue
                                              : sl::Boolean::eFalse;
             cnst.reset = gCameraConstants.reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
-            // 注意：本版 SDK 的 sl::Constants 没有 renderingGameFrames 字段（文档草稿里有、
-            // sl_consts.h:182 的实际结构没有），所以那一位只能留在 JVM/AI 侧不用。
+            // 本版 SDK 的 sl::Constants 没有 renderingGameFrames 字段，那一位不用。
             cnst.motionVectorsDilated = sl::Boolean::eFalse;
             cnst.orthographicProjection = sl::Boolean::eFalse;
             (void)api.setConstants(cnst, *token, viewport);
         }
-
-        // 2) 资源 tag（lifecycle 按文档 :143-147：输入/输出 eOnlyValidNow，深度/MV eValidUntilPresent）
-        // 只保留输出这一个 barrier：文档 :155 说资源状态由 SL 管理，输入侧的 transition 没必要，
-        // 还会和 SMAA/GUI 的既有状态重复切；tag 里仍带上资源当前应有的 state（D3D12 下必填）。
+// tag：输入/输出 eOnlyValidNow，深度/MV eValidUntilPresent；只保留输出 barrier，输入侧再切与 SMAA/GUI 冲突。
         transition(outResource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         sl::Resource colorRes(sl::ResourceType::eTex2d, color,
                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -2682,11 +2183,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         sl::Resource outRes(sl::ResourceType::eTex2d, outResource,
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        // P213：HUD-less 必须和其余 tag 在**同一次** slSetTagForFrame 里给出。分成两次调用会让
-        // 后一次覆盖前一次，SL 随后就再也找不到 depth/MV（实测日志：“Failed to find global tag
-        // 'kBufferTypeDepth'”，插帧因此一直不工作）。
-        // HUD-less 用 SR 的输出（窗口尺寸、此后不会被 GUI 写到）；outResource == out 时那张会叠上
-        // UI，不满足“UI 之前”的要求，于是干脆不开 FG。
+        // HUD-less 必须与其余 tag 同一次 slSetTagForFrame（分开会互相覆盖，SL 找不到 depth/MV）；outResource == out 会叠 UI，不开 FG。
         const int32_t fgModeEarly = gDlssgMode.load();
         const bool wantFg = (fgModeEarly != 0) && (outResource != out) && (api.setFgOptions != nullptr);
         sl::Resource hudlessRes(sl::ResourceType::eTex2d, outResource,
@@ -2707,18 +2204,15 @@ sl::FrameToken* gLastFrameToken = nullptr;
         const uint32_t tagCount = wantFg ? 5u : 4u;
         const sl::Result tagResult = api.setTags(*token, viewport, tags, tagCount, cmd);
         if (tagResult != sl::Result::eOk) {
-            // 只在第一次失败时打一行：每帧打会把日志刷爆（P210 时吃过这个亏）。
             static bool warnedTag = false;
             if (!warnedTag) {
                 warnedTag = true;
-                logWarn("slSetTagForFrame failed=0x%X (frame=%u, color=%p depth=%p mv=%p out=%p)",
+                logWarn("slSetTagForFrame failed 0x%X frame=%u",
                         static_cast<unsigned>(tagResult), s.submitCount,
                         static_cast<void*>(color), static_cast<void*>(depth),
                         static_cast<void*>(mv), static_cast<void*>(outResource));
             }
         }
-
-        // 3) 选项（:170-186：各档 preset + 模式 + 输出尺寸 + 非 HDR/非自动曝光）
         sl::DLSSOptions opt{};
         opt.dlaaPreset = sl::DLSSPreset::ePresetK;
         opt.qualityPreset = sl::DLSSPreset::ePresetK;
@@ -2729,9 +2223,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
             case NVSDK_NGX_PerfQuality_Value_DLAA:       opt.mode = sl::DLSSMode::eDLAA; break;
             case NVSDK_NGX_PerfQuality_Value_MaxQuality: opt.mode = sl::DLSSMode::eMaxQuality; break;
             case NVSDK_NGX_PerfQuality_Value_Balanced:   opt.mode = sl::DLSSMode::eBalanced; break;
-            // P291（用户 m03752）：极致性能 = 3x。它原先落进 default 被当成 MaxPerformance（2x），
-            // Streamline 于是按 2x 规划特征，我们却喂 3x 的输入 —— 评价结果全黑（只有 GUI 正常），
-            // 而 50% / 58% / 67% 恰好都与 default 的 eMaxPerformance 或已有分支吻合，所以只有这一档坏。
+            // 极致性能 = 3x：漏进 default 会被当成 MaxPerformance(2x)，按 2x 规划特征却喂 3x 输入 => 全黑。
             case NVSDK_NGX_PerfQuality_Value_UltraPerformance: opt.mode = sl::DLSSMode::eUltraPerformance; break;
             default:                                     opt.mode = sl::DLSSMode::eMaxPerformance; break;
         }
@@ -2740,15 +2232,11 @@ sl::FrameToken* gLastFrameToken = nullptr;
         opt.preExposure = in.preExposure > 0.0f ? in.preExposure : 1.0f;
         opt.exposureScale = in.exposureScale > 0.0f ? in.exposureScale : 1.0f;
         opt.useAutoExposure = sl::Boolean::eFalse;
-        // P197：HDR 开启时 colorBuffersHDR 必须是 eTrue。注意我们的内部主渲染目标仍是 SDR，
-        // 线性化与白点换算发生在呈现用的 blit PS 里；这里只是让 Streamline 按 HDR 语义
-        // 处理颜色缓冲（避免它再套一层 sRGB 编解码）。
+        // HDR 开启时 colorBuffersHDR 必须 eTrue：内部主目标仍是 SDR，线性化在 blit PS 里，这里只让 SL 按 HDR 语义处理。
         opt.colorBuffersHDR =
             mcdr_hdr_state_active() != 0 ? sl::Boolean::eTrue : sl::Boolean::eFalse;
         opt.alphaUpscalingEnabled = sl::Boolean::eFalse;
-        // P199：`slDLSSSetOptions` 是"配置变化时"的调用，不是每帧调用。26.3 起我们每帧都会走到
-        // 这里，而 SL 的 DLSS 插件在 SetOptions 里会重建内部资源（实测每帧调用时进程私有提交
-        // 内存约 750 MB/min 线性上涨，关闭 DLSS 则完全平坦）。只在参数真的变了才下发。
+        // slDLSSSetOptions 只在配置变化时下发：每帧调用 SL 会重建内部资源（实测 ~750 MB/min 私有内存）。
         const bool slOptsChanged = !s.slEvalOptsValid || s.slEvalOptMode != static_cast<int32_t>(opt.mode) ||
                                    s.slEvalOptOutW != opt.outputWidth ||
                                    s.slEvalOptOutH != opt.outputHeight ||
@@ -2770,55 +2258,36 @@ sl::FrameToken* gLastFrameToken = nullptr;
                 s.slEvalOptHdr = mcdr_hdr_state_active() != 0;
             }
         }
-
-        // 4) evaluate（文档 :235：inputs 只需要 viewport；资源已经在 tag 里给过）
         const sl::BaseStructure* evalInputs[1] = {&viewport};
         sl::Result evalResult = sl::Result::eOk;
         evalResult = api.evaluate(sl::kFeatureDLSS, *token, evalInputs, 1, cmd);
         ++s.submitCount;
-
-
-        // 4.5) handover：只有当 SL 写的那张纹理不是 GUI 目标时才需要拷回（同尺寸、同格式）。
-        // P115：`outResource == out` 说明两者已经是同一张纹理，这一拷贝可以直接省掉。
+// handover：只有 SL 写的那张纹理不是 GUI 目标时才需要拷回（同尺寸、同格式）。
         if (copyBack && outResource != out && evalResult == sl::Result::eOk) {
             transition(outResource, D3D12_RESOURCE_STATE_COPY_SOURCE);
             transition(out, D3D12_RESOURCE_STATE_COPY_DEST);
             cmd->CopyResource(out, outResource);
         }
-        // 5) 宿主负责恢复（:242-253 + eDisableCLStateTracking）：只恢复输出到 RT。
-        // 输入侧我们不再改状态，所以也没有要恢复的 barrier。
+        // 宿主负责恢复：只把输出恢复成 RT —— 输入侧没改状态，也没有要恢复的 barrier。
         transition(out, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        // P305ag：SR 已跑完、输出已在 RENDER_TARGET —— 此刻把本帧输入交给 FG provider。
+        // SR 已跑完、输出已在 RENDER_TARGET —— 此刻把本帧输入交给 FG provider。
         tagFrameGenInputsFromDlss(cmd, in);
-
-        // 5.5) P213：帧生成（DLSS-G）。
-        // - HUD-less 必须“UI 之前、与 backbuffer 同尺寸”的画面（ProgrammingGuideDLSS_G.md §5.0）。
-        //   我们这里只有 SR 的输出（`outResource`）满足：它是窗口尺寸、且此后只有 GUI 合成会
-        //   写到 `out`，不会再碰 `outResource`。`outResource == out` 时不满足（那张会叠上 UI），
-        //   所以那种情形直接不开 FG。
-        // - §5.2：tag 的资源在 Present 时才被消费，用 eValidUntilPresent。
-        // - §6.0：slDLSSGSetOptions 要在呈现线程调用、下一次 Present 生效 —— 本函数就在渲染线程，
-        //   紧随其后的 present 就是它要影响的那一次。
+// 帧生成（DLSS-G）：
+// - HUD-less 必须是"UI 之前、与 backbuffer 同尺寸"的画面（ProgrammingGuideDLSS_G.md §5.0）：
+//   只有 SR 的输出满足（此后只有 GUI 合成会写 out）。outResource == out 那张会叠上 UI，不开 FG。
+// - §5.2：tag 的资源在 Present 时才消费，用 eValidUntilPresent。
+// - §6.0：slDLSSSetOptions 在下一次 Present 生效 —— 本函数就在渲染线程，紧随其后的那次就是目标。
         const int32_t fgMode = fgModeEarly;
-        // P213e（用户 m01219）：`appliedFgMode` 原来是 `if (wantFg)` 块内的静态量，关掉 FG 的
-        // 分支看不见它，于是那里只能用一次性闩 `fgOffSent` —— 开过再关就再也不发 eOff，
-        // Streamline 继续插帧而我们以为已经关了。挪到这里，两个分支共用。
+        // appliedFgMode 必须两分支共用：否则关 FG 的分支只能用一次性闩，开过再关就再也不发 eOff。
         static int32_t appliedFgMode = -1;
         static int32_t appliedFgFrames = -1;
         if (wantFg) {
-            // 上一步的拷贝把 outResource 留在了 COPY_SOURCE；tag 里声明的是 UNORDERED_ACCESS，
-            // 所以这里要把它切回去（Present 时状态必须与 tag 一致）。
+            // 上一步的拷贝把 outResource 留在 COPY_SOURCE；tag 声明的是 UNORDERED_ACCESS，Present 前必须切回去。
             transition(outResource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-            // 选项只在“期望状态变了”时下发：每帧调会拖慢 Present 线程（文档 §6.0 也不建议）。
-            // P213f：交换链重建（ResizeBuffers）之后 SL 侧必须重新拿到 options，否则 FG 会停在
-            // 旧尺寸上不再插帧。用“输出尺寸”当代理：尺寸变了就重发一次。
+// 选项只在状态变了时下发（每帧调拖慢 Present 线程）；Resize 后必须重发 options，用输出尺寸当代理。
             static uint32_t appliedFgW = 0;
             static uint32_t appliedFgH = 0;
-            // P225（Phase D）：动态多帧。
-            // 模式 DYNAMIC 时不再把决定权交给 SL（eDynamic 的 dynamicTargetFrameRate 只跟显示器
-            // 刷新率，完全无视我们的 Reflex 帧限），而是自己按“上帧时长 : 帧限”的比值算要插几帧，
-            // 再用 eOn + 显式 numFramesToGenerate 下发 —— 这样“Reflex 限帧”就是目标呈现率。
+            // 动态多帧：不用 SL 的 eDynamic（它无视 Reflex 限帧），自己按"上帧时长 : 帧限"算帧数并用 eOn + 显式 numFramesToGenerate。
             const int32_t maxFrames = std::clamp<int32_t>(gDlssgFrames.load(), 1, 5);
             static uint64_t lastFgQpc = 0;
             static int32_t dynFrames = 1;
@@ -2837,7 +2306,6 @@ sl::FrameToken* gLastFrameToken = nullptr;
                     if (targetUs > 0 && renderUs > 0) {
                         int32_t need = static_cast<int32_t>(targetUs / renderUs) - 1;
                         need = std::clamp(need, 1, maxFrames);
-                        // 一次只走一帧，避免抖动；上限由“生成帧数”配置决定。
                         if (need > dynFrames) {
                             dynFrames += 1;
                         } else if (need < dynFrames) {
@@ -2855,12 +2323,9 @@ sl::FrameToken* gLastFrameToken = nullptr;
                             wantFrames, maxFrames, gReflex.frameLimitUs);
                 }
             }
-            // P226（用户 m10065）：DYNAMIC 且没有 Reflex 限帧时，交回 SL 的 eDynamic —— 它知道
-            // 显示器刷新率，会自己往刷新率上追；有 Reflex 限帧时才用 P225 的显式帧数（让限帧成为目标）。
+            // DYNAMIC 且没有 Reflex 限帧时交回 SL 的 eDynamic（它知道刷新率，会自己追）；有限帧时才用显式帧数。
             const bool fgDynamic = (fgMode == 2) && (gReflex.frameLimitUs == 0);
-            // P296b：dynamic 下用 -1 当"帧数不由我们决定"的哨兵。原来条件里比的是哨兵、写的却是
-            // wantFrames，于是**每帧都判不等**→ 每帧一次 `slDLSSGSetOptions`。P199 已经量过同类调用
-            // 每帧一次的代价（进程私有提交内存 750 MB/min 线性上涨），所以这里存哨兵、比哨兵。
+            // 哨兵 -1 = 帧数不由我们决定：必须存哨兵，否则每帧都判不等 => 每帧一次 slDLSSGSetOptions。
             const int32_t appliedFramesWanted = fgDynamic ? -1 : wantFrames;
             if (appliedFgMode != fgMode || appliedFgFrames != appliedFramesWanted ||
                 appliedFgW != in.targetWidth || appliedFgH != in.targetHeight) {
@@ -2874,9 +2339,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
                     appliedFgFrames = appliedFramesWanted;
                     appliedFgW = in.targetWidth;
                     appliedFgH = in.targetHeight;
-                    // P296：只在本函数真的下发过选项时打一行（上面的 if 已经按"值变了才下发"过滤），
-                    // 验收时用它证明"开关确实到过 SL"，不需要去 sl.log 里猜 —— 那份日志只记
-                    // "slDLSSGSetOptions() is called on the thread N"，不记 mode/numFrames。
+                    // 只在本函数真的下发过选项时打一行，用来证明开关到过 SL（sl.log 不记 mode/numFrames）。
                     logInfo("fg options -> %s frames=%u (%ux%u)",
                             fgDynamic ? "dynamic" : "on",
                             static_cast<unsigned>(fg.numFramesToGenerate),
@@ -2891,14 +2354,12 @@ sl::FrameToken* gLastFrameToken = nullptr;
                     }
                 }
             }
-            // P213c：每帧问一次（只在 FG 开着时）presented 数，F3 的 output 要用它累积。
             if (api.getFgState != nullptr) {
                 sl::DLSSGState stFrame{};
                 const sl::Result stRes = api.getFgState(viewport, stFrame, nullptr);
                 if (stRes == sl::Result::eOk) {
                     gFgPresented.store(static_cast<int32_t>(stFrame.numFramesActuallyPresented));
-                    // P248：RTSS OSD 与"帧生成是否真的走 SL"互为前提 —— 秒级打一次状态，
-                    // 用 numFramesActuallyPresented > 1 证明插帧真的发生（而不是我们只是下发过选项）。
+                    // 秒级打一次状态，用 numFramesActuallyPresented > 1 证明插帧真的发生（而不是只下发过选项）。
                     static uint64_t fgLogTick = 0;
                     if (++fgLogTick % 600 == 0) {
                         logInfo("fg state: status=%d presented=%u maxGen=%u tick=%llu",
@@ -2917,8 +2378,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
             }
 
         } else if (fgMode == 0 && api.setFgOptions != nullptr) {
-            // P213e（用户 m01219）：关掉 FG 必须真的下发一次 eOff。原来靠一次性闩 `fgOffSent`，
-            // 一旦本进程里开过 FG 再关，就再也不发 → SL 仍在插帧、JVM 这边却以为已经关了。
+            // 关掉 FG 必须真的下发一次 eOff：一次性闩的老 bug 是开过再关就再也不发，SL 仍在插帧。
             if (appliedFgMode != 0) {
                 sl::DLSSGOptions fg{};
                 fg.mode = sl::DLSSGMode::eOff;
@@ -2926,13 +2386,10 @@ sl::FrameToken* gLastFrameToken = nullptr;
                 if (offResult == sl::Result::eOk) {
                     appliedFgMode = 0;
                     appliedFgFrames = 0;
-                    // P296（验收 A6）：关掉时到底有没有真的下发 eOff，只能由我们自己证明 ——
-                    // sl.log 不记 mode/numFrames。这行打在"刚关掉"的那一帧，之后 fgMode 一直是 0
-                    // 且 appliedFgMode 也是 0，不会再进这个分支。
+                    // 关掉时到底有没有真的下发 eOff 只能由我们自己证明（sl.log 不记 mode/numFrames）：打在刚关掉那一帧。
                     logInfo("fg options -> off (applied)");
                 } else {
-                    // 失败时 appliedFgMode 保持非 0，下一帧还会再试；这里只警告一次，
-                    // 免得"SL 不认 eOff"变成每秒几十行的垃圾日志。
+                    // 失败时 appliedFgMode 保持非 0，下一帧还会再试；这里只警告一次。
                     static bool warnedFgOff = false;
                     if (!warnedFgOff) {
                         warnedFgOff = true;
@@ -2941,14 +2398,10 @@ sl::FrameToken* gLastFrameToken = nullptr;
                     }
                 }
             }
-            // P213c（用户 m01219）：关着时“上一次真正提交的帧数”必须是 1。原来这里不复位，
-            // gFgPresented 会停在上次开 FG 时的 2/3…，JVM 的 F3 把它当成每帧都交了 2 帧，
-            // 于是出现“RTSS 实测 120、F3 却显示 120/240 (FG 2.0x)”。
+            // 关着时"上一次真正提交的帧数"必须是 1，否则 F3 会把上次开 FG 的 2/3 当成每帧都交 2 帧。
             gFgPresented.store(1);
         }
-
-        // P291e：记下这一帧结束时"那张被 DLSS 写过的输出纹理"停在哪个状态，
-        // 供 JVM 做状态正确的读回（0 = 本帧没有 handover 纹理，别采样）。
+// 记下本帧结束时输出纹理停在哪个状态，供 JVM 做状态正确的读回（0 = 本帧没有 handover 纹理）。
         gDlssOutputState.store(
             (copyBack && outResource != out && evalResult == sl::Result::eOk)
                 ? static_cast<int32_t>(wantFg ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
@@ -2973,14 +2426,10 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
         return -1;
     }
 #if MCDR_DLSS_HAVE_STREAMLINE
-    // P127（p93 实测：native 已自报 impl=streamline，但 streamlineEvaluate 一次都没被调用）：
-    // `s.disabled` 是 **NGX 路径**自己的失败状态（建不出 feature / MV 中间纹理失败时置位）。
-    // 它原来排在这个分支之前，于是启动阶段只要 NGX 探测失败，Streamline 就被永久挡在门外，
-    // native 每帧静默 return -1，JVM 只看到 "failed to evaluate 30 frames in a row"。
-    // Streamline 模式下 NGX 的状态与它无关，所以必须先判 SL。
+    // 先判 Streamline：s.disabled 是 **NGX 路径**自己的失败状态，排在前面会让 SL 被永久挡在门外
+    // （每帧静默 return -1，JVM 只看到 evaluate 连续失败）。
     if (dlssImplStreamline()) {
-        // P112 阶段 2：streamline 模式下 NGX 从未 init/创建，这里直接走 SL 的
-        // tag → options → evaluate 链（资源状态由 streamlineEvaluate 内部负责）。
+        // streamline 模式下 NGX 从未 init/创建：直接走 SL 的 tag -> options -> evaluate（状态由内部负责）。
         return streamlineEvaluate(commandList, *in, tl, tlCtx);
     }
 #endif
@@ -2994,7 +2443,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     if (cmd == nullptr) {
         return 0;
     }
-    // Install the module-provided tracked-transition callback for this call (see transition()).
+    // 为本调用装上模块提供的跟踪式转换回调。
     s.transitionFn = tl;
     s.transitionCtx = tlCtx;
     auto* color = reinterpret_cast<ID3D12Resource*>(in->pInColor);
@@ -3004,19 +2453,15 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     if (color == nullptr || depth == nullptr || mv == nullptr || out == nullptr) {
         return 0;
     }
-    // P108 (2026-10-16 crash, hs_err_pid52140): a NON-NULL but invalid handle passed the
-    // `== nullptr` check above and faulted on the very first vtable call —
-    // `EXCEPTION_ACCESS_VIOLATION reading 0x50`, native frames
-    // `mcdr_dlss_evaluate+0xba (d3d12_dlss.cpp:1125)` -> `applyDlssToTexture+0x31d` ->
-    // `mcdr_dx12EvaluateDlss+0x13`, i.e. the first `mv->GetDesc()`. Reject a dangling or
-    // truncated handle HERE instead of dereferencing it: a garbage pointer must degrade to
-    // "DLSS skipped this frame", never to a process kill. Reported once, with raw values.
+    // 非 NULL 但失效的句柄必须**在第一次 vtable 调用之前**挡掉：曾以
+    // EXCEPTION_ACCESS_VIOLATION reading 0x50（第一次 mv->GetDesc()）直接把进程干掉。垃圾指针只能
+    // 退化成"本帧跳过 DLSS"，绝不杀进程；失败只报一次，带上原始数值。
     if (!isMappedReadable(color) || !isMappedReadable(depth) || !isMappedReadable(mv) ||
         !isMappedReadable(out)) {
         if (!s.evalFailWarned) {
             s.evalFailWarned = true;
             s.failure = "invalid texture handle";
-            logError("DLSS skipped — a texture handle in mcdr_dlss_input is not a readable "
+            logError("DLSS skipped: bad texture handle in input"
                      "pointer (color=%p depth=%p mv=%p out=%p). That is a data-plane bug (the JVM "
                      "handed over a stale/invalid handle), not a DLSS failure; DLSS stays enabled "
                      "so the next frame can retry with a valid set.",
@@ -3025,10 +2470,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
         }
         return 0;
     }
-
-    // Motion vectors must be in a format DLSS can bind. The velocity pass writes
-    // RG16_FLOAT, which is exactly what NGX wants; anything else is copied into an
-    // intermediate of the same footprint first.
+// MV 必须是 DLSS 能绑的格式：速度 pass 写 RG16_FLOAT（正好），其它格式先拷进同 footprint 的中间纹理。
     ID3D12Resource* mvForDlss = mv;
     const bool mvIsRg16 = (mv->GetDesc().Format == DXGI_FORMAT_R16G16_FLOAT);
     if (!mvIsRg16) {
@@ -3036,8 +2478,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
         const bool reuse = (s.mvBuffer != nullptr) && (s.mvBuffer->GetDesc().Width == md.Width) &&
                            (s.mvBuffer->GetDesc().Height == md.Height);
         if (!reuse) {
-            // B4: created by the device module (verified/tracked there), released through its
-            // deferred-delete path — no CreateCommittedResource in this unit.
+            // B4：由设备模块创建并跟踪，释放走延迟删除；本单元不 CreateCommittedResource。
             destroyTrackedTexture(s.transitionCtx, &s.mvBufferObject);
             s.mvBuffer = nullptr;
             void* mvObj = nullptr;
@@ -3045,7 +2486,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
             if (!createTrackedTexture(s.transitionCtx, static_cast<UINT>(md.Width), md.Height,
                                       md.Format, md.MipLevels, md.DepthOrArraySize,
                                       md.SampleDesc.Count, 0, &mvObj, &mvRes)) {
-                logError("motion-vector intermediate creation failed (fmt=%d); DLSS disabled",
+                logError("mv intermediate create failed fmt=%d; DLSS disabled",
                          static_cast<int>(md.Format));
                 s.disabled = true;
                 return -1;
@@ -3061,45 +2502,24 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
         transition(mvForDlss, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         s.mvCopyResourceState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     }
-
-    // P108: prefer the depth snapshot taken before vanilla cleared the depth buffer. This is
-    // what keeps the upscale depth-aware instead of colour-only; without it the depth term is
-    // a constant "far" plane. Falls back to the JVM-supplied depth when no snapshot exists.
+// 优先用 vanilla 清深度之前拍的快照：没有它深度项恒为远平面，放大退化成纯颜色；无快照才用 JVM 送的深度。
     ID3D12Resource* depthForDlss = depth;
     if (s.depthSnapshot != nullptr) {
         depthForDlss = s.depthSnapshot;
     }
-
-    // All four inputs go to PIXEL_SHADER_RESOURCE (NGX samples them) and the output to
-    // RENDER_TARGET (NGX writes it). Done before every Evaluate so the states hold no
-    // matter which pass the JVM hands them over from. `depth` is only transitioned when it is
-    // the resource actually handed to NGX (the snapshot already sits in PIXEL_SHADER_RESOURCE).
-    // P108x ROOT-CAUSE FIX: NGX evaluates DLSS with a COMPUTE dispatch (its output is a UAV), and a
-    // texture sitting in PIXEL_SHADER_RESOURCE is not readable from a compute shader. That is an
-    // INVALID CALL — and indeed `logDeviceStatus("dlss-evaluate")` reports
-    // `GetDeviceRemovedReason=HRESULT 0x887A0001` (DXGI_ERROR_INVALID_CALL) one millisecond after a
-    // "successful" evaluate. All three inputs therefore go to NON_PIXEL_SHADER_RESOURCE (the state
-    // compute dispatches read from).
+// 每次 Evaluate 前都设：输入 -> NON_PIXEL_SHADER_RESOURCE，输出 -> UNORDERED_ACCESS。NGX 用
+// compute dispatch 评价（输出是 UAV），PIXEL_SHADER_RESOURCE 在 compute 里不可读
+// —— 那是 INVALID_CALL，实测 "成功" 后 1 ms 就 GetDeviceRemovedReason=0x887A0001。
+// depth 只在它就是交给 NGX 的那张资源时转换（快照已经在 PIXEL_SHADER_RESOURCE 之上）。
     transition(color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     if (depthForDlss == depth) {
         transition(depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
     transition(mvForDlss, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    // P108: NGX's output must be a UAV resource. The JVM's target is created with
-    // ALLOW_RENDER_TARGET only, which NGX rejects with `FAIL_RWFlagMissing` (0xBAD00009), so DLSS
-    // has to write into something else.
-    //
-    // HISTORY — why the JVM now supplies that something (user m11147 follow-up, control-group
-    // evidence): our own `CreateCommittedResource` texture turned out to be unwritable. With the
-    // IDENTICAL source, call site and command list, copying the colour input into the
-    // module-created target read back `mean=17.8/16.5/11.6/255.0`, while the same copy into this
-    // unit's private texture read `mean=0.0/0.0/0.0/0.0` — all zero, alpha included — both
-    // immediately and on the following frame. So the ad-hoc creation path produces a resource the
-    // GPU will not write; the module's `createTexture` path does not.
-    //
-    // Therefore: if the JVM hands us a UAV texture it created through the module (see
-    // `mcdr_dx12SetDlssOutput`), use it and never build a private one. The private texture stays
-    // only as a fallback for older JVM builds / older DLL pairings.
+    // NGX 的输出必须是 UAV 资源，而 JVM 的 GUI 目标是 ALLOW_RENDER_TARGET（FAIL_RWFlagMissing）。
+    // 本单元自己 CreateCommittedResource 出来的纹理 GPU 根本不写（同样的拷贝读回全 0，含 alpha），
+    // 所以只要 JVM 通过 mcdr_dx12SetDlssOutput 交付了经模块创建的 UAV 纹理就用它，私有纹理只作为
+    // 旧 DLL/旧 JVM 配对的兜底。
     ID3D12Resource* ngxTarget = out;
     bool viaHandover = false;
     if (s.externalOutput != nullptr) {
@@ -3113,9 +2533,8 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
             transition(out, D3D12_RESOURCE_STATE_COPY_DEST);
             transition(ngxTarget, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         } else {
-            // Never silent: a mismatch means the copy back would be nonsense, so say so and fall
-            // back to the private texture (the old, still-broken-on-this-machine path).
-            logError("the JVM-supplied DLSS output texture does not fit the target — "
+            // 格式不一致必须报出来并退回私有纹理（否则拷回的是无意义内容）。
+            logError("JVM output does not fit target"
                      "got %llux%u fmt=%d, need %dx%d fmt=%d; falling back to the private UAV "
                      "texture (which this machine cannot write, so DLSS output will be empty)",
                      static_cast<unsigned long long>(ed.Width), ed.Height,
@@ -3129,19 +2548,13 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
                                                 out->GetDesc().Format);
         if (priv != nullptr) {
             ngxTarget = priv;
-            // `out` only has to be a copy destination until the copy below.
             transition(out, D3D12_RESOURCE_STATE_COPY_DEST);
             transition(priv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
     }
-
-    // P291b: never ask NGX to write into a texture this module did not create with
-    // ALLOW_UNORDERED_ACCESS. The JVM GUI target has no UAV flag, so transitioning it to
-    // UNORDERED_ACCESS is what removes the device (user m04140: turning the hand-over off
-    // crashed the game). If neither the hand-over texture nor a private one is usable, skip
-    // the frame instead of removing the device.
+// 绝不让 NGX 写进没按 ALLOW_UNORDERED_ACCESS 建的纹理：把 GUI 目标转成 UAV 会移除设备；两者都不可用就跳过本帧。
     if (ngxTarget == out) {
-        logError("no usable DLSS output texture this frame (the hand-over texture was "
+        logError("no usable DLSS output texture; evaluate skipped"
                  "rejected and the private one could not be created); skipping the evaluate "
                  "instead of transitioning a non-UAV target to UNORDERED_ACCESS");
         return 0;
@@ -3149,9 +2562,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     NVSDK_NGX_D3D12_DLSS_Eval_Params ep{};
     ep.Feature.pInColor = color;
     ep.Feature.pInOutput = ngxTarget;
-    // P108: 0, not the SDK's "optimal" sharpness. The reference integration sets 0 with the note
-    // "sharpening is deprecated in DLSS"; the value we used to pass (0.35 here) is a leftover from
-    // the optimal-settings query and is not what a working integration asks for.
+    // 锐度传 0（不是 SDK 的 optimal）：参考实现注明 DLSS 里锐化已废弃，0.35 是当年查询结果的残留。
     ep.Feature.InSharpness = 0.0f;
     ep.pInDepth = depthForDlss;
     ep.pInMotionVectors = mvForDlss;
@@ -3166,8 +2577,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     ep.InExposureScale = (in->exposureMode == MCDR_DLSS_EXPOSURE_NONE && in->exposureScale != 0.0f)
                              ? in->exposureScale
                              : 1.0f;
-    // No transparency mask, no auto-exposure texture, no subrects: the data plane produces
-    // none of them yet (see the ABI header's list of what MCDR does not have).
+    // 没有透明遮罩、曝光纹理和 subrect：数据面还不提供这些。
 
     const NVSDK_NGX_Result er = NGX_D3D12_EVALUATE_DLSS_EXT(cmd, s.feature, s.params, &ep);
     if (NVSDK_NGX_FAILED(er)) {
@@ -3186,9 +2596,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
         s.disabled = true;
         return -1;
     }
-    // P108: hand the result back. DLSS wrote into our UAV texture, so copy it into the JVM's
-    // target and leave that target in RENDER_TARGET — the GUI render pass attaches it right
-    // after this returns (the contract this entry point has always had).
+    // 结果交回：DLSS 写的是我们的 UAV，拷进 JVM 目标并留在 RENDER_TARGET —— GUI pass 紧接着附着它。
     if (ngxTarget != out) {
         transition(ngxTarget, D3D12_RESOURCE_STATE_COPY_SOURCE);
         cmd->CopyResource(out, ngxTarget);
@@ -3197,39 +2605,32 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     } else {
         transition(out, D3D12_RESOURCE_STATE_RENDER_TARGET);
     }
-    // P305ag：NGX 路径同样在 SR 成功后把本帧输入交给 FG provider（深度/MV 已在上面转成只读）。
+    // NGX 路径同样在 SR 成功后把本帧输入交给 FG provider（深度/MV 已转成只读）。
     tagFrameGenInputsFromDlss(cmd, *in);
     s.resetPending = false;
 
     ++s.submitCount;
     if (!s.evalOk) {
         s.evalOk = true;
-        logInfo("DLSS Evaluate succeeded on the first frame: render %dx%d -> target %dx%d "
+        logInfo("DLSS evaluate ok %dx%d -> %dx%d"
                 "(mv=%s)",
                 in->renderWidth, in->renderHeight, in->targetWidth, in->targetHeight,
                 mvIsRg16 ? "RG16 straight through" : "copied into an RG16 intermediate");
     }
-    // P291b: 1 = the result went into the JVM hand-over texture (or straight into the JVM
-    // target); 2 = it went into the module private texture, which the JVM must NOT treat as
-    // "the GUI target already carries the world layer" - that is the black-screen path.
+    // 1 = 结果进了 JVM handover 纹理（或直接进 JVM 目标）；2 = 进了私有纹理，JVM 不能当成"GUI 目标已带世界层"（黑屏路径）。
     return viaHandover ? 1 : 2;
 }
-
-    // Called from destroyDevice() BEFORE the D3D12 device goes away: NGX must release its
-    // feature and shut down while the device is still alive.
-    // P108 (user m11147): record the tier the user picked. Called by the device module whenever
-    // `setDlssQuality` observes a change. A value >= 0 makes `ensureFeature` rebuild the feature on
-    // the next frame (PerfQualityValue is a CreateFeature input); -1 restores the "closest to the
-    // render:target ratio" behaviour for old DLL/old JVM combinations.
+// destroyDevice() 里、设备还活着时调用：NGX 必须先释放 feature 再 shutdown。
+// setDlssQuality 观察到的档位记在这里：>= 0 让 ensureFeature 下一帧重建（PerfQualityValue 是
+// CreateFeature 输入），-1 恢复"按比例选"。
     int32_t mcdr_dlss_request_quality(int32_t tier) {
     const int normalised = (tier < 0) ? -1 : (tier > 4 ? 4 : tier);
     if (normalised != s.requestedQuality) {
         s.requestedQuality = normalised;
-        // Allow a rebuild even if a previous create failed, so switching tiers can recover.
         s.createdWarned = false;
         if (!s.qualityRequestLogged) {
             s.qualityRequestLogged = true;
-            logInfo("DLSS quality tier request: %d (%s) — the feature will be rebuilt",
+            logInfo("DLSS tier request %d (%s); feature rebuilds",
                     normalised,
                     normalised < 0 ? "unset -> closest to the render:target ratio"
                                    : (normalised == 1 ? "Performance"
@@ -3241,45 +2642,31 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     }
     return normalised;
     }
-
-    // P108ac (user m08033): the DLSS *model* (NGX render preset). The user's report was that the
-    // remaining noise/flicker is inherent to DLSS and that the usual remedy is swapping the model,
-    // so this exposes exactly that knob instead of guessing a better default ourselves.
-    //
-    // `preset` is a NVSDK_NGX_DLSS_Hint_Render_Preset value: 0 = Default (NGX decides per tier),
-    // 5 = E and 6 = F (deprecated CNN presets), 10 = J, 11 = K, 12 = L, 13 = M (transformer).
-    // Out-of-range values are rejected with -1 and change nothing. A change makes `ensureFeature`
-    // rebuild the feature on the next frame, because the preset is a CreateFeature input.
+// preset 是 NVSDK_NGX_DLSS_Hint_Render_Preset：0 = Default（NGX 按档自选）、5 = E / 6 = F
+// （已废弃的 CNN）、10 = J、11 = K、12 = L、13 = M（transformer）。越界返回 -1 且不改任何东西；
+// 变化会重建 feature（preset 是 CreateFeature 输入）。
     int32_t mcdr_dlss_request_preset(int32_t preset) {
         if (preset < 0 || preset > NVSDK_NGX_DLSS_Hint_Render_Preset_O) {
-            logWarn("DLSS render preset %d is out of range (valid: 0=Default, 5=E, 6=F, "
+            logWarn("DLSS preset %d out of range (valid 0,5,6,10..13)"
                     "10=J, 11=K, 12=L, 13=M) — ignored",
                     preset);
             return -1;
         }
         if (preset != s.requestedPreset) {
             s.requestedPreset = preset;
-            // Same recovery rule as the tier: a failed create must be retryable by changing the
-            // model, otherwise a first-frame failure locks the button out for the whole session.
+            // 同档位：失败的 create 必须能靠换模型重试，否则首帧失败就锁死整个按钮。
             s.createdWarned = false;
             if (!s.presetRequestLogged) {
                 s.presetRequestLogged = true;
-                logInfo("DLSS render preset request: %d (%s) — the feature will be rebuilt",
+                logInfo("DLSS preset request %d (%s); feature rebuilds",
                         preset, presetName(preset).c_str());
             }
         }
         return preset;
     }
-
-    // P108 (user m11147 follow-up): the JVM hands us the UAV texture it created through the module's
-// `createTexture` path, to be used as NGX's output instead of this unit's private texture.
-//
-// The module does the unwrapping (it is the side that knows `Dx12Object`'s layout) and passes the
-// raw `ID3D12Resource*` as an opaque pointer — never reinterpret a JVM handle here, that mistake
-// caused the `mv->GetDesc()` null-vtable crash recorded in mcdr_dlss_evaluate.
-//
-// `resource == nullptr` clears the override and restores the private fallback. The resource is NOT
-// owned by this unit; the module keeps the Dx12Object alive. Returns 1=accepted 0=cleared.
+// JVM 交付的 UAV 输出纹理（经模块 createTexture 创建）。解包由模块做，这里只收裸
+// ID3D12Resource* —— 绝不要在这里解释 JVM 句柄（那个错误就是 mv->GetDesc() 的空 vtable 崩溃）。
+// resource == nullptr 清掉覆盖、退回私有纹理；本单元不持有该资源。返回 1 = 接受，0 = 清除。
 int32_t mcdr_dlss_set_output_texture(void* resource) {
     auto* res = static_cast<ID3D12Resource*>(resource);
     if (res == s.externalOutput) {
@@ -3288,27 +2675,22 @@ int32_t mcdr_dlss_set_output_texture(void* resource) {
     s.externalOutput = res;
     if (res != nullptr) {
         const D3D12_RESOURCE_DESC d = res->GetDesc();
-        logInfo("DLSS output texture supplied by the JVM: %llux%u fmt=%d flags=0x%X — NGX "
+        logInfo("DLSS output texture %llux%u fmt=%d flags=0x%X"
                 "will write here instead of this unit's private UAV texture",
                 static_cast<unsigned long long>(d.Width), d.Height, static_cast<int>(d.Format),
                 static_cast<unsigned>(d.Flags));
     } else {
-        logInfo("DLSS output texture override cleared; back to the private UAV texture");
+        logInfo("DLSS output override cleared; private UAV again");
     }
     return res != nullptr ? 1 : 0;
 }
-
-// P108 (user m10920): the DLSS on/off switch. Independent of the anti-aliasing mode, and
-    // deliberately does NOT touch the loaded NGX runtime / feature handle — flipping the switch
-    // off and on again must not throw away a successful Init/CreateFeature. The real gate is
-    // the device module's applyDlssToTexture (gCtx.dlssEnabled); this mirror feeds the status
-    // query and the log.
+// DLSS 开关与 AA 模式无关，且不动已加载的 runtime/feature（关了再开不该丢 Init）；真正的门是设备模块的 dlssEnabled。
     int32_t mcdr_dlss_set_enabled(int32_t enabled) {
     const bool want = enabled != 0;
     const bool changed = (want != s.enabled);
     s.enabled = want;
     if (changed) {
-        logInfo("DLSS switch %s (independent of anti-aliasing; NGX state is kept: "
+        logInfo("DLSS switch %s "
                 "initOk=%d featureOk=%d)",
                 want ? "ON" : "OFF", s.initOk ? 1 : 0, s.featureOk ? 1 : 0);
     }
@@ -3317,9 +2699,7 @@ int32_t mcdr_dlss_set_output_texture(void* resource) {
 
     void mcdr_dlss_shutdown(void) {
     destroyFeature();
-    // B4: the three private textures are module-owned now. Hand them back **before** the device
-    // goes away (ctx = nullptr: no command list to touch, just the deferred delete). They used to
-    // be leaked here (`s = State{}` dropped the pointers) or Release()d inline.
+    // 三张私有纹理归模块所有：设备消失**之前**交回（ctx = nullptr：只做延迟删除，不碰命令列表）。
     destroyTrackedTexture(nullptr, &s.mvBufferObject);
     s.mvBuffer = nullptr;
     destroyTrackedTexture(nullptr, &s.dlssOutputObject);
@@ -3331,8 +2711,7 @@ int32_t mcdr_dlss_set_output_texture(void* resource) {
         s.depthStencil = nullptr;
     }
     if (s.initOk) {
-        // Shutdown1(device) 是现行入口；NVSDK_NGX_D3D12_Shutdown() 只在定义了
-        // NGX_ENABLE_DEPRECATED_SHUTDOWN 时才声明，本项目没有定义它（编译期就报 C3861）。
+        // 只能用 NVSDK_NGX_D3D12_Shutdown1(device)：无参 Shutdown() 需要 NGX_ENABLE_DEPRECATED_SHUTDOWN（未定义，C3861）。
         const NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Shutdown1(s.device);
         if (NVSDK_NGX_FAILED(r)) {
             logWarn("NVSDK_NGX_D3D12_Shutdown1 failed: %s", ngxResultString(r).c_str());
@@ -3340,22 +2719,14 @@ int32_t mcdr_dlss_set_output_texture(void* resource) {
         s = State{};
     }
 
-
 }  // mcdr_dlss_shutdown
-
-// P249：DXGI 工厂升级入口。设备模块建工厂后立刻调一次，把 swapchain 交给 SL 的代理工厂
-// （否则 DLSS-G 一次都不出帧；见 mcdr_dlss_impl.h 里那段说明）。
+// DXGI 工厂升级入口：设备模块建完工厂立刻调一次，否则 DLSS-G 一次都不出帧。
 int32_t mcdr_sl_upgrade_interface(void** baseInterface) {
 #if MCDR_DLSS_HAVE_STREAMLINE
     if (!dlssImplStreamline()) {
         return 0;
     }
-    // P253（2026-10-26，用户 m04053 的对照实验）：**只要 DLSS 实现是 STREAMLINE，链就一律走
-    // SL 代理工厂**，不再按帧生成开关决定。依据是同一台机器上的 A/B：
-    //   dev（FG 开 ⇒ 代理链，Present 槽 owner=sl.interposer.dll）: RTSS OSD 正常；
-    //   用户 Prism 实例（FG 关 ⇒ P250 保持原生链，owner=DXGI.DLL+jmp）: OSD 不显示。
-    // 两边的 RTSSHooks64 基址、两个 D3D12Core、swapchain 描述、窗口模式全部一致，唯一测到的
-    // 差异就是链是否被 SL 代理 —— 所以先按“代理链才让 RTSS 的 OSD 生效”验证。
+    // 只要实现是 STREAMLINE，链就一律走 SL 代理工厂（不按 FG 开关）：A/B 实测只有代理链让 RTSS 的 OSD 生效。
     const int32_t fgModeForLog = gDlssgMode.load();
     const int32_t upgraded = streamlineUpgradeInterface(baseInterface);
     if (upgraded != 0) {
@@ -3370,28 +2741,265 @@ int32_t mcdr_sl_upgrade_interface(void** baseInterface) {
 #endif
 }
 
-
 }  // extern "C"
-
-// P213：帧生成的开关（C++ 链接，与 mcdr_dlss_impl.h 的声明一致）。
-// 0 = off，1 = on（固定倍率），2 = dynamic（多帧，驱动 ≥ 595.41）。
-// 真正的下发在 streamlineEvaluate() 里（那里才有 frame token 与 viewport，且必须在呈现线程上调用）。
+// FG 开关（C++ 链接）：0=off 1=on 2=dynamic（驱动 >= 595.41）；真正下发在 streamlineEvaluate（呈现线程）。
 void mcdr_dlss_set_fg_mode(int32_t mode, int32_t numFrames) {
     gDlssgMode.store(mode);
     gDlssgFrames.store(numFrames < 1 ? 1 : numFrames);
-    // P213c（用户 m01219）：关掉时立刻把“上一次提交的帧数”复位，不等下一帧 evaluate ——
-    // F3 每帧都在读它，晚一帧就会显示一次 2× 的错数。
+    // 关掉时立刻复位"上一次提交的帧数"：F3 每帧都在读它，晚一帧就显示一次 2x 的错数。
     if (mode == 0) {
         gFgPresented.store(1);
     }
 }
-// P213c：上一次 Present 真正提交的帧数（1 = 没插帧）。JVM 的 F3 用它把 output 累加成
-// “presented fps”，否则一次 slPresent 只被 JVM 看到一次，两个数字永远相等。
+// 上一次 Present 真正提交的帧数（1 = 没插帧）；F3 用它把 output 累加成 presented fps。
 int32_t mcdr_dlss_fg_presented(void) {
     return gFgPresented.load();
 }
-// P291e：DLSS 输出纹理当前所处的 D3D12_RESOURCE_STATES（0 = 未知/没有 handover 纹理）。
-// 读回采样必须带这个状态，否则 barrier 的 StateBefore 是错的、内容未定义。
+// DLSS 输出纹理当前的 state（0 = 未知/无 handover 纹理）。读回必须拿它当 StateBefore，否则 barrier 的 Before 错、内容未定义。
 int32_t mcdr_dlss_output_state(void) {
     return gDlssOutputState.load();
 }
+
+// ---- DLSS-D（Ray Reconstruction）逐帧求值 -------------------------------------
+// RR 与 DLSS-SR 是两份插件，函数也从 sl.interposer.dll 现场解析：宁可这里返回 0，
+// 也不要在游戏进程里自己调 NVSDK_NGX_D3D12_Init_*（SL 持有 NGX，会撞 0xBAD00005）。
+#if MCDR_DLSS_HAVE_STREAMLINE
+namespace {
+
+using PFn_GetFeatureFunction = sl::Result (*)(sl::Feature, const char*, void*&);
+
+struct DlssdApi {
+    bool resolved = false;
+    bool ok = false;
+    PFn_GetFeatureFunction getFeatureFunction = nullptr;
+    sl::Result (*setTag)(const sl::FrameToken&, const sl::ViewportHandle&, const sl::ResourceTag*,
+                         uint32_t, ID3D12GraphicsCommandList*) = nullptr;
+    sl::Result (*evaluate)(sl::Feature, const sl::FrameToken&, const sl::BaseStructure* const*,
+                           uint32_t, ID3D12GraphicsCommandList*) = nullptr;
+    sl::Result (*newFrameToken)(sl::FrameToken*&, const uint32_t*) = nullptr;
+    // 缺了常量 DLSS-D 不会报错，只会按「零位移」重投影（画面拖影），所以这条要单独记结果。
+    sl::Result (*setConstants)(const sl::Constants&, const sl::FrameToken&,
+                               const sl::ViewportHandle&) = nullptr;
+    sl::Result (*setOptions)(const sl::ViewportHandle&, const sl::DLSSDOptions&) = nullptr;
+    uint32_t optionWidth = 0u;
+    uint32_t optionHeight = 0u;
+    int32_t optionMode = -1;
+    // 一次性诊断：成功只报一条，失败也只报一条（每帧重复没有信息量）。
+    bool reportedOk = false;
+    bool reportedFail = false;
+};
+
+std::wstring dlssdModuleDirectory() {
+    HMODULE self = nullptr;
+    if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                  GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              reinterpret_cast<LPCWSTR>(&dlssdModuleDirectory), &self)) {
+        return {};
+    }
+    wchar_t path[MAX_PATH] = {};
+    if (!::GetModuleFileNameW(self, path, MAX_PATH)) return {};
+    std::wstring text(path);
+    const auto slash = text.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? std::wstring() : text.substr(0, slash + 1);
+}
+
+DlssdApi& dlssdApi() {
+    static DlssdApi api{};
+    if (api.resolved) return api;
+    api.resolved = true;
+    const std::wstring dir = dlssdModuleDirectory();
+    if (dir.empty()) return api;
+    HMODULE sl = ::LoadLibraryW((dir + L"sl.interposer.dll").c_str());
+    if (sl == nullptr) return api;
+    api.getFeatureFunction =
+        reinterpret_cast<PFn_GetFeatureFunction>(::GetProcAddress(sl, "slGetFeatureFunction"));
+    api.setTag = reinterpret_cast<decltype(api.setTag)>(::GetProcAddress(sl, "slSetTagForFrame"));
+    api.evaluate = reinterpret_cast<decltype(api.evaluate)>(::GetProcAddress(sl, "slEvaluateFeature"));
+    api.newFrameToken =
+        reinterpret_cast<decltype(api.newFrameToken)>(::GetProcAddress(sl, "slGetNewFrameToken"));
+    api.setConstants =
+        reinterpret_cast<decltype(api.setConstants)>(::GetProcAddress(sl, "slSetConstants"));
+    if (api.getFeatureFunction == nullptr || api.setTag == nullptr || api.evaluate == nullptr ||
+        api.newFrameToken == nullptr) {
+        return api;
+    }
+    void* raw = nullptr;
+    if (api.getFeatureFunction(sl::kFeatureDLSS_RR, "slDLSSDSetOptions", raw) != sl::Result::eOk ||
+        raw == nullptr) {
+        return api;
+    }
+    api.setOptions = reinterpret_cast<decltype(api.setOptions)>(raw);
+    api.ok = true;
+    return api;
+}
+
+void writeText(char* out, int32_t capacity, const char* text) {
+    if (out == nullptr || capacity <= 0) return;
+    std::snprintf(out, static_cast<size_t>(capacity), "%s", text == nullptr ? "" : text);
+}
+
+}  // namespace
+
+extern "C" int32_t mcdr_dlssd_eval(const mcdr_dlssd_frame* frame, char* outText, int32_t capacity) {
+    writeText(outText, capacity, "dlssd: frame inputs incomplete");
+    if (frame == nullptr) return 0;
+    // 位序：1 list、2 radiance、4 output、8 depth、16 motion、32 normal。缺哪个一眼看得出来。
+    const unsigned missing =
+        (frame->list == nullptr ? 1u : 0u) | (frame->radiance == nullptr ? 2u : 0u) |
+        (frame->output == nullptr ? 4u : 0u) | (frame->depth == nullptr ? 8u : 0u) |
+        (frame->motion == nullptr ? 16u : 0u) | (frame->normal == nullptr ? 32u : 0u);
+    if (missing != 0u) {
+        char line[64] = {};
+        std::snprintf(line, sizeof(line), "dlssd: frame inputs missing 0x%X", missing);
+        writeText(outText, capacity, line);
+        return 0;
+    }
+    DlssdApi& api = dlssdApi();
+    if (!api.ok) {
+        writeText(outText, capacity, "dlssd: streamline rr api missing");
+        return 0;
+    }
+    auto* list = static_cast<ID3D12GraphicsCommandList*>(frame->list);
+    const sl::ViewportHandle viewport(0);
+
+    // 选项只在输出尺寸/模式变化时下发：每帧下发会让 SL 重建内部资源。
+    const int32_t mode = static_cast<int32_t>(sl::DLSSMode::eMaxQuality);
+    if (api.optionWidth != frame->outputWidth || api.optionHeight != frame->outputHeight ||
+        api.optionMode != mode) {
+        sl::DLSSDOptions options{};
+        options.mode = sl::DLSSMode::eMaxQuality;
+        options.outputWidth = frame->outputWidth;
+        options.outputHeight = frame->outputHeight;
+        options.preExposure = 1.0f;
+        options.exposureScale = 1.0f;
+        // RR 吃的是线性 HDR 辐亮度（RGBA16F），不是 SDR 颜色。
+        options.colorBuffersHDR = sl::Boolean::eTrue;
+        options.alphaUpscalingEnabled = sl::Boolean::eFalse;
+        options.normalRoughnessMode = frame->roughness != nullptr
+                                          ? sl::DLSSDNormalRoughnessMode::eUnpacked
+                                          : sl::DLSSDNormalRoughnessMode::ePacked;
+        options.dlaaPreset = sl::DLSSDPreset::ePresetF;
+        options.qualityPreset = sl::DLSSDPreset::ePresetF;
+        options.balancedPreset = sl::DLSSDPreset::ePresetF;
+        options.performancePreset = sl::DLSSDPreset::ePresetF;
+        const sl::Result r = api.setOptions(viewport, options);
+        if (r != sl::Result::eOk) {
+            char line[160] = {};
+            std::snprintf(line, sizeof(line), "dlssd: setOptions 0x%X out %ux%u",
+                          static_cast<unsigned>(r), frame->outputWidth, frame->outputHeight);
+            writeText(outText, capacity, line);
+            return -1;
+        }
+        api.optionWidth = frame->outputWidth;
+        api.optionHeight = frame->outputHeight;
+        api.optionMode = mode;
+    }
+
+    sl::FrameToken* token = nullptr;
+    const uint32_t index = frame->frameIndex;
+    if (api.newFrameToken(token, &index) != sl::Result::eOk || token == nullptr) {
+        writeText(outText, capacity, "dlssd: frame token unavailable");
+        return 0;
+    }
+
+    // slSetConstants：DLSS-D 靠它做重投影。四个矩阵是行主序（SL 的 float4x4 就是 row[4]），
+    // 且明确禁止含抖动偏移；Kotlin 侧已按这个约定摊成 72 个浮点。
+    sl::Result constantsResult = sl::Result::eErrorMissingInputParameter;
+    if (api.setConstants != nullptr && frame->constants != nullptr) {
+        const float* m = frame->constants;
+        sl::Constants values{};
+        for (uint32_t row = 0; row < 4u; ++row) {
+            const uint32_t r = row * 4u;
+            values.cameraViewToClip.setRow(
+                row, sl::float4(m[r], m[r + 1u], m[r + 2u], m[r + 3u]));
+            values.clipToCameraView.setRow(
+                row, sl::float4(m[16u + r], m[17u + r], m[18u + r], m[19u + r]));
+            values.clipToPrevClip.setRow(
+                row, sl::float4(m[32u + r], m[33u + r], m[34u + r], m[35u + r]));
+            values.prevClipToClip.setRow(
+                row, sl::float4(m[48u + r], m[49u + r], m[50u + r], m[51u + r]));
+        }
+        // 本渲染器不做时间抖动，MV 是像素单位且 +y 朝下，所以 jitter 恒 0、mvecScale 取 1/w、1/h。
+        values.jitterOffset = sl::float2(0.0f, 0.0f);
+        values.mvecScale =
+            sl::float2(frame->width > 0 ? 1.0f / static_cast<float>(frame->width) : 0.0f,
+                       frame->height > 0 ? 1.0f / static_cast<float>(frame->height) : 0.0f);
+        values.cameraNear = m[64];
+        values.cameraFar = m[65];
+        values.cameraFOV = m[66];
+        values.cameraAspectRatio = m[67];
+        values.depthInverted = sl::Boolean::eFalse;
+        values.cameraMotionIncluded = sl::Boolean::eTrue;
+        values.motionVectors3D = sl::Boolean::eFalse;
+        values.orthographicProjection = sl::Boolean::eFalse;
+        values.reset = frame->reset != 0 ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+        constantsResult = api.setConstants(values, *token, viewport);
+    }
+
+    auto* radiance = static_cast<ID3D12Resource*>(frame->radiance);
+    auto* output = static_cast<ID3D12Resource*>(frame->output);
+    auto* depth = static_cast<ID3D12Resource*>(frame->depth);
+    auto* motion = static_cast<ID3D12Resource*>(frame->motion);
+    auto* normal = static_cast<ID3D12Resource*>(frame->normal);
+    sl::Resource colorRes(sl::ResourceType::eTex2d, radiance,
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    sl::Resource outputRes(sl::ResourceType::eTex2d, output,
+                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    sl::Resource depthRes(sl::ResourceType::eTex2d, depth,
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    sl::Resource motionRes(sl::ResourceType::eTex2d, motion,
+                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    sl::Resource normalRes(sl::ResourceType::eTex2d, normal,
+                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    sl::Resource roughnessRes(sl::ResourceType::eTex2d,
+                              static_cast<ID3D12Resource*>(frame->roughness),
+                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    // packed 模式下 normal 就是打包后的法线-粗糙度纹理；unpacked 模式多一张粗糙度。
+    // 注意枚举名：SL 叫 kBufferTypeNormals（复数），没有 kBufferTypeNormal。
+    const sl::BufferType normalType = frame->roughness != nullptr ? sl::kBufferTypeNormals
+                                                                 : sl::kBufferTypeNormalRoughness;
+    sl::ResourceTag tags[6] = {
+        sl::ResourceTag(&colorRes, sl::kBufferTypeScalingInputColor,
+                        sl::ResourceLifecycle::eOnlyValidNow),
+        sl::ResourceTag(&outputRes, sl::kBufferTypeScalingOutputColor,
+                        sl::ResourceLifecycle::eOnlyValidNow),
+        sl::ResourceTag(&depthRes, sl::kBufferTypeDepth,
+                        sl::ResourceLifecycle::eValidUntilPresent),
+        sl::ResourceTag(&motionRes, sl::kBufferTypeMotionVectors,
+                        sl::ResourceLifecycle::eValidUntilPresent),
+        sl::ResourceTag(&normalRes, normalType, sl::ResourceLifecycle::eOnlyValidNow),
+        sl::ResourceTag(&roughnessRes, sl::kBufferTypeRoughness,
+                        sl::ResourceLifecycle::eOnlyValidNow),
+    };
+    const uint32_t tagCount = frame->roughness != nullptr ? 6u : 5u;
+    const sl::Result tagResult = api.setTag(*token, viewport, tags, tagCount, list);
+    if (tagResult != sl::Result::eOk) {
+        char line[160] = {};
+        std::snprintf(line, sizeof(line), "dlssd: setTag 0x%X tags=%u",
+                      static_cast<unsigned>(tagResult), tagCount);
+        writeText(outText, capacity, line);
+        return -1;
+    }
+
+    const sl::BaseStructure* inputs[1] = {&viewport};
+    const sl::Result evalResult = api.evaluate(sl::kFeatureDLSS_RR, *token, inputs, 1, list);
+    char line[176] = {};
+    std::snprintf(line, sizeof(line), "dlssd: eval 0x%X consts=0x%X %ux%u -> %ux%u packed=%d",
+                  static_cast<unsigned>(evalResult), static_cast<unsigned>(constantsResult),
+                  frame->width, frame->height, frame->outputWidth, frame->outputHeight,
+                  frame->roughness == nullptr ? 1 : 0);
+    writeText(outText, capacity, line);
+    return evalResult == sl::Result::eOk ? 1 : -1;
+}
+
+#else
+
+extern "C" int32_t mcdr_dlssd_eval(const mcdr_dlssd_frame*, char* outText, int32_t capacity) {
+    if (outText != nullptr && capacity > 0) {
+        std::snprintf(outText, static_cast<size_t>(capacity), "%s", "dlssd: streamline not built in");
+    }
+    return 0;
+}
+
+#endif

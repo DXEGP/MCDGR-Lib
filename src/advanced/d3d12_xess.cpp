@@ -1,37 +1,18 @@
-// P278：XeSS 超分后端（Intel XeSS SDK 3.0，供应者是 libxess.dll）。
-//
-// 定位：sr 抽象层的第三个后端。与 FSR 那条路的差别都在 header 里写着，这里只记最容易
-// 踩空的三点：
-//   1. **XeSS 自己转自己的屏障**，但**不替我们转输入输出**。execute 参数里颜色/速度/深度/
-//      掩码都要求 `NON_PIXEL_SHADER_RESOURCE`、输出要求 `UNORDERED_ACCESS`，这些 transition
-//      必须由我们发（走 transitionTextureTo 的状态跟踪），返回前把输出交回 RENDER_TARGET。
-//   2. **输入分辨率是"每帧告诉它"的，不是 init 时定死的**。SDK 文档的 Dynamic Input
-//      Resolution 一节明说：忽略 optimal、在 [min, max] 里自由变化，每帧用
-//      execute params 的 inputWidth/inputHeight 提供实际值。我们的渲染比例是滑块（33/50/
-//      58/67/100%），正好落在这一档。
-//   3. **qualitySetting 只影响内部历史长度与核选择**：按 doc 表格（1.3 起的默认映射，
-//      不是 legacy）从 display/render 比值里取最接近的一档；比值与设定档对不上时不报错，
-//      因为真正的输入尺寸由每帧参数决定。
-//
-// 深度 / 运动矢量约定（与 sr_plan.md §8 的表一致）：
-//   * 深度：reverse-Z → `XESS_INIT_FLAG_INVERTED_DEPTH`。
-//   * MV：渲染分辨率的**像素**位移（D3D12Velocity 已乘 ScreenSize）→ 不置
-//     `XESS_INIT_FLAG_USE_NDC_VELOCITY`，也不置 `HIGH_RES_MV`（MV 与颜色同为渲染尺寸）。
-//   * MV 由 jittered 投影算出 → 置 `XESS_INIT_FLAG_JITTERED_MV`（头文件注释："Remove jitter
-//     from input velocity"），与 DLSS 的 motionVectorJitterCancellation、FSR 的
-//     MOTION_VECTORS_JITTER_CANCELLATION 对称。
-//   * 曝光：v1 不接曝光纹理 → 不置 `XESS_INIT_FLAG_EXPOSURE_SCALE_TEXTURE`，`exposureScale`
-//     按载荷里的 preExposure 直传（0 = 未填按 1）。
-//
-// 失败策略与其余后端一致：每条失败路径最多一行日志并钉住状态，不每帧重试；失败不让帧失败
-// —— 调用方（srEvaluateFrame）退回"没有超分"的老路径。
+// d3d12_xess.cpp — XeSS 超分后端（Intel XeSS SDK 3.0，libxess.dll）。
+// **XeSS 自己转自己的屏障，但不替我们转输入输出**：颜色 / 速度 / 深度 / 掩码要求
+// NON_PIXEL_SHADER_RESOURCE、输出要求 UNORDERED_ACCESS，必须由我们发（transitionTextureTo 状态跟踪），返回前交回 RENDER_TARGET。
+// 输入分辨率每帧告诉它（Dynamic Input Resolution），init 只定 [min, max]；qualitySetting 按 doc 表格（1.3 起默认映射）
+// 从 display/render 比值取最近一档，对不上不报错。
+// 深度 reverse-Z → XESS_INIT_FLAG_INVERTED_DEPTH；MV 是渲染分辨率像素位移 → 不置 USE_NDC_VELOCITY / HIGH_RES_MV，
+// 但要置 XESS_INIT_FLAG_JITTERED_MV；v1 不接曝光纹理（exposureScale 直传 preExposure）。
+// 失败策略：每条失败路径最多一行日志并钉住状态，失败不让帧失败（调用方退回无超分）。
 module;
 #include "_d3d12_module_prelude.h"
 
 // XeSS 的 C API（external\xess\inc\xess，vcxproj 已登记）。
 #include "xess.h"
 #include "xess_d3d12.h"
-#include "mcdr_abi.h"   // mcdr_sr_caps / mcdr_sr_dispatch / MCDR_SR_MASK_*
+#include "mcdr_abi.h"
 
 #include <algorithm>
 #include <cmath>
@@ -49,9 +30,8 @@ constexpr const char* kXessDll = "libxess.dll";
 // 上限取 8K，与 FSR 一致：再大直接拒绝并报原因，比悄悄建错尺寸的上下文好。
 constexpr int kMaxSide = 8192;
 
-// 本模块所在目录。P108 的教训：GetModuleFileNameA(nullptr) 拿到的是宿主 exe（java.exe），
-// 必须用 GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS 问本模块自己。
-// 发行包里 libxess.dll 由 MCDR_ABI.extractVendorResources() 解到 dxrmc\，与本 DLL 同目录。
+// 本模块所在目录：GetModuleFileNameA(nullptr) 拿到的是宿主 exe（java.exe），必须用
+// GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS 问本模块自己。libxess.dll 由 extractVendorResources() 解到 dxrmc\，同目录。
 std::wstring selfDirectory() {
     HMODULE self = nullptr;
     wchar_t path[MAX_PATH] = {};
@@ -67,8 +47,7 @@ std::wstring selfDirectory() {
     return dir;
 }
 
-// 从 DLL 里取到的入口。前五条是必需，后三条有就用（BuildPipelines 只为省 init 的停顿，
-// IsOptimalDriver 只为日志）。
+// 从 DLL 里取到的入口：前六条必需，后三条有就用（BuildPipelines 只为省 init 停顿，IsOptimalDriver 只进日志）。
 struct XessApi {
     HMODULE module = nullptr;
     decltype(&xessD3D12CreateContext) createContext = nullptr;
@@ -79,7 +58,6 @@ struct XessApi {
     decltype(&xessGetOptimalInputResolution) getOptimalInputResolution = nullptr;
     decltype(&xessD3D12BuildPipelines) buildPipelines = nullptr;
     decltype(&xessIsOptimalDriver) isOptimalDriver = nullptr;
-    // P279：外部堆尺寸的唯一来源。
     decltype(&xessGetProperties) getProperties = nullptr;
 
     bool ready() const {
@@ -102,7 +80,6 @@ XessRuntime& runtime() {
     return instance;
 }
 
-// 载入运行库。搜索顺序：本模块目录 → 裸 DLL 名（标准搜索路径）。
 bool loadLocked(XessRuntime& rt) {
     if (rt.attempted) { return rt.problem.empty(); }
     rt.attempted = true;
@@ -169,8 +146,7 @@ bool isAvailable(std::string& why) {
     return ok;
 }
 
-// 质量档：doc 表格里 XeSS 1.3 起的默认（非 legacy）映射。
-// 比值 = display / render，取最接近的一档；对不上不报错（输入尺寸由每帧参数决定）。
+// 质量档：doc 表格里 XeSS 1.3 起的默认（非 legacy）映射；比值 = display / render 取最近一档，对不上不报错。
 xess_quality_settings_t qualityForRatio(double ratio) {
     struct Entry {
         double ratio;
@@ -198,9 +174,7 @@ xess_quality_settings_t qualityForRatio(double ratio) {
     return best;
 }
 
-// 把 ABI 的 void* 句柄解成模块自己的对象。**只在模块内做**（P108 的教训：JVM 句柄的布局
-// 只有模块知道，别的 TU 去 reinterpret 会得到空 vtable）。与 d3d12_fsr.cpp 里同名同义：
-// 两个实现单元各留一份，比往模块导出面再加一个转换函数划算。
+// 把 ABI 的 void* 句柄解成模块自己的对象。**只在模块内做**：别的 TU 去 reinterpret 会得到空 vtable。
 Dx12Object* asObject(void* handle) {
     return handle == nullptr ? nullptr : static_cast<Dx12Object*>(handle);
 }
@@ -218,9 +192,9 @@ void fillCapsFields(mcdr_sr_caps& out, bool available, const std::string& note) 
     out.backend = MCDR_SR_BACKEND_XESS;
     out.available = available ? 1 : 0;
     out.coupledDenoise = 0;                 // XeSS-SR 不含降噪
-    out.needsExposure = 0;                  // v1 不接曝光纹理（P289）
+    out.needsExposure = 0;                  // v1 不接曝光纹理，只传 exposureScale
     out.takesMasks = MCDR_SR_MASK_RESPONSIVE; // pResponsivePixelMaskTexture
-    out.externalHeap = 1;                   // SDK 原生支持 pTempBufferHeap/pTempTextureHeap（P279 落地）
+    out.externalHeap = 1;                   // SDK 原生支持 pTempBufferHeap/pTempTextureHeap
     out.jitterPhaseCount = 8;
     out.minRenderWidth = 320;
     out.minRenderHeight = 180;
@@ -233,9 +207,6 @@ void fillCapsFields(mcdr_sr_caps& out, bool available, const std::string& note) 
 
 }  // namespace
 
-// ---------------------------------------------------------------------------
-// P278：XeSS 后端
-// ---------------------------------------------------------------------------
 class XessSrProvider final : public IUpscaleProvider {
 public:
     SrBackendId backend() const override { return SrBackendId::XeSS; }
@@ -271,8 +242,7 @@ public:
 
     void onResize(int32_t renderWidth, int32_t renderHeight, int32_t displayWidth,
                   int32_t displayHeight) override {
-        // 只记账：XeSS 的存储与层的特化在 init 时就定了（doc "must be set during
-        // initialization"），重建要等 GPU 追平，所以推迟到下一帧 evaluate 的 ensureContext。
+        // 只记账：XeSS 的存储与层特化在 init 时就定了，重建要等 GPU 追平，推迟到下一帧 evaluate。
         adoptSizes(renderWidth, renderHeight, displayWidth, displayHeight);
     }
 
@@ -296,7 +266,7 @@ public:
             return false;
         }
         if (mask != nullptr && mask->resource == nullptr) { mask = nullptr; }
-        // P291i：低于能力下限时 XeSS 同样给不出有效结果，明确拒绝并只记一次日志。
+        // 低于能力下限时 XeSS 同样给不出有效结果：明确拒绝并只记一次日志。
         if (dispatch.renderWidth < 320 || dispatch.renderHeight < 180) {
             if (!tooSmallLogged_) {
                 tooSmallLogged_ = true;
@@ -340,13 +310,12 @@ public:
         params.jitterOffsetY = dispatch.jitterOffsetY;
         params.exposureScale = dispatch.preExposure > 0.0f ? dispatch.preExposure : 1.0f;
         params.resetHistory = dispatch.reset != 0 ? 1u : 0u;
-        // 渲染分辨率是每帧给的（Dynamic Input Resolution），不是 init 时定死的。
         params.inputWidth = static_cast<uint32_t>(renderW_);
         params.inputHeight = static_cast<uint32_t>(renderH_);
-        params.pDescriptorHeap = nullptr;            // v1 用 XeSS 内部堆（P279 接外部堆）
+        params.pDescriptorHeap = nullptr;            // 堆通过 init 的 pTempBufferHeap/pTempTextureHeap 给
 
         const xess_result_t rc = runtime().api.execute(handle_, ctx->commandList, &params);
-        // 无论成功与否都得把输出交回 RENDER_TARGET（P273 的接口契约）。
+        // 无论成功与否都得把输出交回 RENDER_TARGET（接口契约，GUI 还要当渲染目标用）。
         transitionTextureTo(ctx, output, D3D12_RESOURCE_STATE_RENDER_TARGET);
         if (rc != XESS_RESULT_SUCCESS) {
             problem_ = "xessD3D12Execute failed rc=";
@@ -376,8 +345,8 @@ private:
         if (displayHeight > 0) { displayH_ = displayHeight; }
     }
 
-    /// P279b：挑一个"输入区间能容纳 renderW_ x renderH_"的质量档。全部装不下时取比例最接近的一档。
-    /// 选定档的 [min,max] 写进 inputMin_ / inputMax_，让 evaluate 的越界检查与 init 用同一套边界。
+    /// 挑一个能容纳 renderW_ x renderH_ 的质量档（全装不下取比例最接近的），把它的 [min,max] 写进 inputMin_ /
+    /// inputMax_，让 evaluate 的越界检查与 init 用同一套边界。
     xess_quality_settings_t pickQualityForSize(const xess_2d_t& outputResolution,
                                                xess_2d_t& optimalOut) {
         static constexpr xess_quality_settings_t kCandidates[] = {
@@ -412,7 +381,7 @@ private:
                 inputMax_ = maxSize;
                 optimalOut = optimal;
                 if (candidate != XESS_QUALITY_SETTING_QUALITY) {
-                    dbgLogInfo("XeSS quality %d fits render %dx%d (range %ux%u..%ux%u)",
+                    dbgLogInfo("XeSS q=%d fits %dx%d, range %ux%u..%ux%u",
                                static_cast<int>(candidate), renderW_, renderH_, minSize.x,
                                minSize.y, maxSize.x, maxSize.y);
                 }
@@ -455,8 +424,7 @@ private:
             return true;
         }
         if (handle_ != nullptr) {
-            // 旧上下文的内部资源可能还在飞：先等 GPU 追平最后一次提交再销毁。
-            // 只在首次建 / 换显示尺寸 / 输入分辨率越界 / 掩码开关变化时发生。
+            // 旧上下文的内部资源可能还在飞：先等 GPU 追平最后一次提交再销毁。只在首次建 / 换显示尺寸 / 越界 / 掩码开关变化时发生。
             if (ctx != nullptr && ctx->fenceValue > 0) {
                 (void)waitForFenceValue(ctx, ctx->fenceValue, 2000000000ull);
             }
@@ -477,13 +445,11 @@ private:
         }
         if (runtime().api.isOptimalDriver != nullptr &&
             runtime().api.isOptimalDriver(handle_) == XESS_RESULT_WARNING_OLD_DRIVER) {
-            dbgLogWarn("XeSS: driver is older than recommended (XESS_RESULT_WARNING_OLD_DRIVER)");
+            dbgLogWarn("XeSS: old driver (XESS_RESULT_WARNING_OLD_DRIVER)");
         }
 
-        // 质量档真正决定的是"允许的输入区间"，而 Dynamic Input Resolution 要求每帧实际输入
-        // 尺寸落在该区间内。只按比例取最近档会踩坑：1.7x 档的区间下界是 503x283，而 75%
-        // 渲染比例给的是 495x278 —— 于是每帧都判越界、每帧重建上下文（实测 20 秒里 171 次
-        // P278 重建，P98 卡顿的主因）。改成按尺寸挑档。
+        // 质量档决定"允许的输入区间"，每帧输入尺寸必须落在其中：只按比例取最近档会每帧判越界重建（1.7x 档下界
+        // 503x283，75% 渲染比例只给 495x278）→ 必须按尺寸挑档。
         xess_2d_t outputResolution{static_cast<uint32_t>(displayW_),
                                    static_cast<uint32_t>(displayH_)};
         xess_2d_t optimal{};
@@ -495,12 +461,10 @@ private:
         if (maskExpected_) { flags |= XESS_INIT_FLAG_RESPONSIVE_PIXEL_MASK; }
 
         // 非阻塞的管线预建：init 会等它完成，先发出去能省一点排队时间。
-        if (runtime().api.buildPipelines != nullptr) {
-            (void)runtime().api.buildPipelines(handle_, nullptr, false, flags);
+        if (runtime().api.buildPipelines != nullptr) {            (void)runtime().api.buildPipelines(handle_, nullptr, false, flags);
         }
 
-        // P279：先把临时堆准备好。尺寸只与输出分辨率有关（`xessGetProperties` 的第三参），
-        // 而重建条件里已经包含输出分辨率，所以这里建一次就能一直复用。
+        // 临时堆的尺寸只与输出分辨率有关（xessGetProperties 的第三参），重建条件已包含它，建一次可复用。
         ensureTempHeaps(outputResolution);
 
         xess_d3d12_init_params_t initParams{};
@@ -521,7 +485,7 @@ private:
             problem_ = "xessD3D12Init failed rc=";
             problem_ += std::to_string(static_cast<int>(initRc));
             if (!logged_) {
-                dbgLogWarn("XeSS init failed: %s (render=%dx%d display=%dx%d quality=%d)",
+                dbgLogWarn("XeSS init failed: %s render=%dx%d display=%dx%d q=%d",
                            problem_.c_str(), renderW_, renderH_, displayW_,
                            static_cast<int>(quality));
                 logged_ = true;
@@ -537,8 +501,7 @@ private:
             std::lock_guard<std::mutex> guard(runtime().lock);
             version = runtime().version;
         }
-        dbgLogInfo("XeSS ready: libxess %s render %dx%d display %dx%d quality=%d flags=0x%x "
-                   "inputRange %ux%u..%ux%u",
+        dbgLogInfo("XeSS ready: libxess %s %dx%d->%dx%d q=%d flags=0x%x in %ux%u..%ux%u",
                    version.empty() ? "?" : version.c_str(), renderW_, renderH_, displayW_,
                    displayH_, static_cast<int>(quality), flags, inputMin_.x, inputMin_.y,
                    inputMax_.x, inputMax_.y);
@@ -558,7 +521,7 @@ private:
         tempTextureHeap_.Reset();
     }
 
-    /// P279：按 `xessGetProperties` 报的字节数建两个 DEFAULT 堆；失败就退回内部分配。
+    /// 按 xessGetProperties 报的字节数建两个 DEFAULT 堆；失败就退回内部分配。
     void ensureTempHeaps(const xess_2d_t& outputResolution) {
         if (tempBufferHeap_ != nullptr && tempTextureHeap_ != nullptr) { return; }
         if (device_ == nullptr || runtime().api.getProperties == nullptr) { return; }
@@ -594,7 +557,7 @@ private:
 
         tempBufferHeap_ = bufferHeap;
         tempTextureHeap_ = textureHeap;
-        dbgLogInfo("XeSS external heaps: buffer=%.1f MB texture=%.1f MB (descriptors=%u)",
+        dbgLogInfo("XeSS heaps: buffer=%.1f MB texture=%.1f MB desc=%u",
                    static_cast<double>(props.tempBufferHeapSize) / (1024.0 * 1024.0),
                    static_cast<double>(props.tempTextureHeapSize) / (1024.0 * 1024.0),
                    props.requiredDescriptorCount);
@@ -609,10 +572,7 @@ private:
     }
 
     //
-    // P279：XeSS 的临时缓冲 / 临时纹理堆。给了外部堆，SDK 就不再自己建一份；
-    // 重建上下文时复用同一对堆（尺寸只取决于输出分辨率，而重建条件里已包含它）。
-    // 建堆失败不算致命 —— 退回 nullptr 让 SDK 自建，只警告一次。
-    //
+    // 临时缓冲 / 临时纹理堆：给了外部堆 SDK 就不再自己建，重建时复用同一对；失败退回 nullptr 让 SDK 自建并只警告一次。
     ComPtr<ID3D12Heap> tempBufferHeap_;
     ComPtr<ID3D12Heap> tempTextureHeap_;
     bool heapWarned_ = false;
@@ -631,12 +591,10 @@ private:
     bool needsRecreate_ = false;
     std::string problem_;
     bool logged_ = false;
-    /** P291i：尺寸过小只记一次日志，避免每帧刷屏。 */
     bool tooSmallLogged_ = false;
 };
 
-// caps 的 XeSS 分支（d3d12_sr.cpp 的 srFillCaps 调它）。**不建上下文**：
-// 建上下文要设备、要尺寸，而 caps 只回答"这个后端能不能用"。
+// caps 的 XeSS 分支（srFillCaps 调它）。**不建上下文**：caps 只回答"这个后端能不能用"。
 void fillXessCaps(mcdr_sr_caps& out) {
     std::string why;
     const bool ok = isAvailable(why);

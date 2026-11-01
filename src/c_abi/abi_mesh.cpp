@@ -1,8 +1,10 @@
-// abi_mesh.cpp — P72 mesh-shader pipeline and HLSL -> DXIL compilation
+// abi_mesh.cpp — mesh-shader pipeline and HLSL -> DXIL compilation.
 //
-// Group: mesh shading (originally abi_bridge_p7.cpp).
-// 合并自：abi_bridge_p7.cpp
-//
+// D3DCompile stops at shader model 5.1 and cannot emit amplification/mesh shaders at all, so
+// this unit owns the DXC entry point plus the two calls that consume its output:
+// createMeshPipeline (a D3D12_PIPELINE_STATE_STREAM_DESC through ID3D12Device2) and
+// dispatchMesh (ID3D12GraphicsCommandList6::DispatchMesh). 见 docs\advanced\mesh.md
+
 module;
 
 #include "_d3d12_module_prelude.h"
@@ -20,39 +22,14 @@ import mcdr.d3d12.async_fence;
 
 using namespace d3d12_mc;
 
-// ===========================================================================
-// 本文件是合并后的 C ABI 适配单元，按**功能**命名（不再按移植阶段 pX）。
-// 共享前言（prelude / mcdr_abi.h / 各模块 import）统一放在文件顶部，下面每一段
-// 保留原单元的文件头注释与代码本体，内容逐字节未改。
-// ===========================================================================
-
-// ---------------------------------------------------------------------------
-// 来源单元：abi_bridge_p7.cpp
-// ---------------------------------------------------------------------------
-
-// abi_mesh.cpp — P72: mesh-shader pipeline + HLSL -> DXIL compilation. (合并自 abi_bridge_p7.cpp)
-//
-// The graphics bridge (abi_pipeline.cpp) feeds D3DCompile, which stops at
-// shader model 5.1 and therefore cannot produce amplification/mesh shaders at
-// all. This bridge adds the DXC compilation entry point and the two calls that
-// consume its output: createMeshPipeline() (which builds a
-// D3D12_PIPELINE_STATE_STREAM_DESC and goes through
-// ID3D12Device2::CreatePipelineState) and dispatchMesh()
-// (ID3D12GraphicsCommandList6::DispatchMesh).
-//
-// The descriptor is still a real struct (mcdr_mesh_pipeline_desc) mirrored by
-// MemoryLayout on the Java side and verified at load time by mcdrABILayout(),
-// so -- exactly like abi_pipeline.cpp -- there is nothing to unpack here.
-
 namespace {
 
-// The same bounds abi_pipeline.cpp enforces: they are the contract with the
-// pipeline builders, not incidental limits.
+// Same bounds abi_pipeline.cpp enforces: the contract with the pipeline builders.
 constexpr int32_t kMaxColorTargets = 8;
 constexpr int32_t kMaxPipelineBindings = 64;
 
-// A shader source is kilobytes; this only catches a bogus sourceLen before it
-// turns into a multi-gigabyte string copy.
+// A shader source is kilobytes; this only catches a bogus sourceLen before it turns into a
+// multi-gigabyte string copy.
 constexpr int32_t kMaxSourceBytes = 4 * 1024 * 1024;
 
 constexpr const char* kCompile = "mcdr_dx12CompileShaderDxc";
@@ -102,10 +79,13 @@ int32_t MCDR_CALL mcdr_dx12CompileShaderDxc(const char* source, int32_t sourceLe
     }
 
     std::vector<uint8_t> dxil;
-    // An empty entry point means "main", matching the graphics path's hardcoded
-    // entry and keeping the Java side from having to know the default.
+    // An empty entry point means "main" for the single-entry profiles, matching the graphics path.
+    // Library targets (lib_6_x, used by the ray tracing state object) have no entry point at all,
+    // so the empty string is passed through unchanged.
+    const bool library = std::string(profile, std::strlen(profile)).rfind("lib_", 0) == 0;
     const std::string entryPoint =
-        (entry != nullptr && entry[0] != '\0') ? std::string(entry) : std::string("main");
+        (entry != nullptr && entry[0] != '\0') ? std::string(entry)
+                                               : (library ? std::string() : std::string("main"));
 
     if (const auto r = d3d12_mc::compileHlslToDxil(std::string(source, static_cast<size_t>(sourceLen)),
                                                    entryPoint, profile, dxil);
@@ -117,9 +97,8 @@ int32_t MCDR_CALL mcdr_dx12CompileShaderDxc(const char* source, int32_t sourceLe
 
     const auto size = static_cast<int32_t>(dxil.size());
     if (outDxil == nullptr || outCapacity < size) {
-        // Size probe: report what the caller has to allocate, write nothing, and
-        // let it call again with a buffer of that size (the same contract
-        // mcdrLastError() uses for strings).
+        // Size probe: report what the caller has to allocate, write nothing, and let it call
+        // again with a buffer of that size (the same contract mcdrLastError() uses).
         return size;
     }
     std::memcpy(outDxil, dxil.data(), static_cast<size_t>(size));
@@ -136,7 +115,6 @@ static PipelinePtr* createMeshPipelineErased(const mcdr_mesh_pipeline_desc* desc
 
     d3d12_mc::MeshPipelineDesc d;
 
-    // --- shader bytecode (DXIL, never HLSL) --------------------------------
     if (desc->msLen <= 0 || desc->msData == nullptr) {
         return failWithPtr<PipelinePtr>(kCreateMesh, "msData/msLen is required (mesh shader)");
     }
@@ -159,7 +137,6 @@ static PipelinePtr* createMeshPipelineErased(const mcdr_mesh_pipeline_desc* desc
         d.psDxil.assign(first, first + desc->psLen);
     }
 
-    // --- colour targets ----------------------------------------------------
     if (desc->colorCount < 0 || desc->colorCount > kMaxColorTargets) {
         setLastErrorf(kCreateMesh, "bad colorCount %d", static_cast<int>(desc->colorCount));
         return nullptr;
@@ -183,7 +160,6 @@ static PipelinePtr* createMeshPipelineErased(const mcdr_mesh_pipeline_desc* desc
         dst.alphaOp = src.alphaOp;
     }
 
-    // --- depth state -------------------------------------------------------
     d.hasDepth = desc->hasDepth != 0;
     if (d.hasDepth) {
         d.depthFormat = desc->depth.depthFormat;
@@ -194,9 +170,7 @@ static PipelinePtr* createMeshPipelineErased(const mcdr_mesh_pipeline_desc* desc
     d.cullEnabled = desc->cullEnabled != 0;
     d.polygonMode = desc->polygonMode;
 
-    // --- root bindings -----------------------------------------------------
-    // Identical contract to the graphics pipeline, so mcdr_dx12PushDescriptors
-    // needs no mesh-specific variant.
+    // Same contract as the graphics pipeline, so mcdr_dx12PushDescriptors needs no mesh variant.
     if (desc->bindingCount < 0 || desc->bindingCount > kMaxPipelineBindings) {
         setLastErrorf(kCreateMesh, "bad bindingCount %d", static_cast<int>(desc->bindingCount));
         return nullptr;
@@ -213,8 +187,8 @@ static PipelinePtr* createMeshPipelineErased(const mcdr_mesh_pipeline_desc* desc
     auto r = rootSignature == 0 ? d3d12_mc::createMeshPipeline(d)
                                : d3d12_mc::createMeshPipeline(d, rootSignature);
     if (!r) {
-        // 全限定：ADL 不会把 mcdr::abi 拉进来（实参是 std::unexpected<mcdr::Error>，
-        // 关联命名空间只有 std 与 mcdr），所以这里不能靠 ADL 找 failResultPtr。
+        // Fully qualified: ADL cannot find mcdr::abi here, because the argument is
+        // std::unexpected<mcdr::Error> and its associated namespaces are only std and mcdr.
         return mcdr::abi::failResultPtr<PipelinePtr>(kCreateMesh, r.error());
     }
     return static_cast<PipelinePtr*>(*r);
@@ -277,7 +251,8 @@ int32_t MCDR_CALL mcdr_dx12DispatchMesh(mcdr_command_ctx* ctx, int32_t x, int32_
     return 1;
 }
 
-// P217：meshlet 版地形派发。b8 = 小常量，t14/t15/t16 = 顶点池 / 段表 / meshlet 表。
+// Meshlet terrain dispatch: b8 = small constants, t14/t15/t16 = vertex pool / section table /
+// meshlet table.
 int32_t MCDR_CALL mcdr_dx12MeshDrawMeshlets(
     mcdr_command_ctx* ctx, mcdr_object* vertexBuffer, int64_t vertexOffset, mcdr_object* sections,
     int64_t sectionsOffset, int64_t sectionsLength, mcdr_object* meshlets, int64_t meshletsOffset,

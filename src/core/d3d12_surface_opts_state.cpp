@@ -1,8 +1,5 @@
-// d3d12_surface_opts_state.cpp — P251：交换链建链选项的进程级状态，普通 TU（非模块单元）。
-//
-// 两个 atomic：是否允许 ALLOW_TEARING 建链、是否强制把链建在自建呈现子窗口上。JVM 侧配置
-// 经 mcdr_dx12SetSwapchainOptions 推来，surface 在建链时读。理由见
-// include\mcdr_surface_opts_state.h 的注释。
+// d3d12_surface_opts_state.cpp — 建链选项的进程级状态，普通 TU（不放模块单元的理由见
+// include\mcdr_surface_opts_state.h）。
 #include <atomic>
 #include <cstdint>
 
@@ -11,7 +8,7 @@
 namespace {
 
 std::atomic<int32_t> gAllowTearing{1};       // 默认允许（能进 independent flip / VRR）
-std::atomic<int32_t> gForcePresentChild{1};  // P267：默认用 SeamlessWindowHost 子窗口建链
+std::atomic<int32_t> gForcePresentChild{1};  // 默认建在自建呈现子窗口上
 
 }  // namespace
 

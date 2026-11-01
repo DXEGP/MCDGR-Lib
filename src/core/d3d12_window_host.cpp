@@ -1,15 +1,5 @@
-// d3d12_window_host.cpp — P267 SeamlessWindowHost：呈现子窗口宿主实现（普通 TU）。
-//
-// 设计目标（用户 m04532 的规格）：
-//   1. 物理隔离 GL：承载 swapchain 的 HWND 从创建到销毁都不碰 OpenGL；建链前后
-//      临时 wglMakeCurrent(nullptr, nullptr) 再恢复，避免 DXGI 看到"被 GL 用过的窗口"。
-//   2. 输入零侵入：子窗口 WS_EX_TRANSPARENT + WM_NCHITTEST=HTTRANSPARENT，
-//      键盘/鼠标焦点永远留在 GLFW 主窗口。
-//   3. 无白屏/黑屏闪烁：子窗口**创建后先不显示**，第一帧 Present 成功才 SW_SHOWNA。
-//   4. 几何同步：父窗口被子类化，WM_SIZE 里按客户区尺寸 1:1 调整子窗口，并维护
-//      最小化标记供 Present 跳过。
-//
-// 子窗口位置/尺寸用**客户区坐标**表达，因此天然扣除了标题栏与边框，不需要额外补偿。
+// d3d12_window_host.cpp — 呈现宿主子窗口的实现（普通 TU）。承载 swapchain 的 HWND 从创建到
+// 销毁都不碰 OpenGL；子窗口对鼠标完全透明；首帧 Present 成功才 SW_SHOWNA；几何按客户区 1:1 跟随。
 #include <windows.h>
 
 #include <atomic>
@@ -25,8 +15,7 @@ constexpr UINT kMsgReveal = WM_APP + 0x4D1;  // 渲染线程 -> 窗口线程：�
 
 }  // namespace
 
-// 头文件里是前置声明（opaque），这里给定义。单实例即可：游戏只有一个主窗口，
-// 自检 surface 与主 surface 共享同一个子窗口，用 refs 记引用。
+// 头文件里是不透明前置声明，这里给定义。一个进程只有一套宿主（refs 记引用）。
 struct MCDR_WindowHost {
     HWND parent = nullptr;
     HWND child = nullptr;
@@ -79,7 +68,6 @@ void resizeChild(MCDR_WindowHost* host, int width, int height) {
                    SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS | SWP_DEFERERASE);
 }
 
-// 子窗口消息处理：三条"必须" + 第一帧显示。
 LRESULT CALLBACK hostChildProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_NCHITTEST:
@@ -92,7 +80,6 @@ LRESULT CALLBACK hostChildProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         // 不抢激活焦点（否则点游戏窗口不会激活它）。
         return MA_NOACTIVATE;
     case WM_PAINT: {
-        // 子窗口内容只来自 swapchain；显示前收到 WM_PAINT 时给个空绘制，避免白面。
         PAINTSTRUCT ps{};
         ::BeginPaint(hwnd, &ps);
         ::EndPaint(hwnd, &ps);
@@ -184,7 +171,6 @@ MCDR_WindowHost* mcdr_host_create(void* parentHwnd, int32_t width, int32_t heigh
     HWND parent = reinterpret_cast<HWND>(parentHwnd);
     if (parent == nullptr || ::IsWindow(parent) == 0) return nullptr;
     if (gHost != nullptr) {
-        // 复用：同一个父窗口（主 surface 与自检 surface 共用）。
         if (gHost->parent == parent && gHost->child != nullptr) {
             gHost->refs.fetch_add(1, std::memory_order_relaxed);
             resizeChild(gHost, static_cast<int>(width), static_cast<int>(height));
@@ -198,8 +184,8 @@ MCDR_WindowHost* mcdr_host_create(void* parentHwnd, int32_t width, int32_t heigh
     host->parent = parent;
     host->width = width > 0 ? static_cast<int>(width) : 1;
     host->height = height > 0 ? static_cast<int>(height) : 1;
-    // 样式：WS_CHILD | WS_CLIPSIBLINGS（**没有 WS_VISIBLE**，等第一帧 Present）。
-    // 扩展样式：WS_EX_TRANSPARENT（绘制顺序/命中让位）+ WS_EX_NOPARENTNOTIFY（不打扰父窗）。
+    // WS_CHILD | WS_CLIPSIBLINGS，**没有 WS_VISIBLE**（等第一帧 Present）；
+    // WS_EX_TRANSPARENT 让命中让位给父窗口，WS_EX_NOPARENTNOTIFY 不打扰父窗口。
     host->child = ::CreateWindowExW(WS_EX_TRANSPARENT | WS_EX_NOPARENTNOTIFY, kHostClass,
                                     L"MCDR D3D12 seamless host", WS_CHILD | WS_CLIPSIBLINGS, 0, 0,
                                     host->width, host->height, parent, nullptr,

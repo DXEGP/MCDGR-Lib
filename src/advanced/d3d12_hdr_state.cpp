@@ -1,8 +1,5 @@
-// d3d12_hdr_state.cpp — P197（原生 HDR）的进程级状态，普通 TU（非模块单元）。
-//
-// 只有两个 atomic：HDR 模式（配置推来）与「当前 surface 是否真的以 scRGB 呈现」
-// （surface 创建时写，DLSS 选 colorBuffersHDR 时读）。刻意不放进模块单元，理由见
-// include\mcdr_hdr_state.h 的注释。
+// d3d12_hdr_state.cpp — HDR 的进程级状态，普通 TU（不放模块单元的理由见
+// include\mcdr_hdr_state.h）。
 #include <atomic>
 #include <cstdint>
 
@@ -11,7 +8,7 @@
 namespace {
 
 std::atomic<int32_t> gHdrMode{0};         // 0 auto / 1 on / 2 off
-std::atomic<int32_t> gHdrActive{0};       // 0/1
+std::atomic<int32_t> gHdrActive{0};       // 本次建链是否真的以 scRGB 呈现
 std::atomic<int32_t> gHdrAppliedMode{-1}; // 建链时用掉的模式，-1 = 还没建过链
 
 }  // namespace

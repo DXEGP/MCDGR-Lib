@@ -1,7 +1,6 @@
-// abi_async.cpp — async rendering infrastructure: partitioned descriptor allocator, bundle recorder pool, fence manager, main-list executor, barrier pre-passes
-//
-// Group: async infrastructure (originally abi_bridge_p33.cpp).
-// 合并自：abi_bridge_p33.cpp
+// abi_async.cpp — async rendering infrastructure: partitioned descriptor allocator, bundle
+// recorder pool, fence manager, main-list executor, and the barrier pre-passes that glue them
+// onto the sync path. 见 docs\async\README.md
 //
 module;
 
@@ -23,47 +22,6 @@ import mcdr.error;
 
 using namespace d3d12_mc;
 
-// ===========================================================================
-// 本文件是合并后的 C ABI 适配单元，按**功能**命名（不再按移植阶段 pX）。
-// 共享前言（prelude / mcdr_abi.h / 各模块 import）统一放在文件顶部，下面每一段
-// 保留原单元的文件头注释与代码本体，内容逐字节未改。
-// ===========================================================================
-
-// ---------------------------------------------------------------------------
-// 来源单元：abi_bridge_p33.cpp
-// ---------------------------------------------------------------------------
-
-// abi_async.cpp — async rendering infrastructure: partitioned descriptor（合并自 abi_bridge_p33.cpp）
-// allocator, bundle recorder pool, fence manager, main-list executor, and the
-// barrier pre-passes and bundle execution that glue them onto the sync path.
-//
-// Replaces jni_bridge_p33.cpp (1031 lines, 42 exports).
-//
-// The one structural change in this file is the hot path. The JNI version took
-// 14 parallel arrays and 20 parameters for a single worker partition, and every
-// call had to GetIntArrayElements/GetLongArrayElements 14 times (the
-// JIntArrayRO/JLongArrayRO RAII guards existed only to keep that from leaking on
-// the error branches). It is now two struct arrays:
-//
-//   const mcdr_binding_slot*  bindings   -- packed against mcdr_binding_slot
-//   const mcdr_partition_draw* draws     -- packed against mcdr_partition_draw
-//
-// which the Java side hands over as zero-copy slices of one native buffer. A
-// parallel worker gets `bindings.asSlice(start * bc * STRIDE, count * bc * STRIDE)`
-// and `draws.asSlice(start * DRAW_STRIDE, count * DRAW_STRIDE)` — no array
-// marshalling at all, and the two variants (per-draw bindings vs one shared
-// block) collapse into the `sharedBindings` flag.
-//
-// Indexing contract, which is the thing to keep straight:
-//   * `draws[i]` is draw number `i` of THIS partition (already advanced past the
-//     partition's first draw, so there is no startDraw parameter).
-//   * when sharedBindings == 0, binding slot j of draw i is
-//     `bindings[i * bindingCount + j]`;
-//   * when sharedBindings != 0, every draw reads `bindings[j]` (draw 0's block).
-//   * the SRV descriptor table is ALWAYS built from `bindings[j]`, in both
-//     variants, because the Java side only reaches the bundle path once it has
-//     proved every draw in the batch shares the same SRV set (`srvUniform`).
-
 namespace {
 
 // 统一走 native 日志前缀（与 JVM 侧 log4j 同形），与 dbgLog* 的行外观一致。
@@ -79,10 +37,9 @@ void logFail(const char* what) {
     std::fflush(stderr);
 }
 
-// The bundle path binds CBVs as root descriptors exactly like the sync path, so it
-// inherits the same D3D12 rule: the GPU address must be a multiple of 256. Those
-// offsets come from the JVM, and an unaligned one yields shader-side garbage rather
-// than a driver error, so report it here instead of recording an invalid list.
+// A CBV's GPU address must be a multiple of 256. Those offsets come from the JVM and an
+// unaligned one yields shader-side garbage rather than a driver error, so report it instead of
+// recording an invalid list.
 void logAlignmentFail(const char* what, long long offset) {
     char line[1024];
     const int n = d3d12_mc::formatLogPrefix(line, sizeof(line), "ERROR", "dx12");
@@ -96,7 +53,11 @@ void logAlignmentFail(const char* what, long long offset) {
     std::fflush(stderr);
 }
 
-// Shared body of mcdr_dx12AsyncBundleRecordPartition for both indexing modes.
+// Shared body of mcdr_dx12AsyncBundleRecordPartition for both indexing modes. Indexing contract:
+// draws[i] is draw i of THIS partition (already advanced past its first draw); with
+// sharedBindings == 0 draw i's slot j is bindings[i * bindingCount + j], otherwise every draw
+// reads bindings[j]. The SRV table is always built from bindings[j], because the JVM only takes
+// the bundle path once every draw in the batch shares one SRV set.
 int32_t recordPartition(PartitionedDescriptorAllocator* a, BundleRecorder* r, int32_t baseSlot,
                         int32_t bindingCount, int32_t sharedBindings, const mcdr_binding_slot* bindings,
                         const mcdr_partition_draw* draws, int32_t drawCount, const char* what) {
@@ -114,9 +75,7 @@ int32_t recordPartition(PartitionedDescriptorAllocator* a, BundleRecorder* r, in
         }
     }
 
-    // Scheme B (split root signature): the SRV descriptor block and its root
-    // descriptor table are written once for the whole partition, not once per
-    // draw. Every draw in the partition is known to share the same SRV set.
+    // Write the SRV block and its table once for the whole partition, not per draw.
     if (srvCount > 0) {
         int s = 0;
         for (int j = 0; j < bcount; ++j) {
@@ -136,15 +95,11 @@ int32_t recordPartition(PartitionedDescriptorAllocator* a, BundleRecorder* r, in
         r->setDescriptorTable(static_cast<UINT>(cbvCount), a->gpuHandle(static_cast<UINT>(baseSlot)));
     }
 
-    // P64 constant-CBV hoisting: of the CBVs in a batch only one typically varies
-    // per draw; the rest are constant for the whole batch and are set once before
-    // the loop (a root descriptor bakes its address straight into the command
-    // list). Bit i of varyMask = the i-th CBV binding (dense numbering) varies.
-    // Above 64 bindings the optimisation is skipped rather than made to fit.
+    // Constant-CBV hoisting: usually only one CBV of a batch varies per draw, the rest are set
+    // once before the loop. Bit i of varyMask = the i-th CBV binding varies; above 64 bindings the
+    // optimisation is skipped. A shared block cannot vary by construction.
     UINT64 varyMask = 0;
     if (sharedBindings) {
-        // Every draw shares one block, so nothing can vary by construction --
-        // the caller records one bundle per distinct binding set.
     } else if (cbvCount <= 64) {
         int ci = 0;
         for (int j = 0; j < bcount; ++j) {
@@ -196,9 +151,8 @@ int32_t recordPartition(PartitionedDescriptorAllocator* a, BundleRecorder* r, in
         }
     }
 
-    // P63: the batch is uniformly one VB + one IB (drawMultipleIndexed's whole
-    // semantics is "one VB and one IB, many (indexCount, baseVertex) groups"), so
-    // probe for uniformity and hoist the two IASet* calls out of the loop.
+    // The batch is uniformly one VB + one IB, so probe for that and hoist the two IASet* calls
+    // out of the loop.
     bool vbIbUniform = true;
     if (!sharedBindings) {
         for (int i = 1; i < n; ++i) {
@@ -215,8 +169,8 @@ int32_t recordPartition(PartitionedDescriptorAllocator* a, BundleRecorder* r, in
 
     for (int i = 0; i < n; ++i) {
         if (!sharedBindings) {
-            // Scheme B: CBVs go through root descriptors, so there are zero
-            // descriptor-heap writes per draw. Skip the constant ones (P64).
+            // CBVs go through root descriptors, so there are zero descriptor-heap writes per
+            // draw; only the varying ones are re-issued.
             int cbvIdx = 0;
             for (int j = 0; j < bcount; ++j) {
                 if (bindings[j].type != 0) {
@@ -268,9 +222,8 @@ int32_t recordPartition(PartitionedDescriptorAllocator* a, BundleRecorder* r, in
             D3D12_VERTEX_BUFFER_VIEW vbv{};
             vbv.BufferLocation = vb->resource->GetGPUVirtualAddress() + static_cast<UINT64>(voff);
             vbv.SizeInBytes = static_cast<UINT>(vb->size - static_cast<UINT64>(voff));
-            // Same rule as the sync path and dx12AsyncBundleSetVertexBuffer: the
-            // pipeline's corrected stride wins over the Java-supplied value,
-            // because Java's getVertexSize() is wrong for some pipelines.
+            // The pipeline's corrected stride wins over the Java-supplied value, because Java's
+            // getVertexSize() is wrong for some pipelines.
             UINT effStride = static_cast<UINT>(draws[i].vertexStride);
             const UINT corrected = r->correctedStride(draws[i].vertexSlot);
             if (corrected > 0) {
@@ -287,8 +240,8 @@ int32_t recordPartition(PartitionedDescriptorAllocator* a, BundleRecorder* r, in
     return 1;
 }
 
-// Shared body of the three barrier pre-passes. `apply` is invoked once per valid
-// object; a null or wrong-kind entry is skipped, exactly as the JNI version did.
+// Shared body of the three barrier pre-passes: one apply() per object, null or wrong-kind entries
+// are skipped, count <= 0 is a no-op success.
 template <typename Fn>
 int32_t prepareObjects(mcdr_command_ctx* ctx, mcdr_object* const* objects, int32_t count, const char* what,
                        Fn&& apply) {
@@ -306,19 +259,14 @@ int32_t prepareObjects(mcdr_command_ctx* ctx, mcdr_object* const* objects, int32
 
 }  // namespace
 
-// BundleRecorder::correctedStride 读取本 bundle 记下的 per-slot 修正 stride 映射。
-// 映射由 setCorrectedStride 在 mcdr_dx12AsyncBundleSetPipelineState 里从 Dx12Pipeline
-// 抄入；本模块（异步 bundle）不 import 设备模块，故不持有 Dx12Pipeline*。
+// Per-slot corrected stride captured by setCorrectedStride from the Dx12Pipeline handed in
+// mcdr_dx12AsyncBundleSetPipelineState (this module does not import the device module).
 UINT BundleRecorder::correctedStride(int slot) const {
     auto it = m_correctedStrides.find(slot);
     return it == m_correctedStrides.end() ? 0u : it->second;
 }
 
 extern "C" {
-
-// ===========================================================================
-// Partitioned descriptor allocator
-// ===========================================================================
 
 mcdr_desc_alloc* MCDR_CALL mcdr_dx12AsyncDescriptorCreate(int32_t workerCount) {
     DeviceContext& dc = deviceContext();
@@ -333,8 +281,7 @@ mcdr_desc_alloc* MCDR_CALL mcdr_dx12AsyncDescriptorCreate(int32_t workerCount) {
     if (const auto r = alloc->init(dc.device.Get(), dc.drawHeap.Get(), desc.NumDescriptors,
                                    static_cast<UINT>(workerCount), kAsyncSyncRingReserve);
         !r) {
-        // describe(e) == "<where>: <message>"，所以前缀仍是原来的
-        // "PartitionedDescriptorAllocator::init failed"，后面多了真实失败原因。
+        // describe(e) == "<where>: <message>"，故前缀仍是原来的 init failed，后面多了真实失败原因。
         mcdr::abi::setLastError("mcdr_dx12AsyncDescriptorCreate",
                                 "PartitionedDescriptorAllocator::init failed: " +
                                     mcdr::describe(r.error()));
@@ -342,19 +289,15 @@ mcdr_desc_alloc* MCDR_CALL mcdr_dx12AsyncDescriptorCreate(int32_t workerCount) {
         delete alloc;
         return nullptr;
     }
-    // P33: tell the synchronous path that only kAsyncSyncRingReserve slots at the
-    // start of each frame section belong to the sync ring, so that
-    // pushDescriptors/blitBindSourceTexture's capacity check lines up with the
-    // worker partitions and the sync ring cannot silently overwrite worker
-    // descriptors. Must equal the reservedPerSection used by alloc->init above.
+    // The sync ring's slots at the start of each frame section; pushDescriptors/blitBindSourceTexture
+    // must not overwrite worker descriptors. Must equal the reservedPerSection passed to init().
     dc.syncRingReserve = kAsyncSyncRingReserve;
     return alloc;
 }
 
 void MCDR_CALL mcdr_dx12AsyncDescriptorDestroy(mcdr_desc_alloc* alloc) {
     if (alloc != nullptr) {
-        // P33: async partitioning goes offline, so the sync path may use the whole
-        // drawHeap section again.
+        // Async partitioning goes offline, so the sync path may use the whole drawHeap section.
         deviceContext().syncRingReserve = 0;
     }
     delete alloc;
@@ -420,10 +363,6 @@ int32_t MCDR_CALL mcdr_dx12AsyncDescriptorWriteSRV(mcdr_desc_alloc* alloc, int32
     return alloc->writeDescriptor(static_cast<UINT>(slot), v->cpuHandle) ? 1 : 0;
 }
 
-// ===========================================================================
-// Bundle recorder pool
-// ===========================================================================
-
 mcdr_bundle_pool* MCDR_CALL mcdr_dx12AsyncBundlePoolCreate(int32_t workerCount) {
     DeviceContext& dc = deviceContext();
     if (!dc.device) {
@@ -432,9 +371,8 @@ mcdr_bundle_pool* MCDR_CALL mcdr_dx12AsyncBundlePoolCreate(int32_t workerCount) 
         return nullptr;
     }
     auto* pool = new BundleRecorderPool();
-    // A bundle records SetGraphicsRootDescriptorTable, so it has to bind a
-    // shader-visible descriptor heap itself: pass the same (non-owned) drawHeap
-    // the parent command list uses.
+    // A bundle records SetGraphicsRootDescriptorTable, so it must bind a shader-visible heap
+    // itself: pass the same (non-owned) drawHeap the parent command list uses.
     if (const auto r = pool->init(dc.device.Get(), dc.drawHeap.Get(), static_cast<UINT>(workerCount),
                                   dc.cmdSigIndexed.Get(), dc.cmdSigNonIndexed.Get());
         !r) {
@@ -483,8 +421,8 @@ int32_t MCDR_CALL mcdr_dx12AsyncBundleSetPipelineState(mcdr_bundle_pool* pool, i
     r->setRootSignature(pl->rootSignature.Get());
     r->setPipelineState(pso);
     r->setPrimitiveTopology(bundlePrimitiveTopology(pl->topology));
-    // P33: remember the pipeline's corrected per-slot strides so setVertexBuffer can
-    // apply the same override the sync path uses.
+    // Remember the pipeline's corrected per-slot strides so setVertexBuffer can apply the same
+    // override the sync path uses.
     for (const auto& kv : pl->vertexStrides) {
         r->setCorrectedStride(kv.first, kv.second);
     }
@@ -514,9 +452,8 @@ int32_t MCDR_CALL mcdr_dx12AsyncBundleSetVertexBuffer(mcdr_bundle_pool* pool, in
     D3D12_VERTEX_BUFFER_VIEW vb{};
     vb.BufferLocation = buf->resource->GetGPUVirtualAddress() + static_cast<UINT64>(offset);
     vb.SizeInBytes = static_cast<UINT>(buf->size - offset);
-    // P33: match the sync setVertexBuffer — prefer the pipeline's corrected stride,
-    // because Java's getVertexSize() does not equal the real vertex pitch on every
-    // pipeline.
+    // Match the sync setVertexBuffer: prefer the pipeline's corrected stride, because Java's
+    // getVertexSize() does not equal the real vertex pitch on every pipeline.
     UINT effectiveStride = static_cast<UINT>(stride);
     const UINT corrected = r->correctedStride(slot);
     if (corrected > 0) {
@@ -599,16 +536,7 @@ int32_t MCDR_CALL mcdr_dx12AsyncBundleRecordPartition(mcdr_desc_alloc* alloc, mc
     return ok;
 }
 
-// ===========================================================================
 // Fence manager
-//
-// The only place the native layer calls back into the JVM. Under JNI this needed
-// a JavaVM*, AttachCurrentThread/DetachCurrentThread around every invocation, a
-// NewGlobalRef, and a string method lookup for the "(JZ)V" signature. Under FFM
-// the Java side installs one upcall stub for the whole library and identifies
-// the registration with an integer handle, so this is a plain function pointer
-// call with no JVM bookkeeping at all.
-// ===========================================================================
 
 mcdr_fence_mgr* MCDR_CALL mcdr_dx12AsyncFenceCreate(void) {
     DeviceContext& dc = deviceContext();
@@ -652,35 +580,26 @@ int32_t MCDR_CALL mcdr_dx12AsyncFenceRegisterCallback(mcdr_fence_mgr* manager, u
     if (!manager || !cb) {
         return mcdr::abi::failWith("mcdr_dx12AsyncFenceRegisterCallback", "invalid args");
     }
-    // The callback fires on the monitor thread, outside the registry lock, so it
-    // may legally re-register or unregister. The stub must not throw -- the Java
-    // side wraps it with MethodHandles.catchException, because an escaping
-    // exception out of an upcall terminates the JVM abruptly.
+    // The callback fires on the monitor thread, outside the registry lock, so it may re-register
+    // or unregister. The stub must not throw: an escaping exception out of an upcall terminates
+    // the JVM, so the Java side wraps it with MethodHandles.catchException.
     manager->registerCallback(
         value, [cb, userHandle](UINT64 v, bool ok) { cb(userHandle, v, ok ? 1 : 0); },
         static_cast<UINT64>(timeoutMs < 0 ? 0 : timeoutMs));
     return 1;
 }
 
-// ===========================================================================
-// Executing bundles on an existing (synchronous) command list
-//
-// The main list is still recorded by the DeviceContext's CommandContext (render
-// pass boundaries, viewport/scissor, clears, copies and barriers all live on the
-// main list); only the draw-dense regions are recorded into bundles by workers,
-// then replayed onto the main list in order here.
-// ===========================================================================
+// Executing bundles on an existing (synchronous) command list.
+// The main list stays the only place for render-pass boundaries, viewport/scissor, clears, copies and
+// barriers; draw-dense regions are recorded into bundles and replayed here in order.
 
 int32_t MCDR_CALL mcdr_dx12AsyncCurrentFrameSlot(mcdr_command_ctx* ctx) {
     return ctx ? static_cast<int32_t>(currentDrawFrameSlot(ctx)) : -1;
 }
 
 uint64_t MCDR_CALL mcdr_dx12AsyncCurrentFrameValue(mcdr_command_ctx* ctx) {
-    // The raw frame number (ctx->fenceValue). The bundle allocator picks its slot
-    // from (frameSlot, batch), but needs the raw number to tell "a new frame
-    // started" apart from "the same slot came round again" -- frameSlot alone
-    // (%4) misreads when idle frames skip whole cycles.
-    // Returns (uint64_t)-1 for a null ctx, which the Java side reads as -1.
+    // The raw frame number (ctx->fenceValue): the slot comes from (frameSlot, batch) but the allocator
+    // needs the raw number to tell "a new frame" from "the same slot came round again". ~0 (JVM -1) = null ctx.
     return ctx ? static_cast<uint64_t>(ctx->fenceValue) : ~static_cast<uint64_t>(0);
 }
 
@@ -690,17 +609,15 @@ int32_t MCDR_CALL mcdr_dx12ExecuteBundle(mcdr_command_ctx* ctx, uint64_t bundle)
         return mcdr::abi::failWith("mcdr_dx12ExecuteBundle", "invalid args");
     }
     ctx->commandList->ExecuteBundle(b);
-    // P64: a PSO/root signature set inside a bundle does not roll back to the
-    // parent list, so the parent's binding state is no longer knowable --
-    // invalidate the setPipeline fast-path cache to force a full re-issue.
+    // A PSO/root signature set inside a bundle does not roll back to the parent list, so the
+    // parent's binding state is no longer knowable — invalidate the setPipeline fast path.
     ctx->cachedPso = nullptr;
     return 1;
 }
 
-// The main thread transitions this batch's CBV buffers to
-// VERTEX_AND_CONSTANT_BUFFER before dispatching bundles (a bundle may not contain
-// ResourceBarrier). Same semantics as pushDescriptors' type == 0 handling;
-// transitionBufferTo is a no-op when the state already matches.
+// Main-list only: the batch's CBV buffers go to VERTEX_AND_CONSTANT_BUFFER before the bundles
+// are dispatched, because a bundle may not contain a ResourceBarrier. Same semantics as
+// pushDescriptors' type == 0 handling; a matching state is a no-op.
 int32_t MCDR_CALL mcdr_dx12AsyncPrepareCBVBuffers(mcdr_command_ctx* ctx, mcdr_object* const* buffers,
                                                   int32_t count) {
     return prepareObjects(ctx, buffers, count, "mcdr_dx12AsyncPrepareCBVBuffers", [ctx](mcdr_object* o) {
@@ -712,9 +629,8 @@ int32_t MCDR_CALL mcdr_dx12AsyncPrepareCBVBuffers(mcdr_command_ctx* ctx, mcdr_ob
     });
 }
 
-// Same origin: transition this batch's index buffers to INDEX_BUFFER. Vertex
-// buffers are handled by PrepareCBVBuffers because their target state is the same
-// as a CBV's.
+// Same reason: the batch's index buffers go to INDEX_BUFFER. Vertex buffers ride along with
+// PrepareCBVBuffers because their target state equals a CBV's.
 int32_t MCDR_CALL mcdr_dx12AsyncPrepareIndexBuffers(mcdr_command_ctx* ctx, mcdr_object* const* buffers,
                                                     int32_t count) {
     return prepareObjects(ctx, buffers, count, "mcdr_dx12AsyncPrepareIndexBuffers", [ctx](mcdr_object* o) {
@@ -726,9 +642,8 @@ int32_t MCDR_CALL mcdr_dx12AsyncPrepareIndexBuffers(mcdr_command_ctx* ctx, mcdr_
     });
 }
 
-// Same origin: transition this batch's sampled texture views to
-// PIXEL/NON_PIXEL_SHADER_RESOURCE. Same semantics as pushDescriptors' type == 1
-// handling; a view with no sourceTexture is skipped.
+// Same reason: the batch's sampled views go to PIXEL/NON_PIXEL_SHADER_RESOURCE, matching
+// pushDescriptors' type == 1 handling; a view without a sourceTexture is skipped.
 int32_t MCDR_CALL mcdr_dx12AsyncPrepareTextureViews(mcdr_command_ctx* ctx, mcdr_object* const* views,
                                                     int32_t count) {
     return prepareObjects(ctx, views, count, "mcdr_dx12AsyncPrepareTextureViews", [ctx](mcdr_object* o) {
@@ -741,10 +656,6 @@ int32_t MCDR_CALL mcdr_dx12AsyncPrepareTextureViews(mcdr_command_ctx* ctx, mcdr_
                                 | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     });
 }
-
-// ===========================================================================
-// Main command list executor
-// ===========================================================================
 
 mcdr_executor* MCDR_CALL mcdr_dx12AsyncExecutorCreate(void) {
     DeviceContext& dc = deviceContext();
