@@ -381,7 +381,17 @@ int32_t MCDR_CALL mcdr_dx12NrdDenoise(mcdr_command_ctx* ctx, mcdr_object* const*
                                       uint32_t frameIndex, uint32_t resetHistory, char* outText,
                                       int32_t capacity) {
     return d3d12_mc::nrdDenoise(ctx, textures, textureCount, matrices, frameIndex, resetHistory,
-                                outText, capacity);
+                                outText, capacity, nullptr);
+}
+
+int32_t MCDR_CALL mcdr_dx12NrdDenoiseTemporal(
+    mcdr_command_ctx* ctx, mcdr_object* const* textures, int32_t textureCount,
+    const float* matrices, const float* jitter, uint32_t frameIndex, uint32_t resetHistory,
+    char* outText, int32_t capacity) {
+    if (outText != nullptr && capacity > 0) outText[0] = '\0';
+    if (jitter == nullptr) return 0;
+    return d3d12_mc::nrdDenoise(ctx, textures, textureCount, matrices, frameIndex, resetHistory,
+                                outText, capacity, jitter);
 }
 
 int32_t MCDR_CALL mcdr_dx12DlssdEval(mcdr_command_ctx* ctx, mcdr_object* const* textures,
@@ -390,12 +400,48 @@ int32_t MCDR_CALL mcdr_dx12DlssdEval(mcdr_command_ctx* ctx, mcdr_object* const* 
                                    uint32_t frameIndex, int32_t reset, const float* constants,
                                    char* outText, int32_t capacity) {
     return d3d12_mc::dlssdEval(ctx, textures, textureCount, width, height, outputWidth,
-                               outputHeight, frameIndex, reset, constants, outText, capacity);
+                               outputHeight, frameIndex, reset, constants, outText, capacity, nullptr);
+}
+
+int32_t MCDR_CALL mcdr_dx12RtSrEval(mcdr_command_ctx* ctx, mcdr_object* const* textures,
+                                  int32_t textureCount, uint32_t width, uint32_t height,
+                                  uint32_t outputWidth, uint32_t outputHeight,
+                                  uint32_t frameIndex, int32_t reset, const float* constants,
+                                  char* outText, int32_t capacity) {
+    return d3d12_mc::rtSrEval(ctx, textures, textureCount, width, height, outputWidth,
+                              outputHeight, frameIndex, reset, constants, outText, capacity, nullptr);
+}
+
+int32_t MCDR_CALL mcdr_dx12DlssdEvalExposure(
+    mcdr_command_ctx* ctx, mcdr_object* const* textures, int32_t textureCount,
+    uint32_t width, uint32_t height, uint32_t outputWidth, uint32_t outputHeight,
+    uint32_t frameIndex, int32_t reset, const float* constants, const float* exposure,
+    char* outText, int32_t capacity) {
+    if (outText != nullptr && capacity > 0) outText[0] = '\0';
+    if (exposure == nullptr) return 0;
+    return d3d12_mc::dlssdEval(ctx, textures, textureCount, width, height, outputWidth,
+                               outputHeight, frameIndex, reset, constants, outText, capacity, exposure);
+}
+
+int32_t MCDR_CALL mcdr_dx12RtSrEvalExposure(
+    mcdr_command_ctx* ctx, mcdr_object* const* textures, int32_t textureCount,
+    uint32_t width, uint32_t height, uint32_t outputWidth, uint32_t outputHeight,
+    uint32_t frameIndex, int32_t reset, const float* constants, const float* exposure,
+    char* outText, int32_t capacity) {
+    if (outText != nullptr && capacity > 0) outText[0] = '\0';
+    if (exposure == nullptr) return 0;
+    return d3d12_mc::rtSrEval(ctx, textures, textureCount, width, height, outputWidth,
+                              outputHeight, frameIndex, reset, constants, outText, capacity, exposure);
 }
 
 int32_t MCDR_CALL mcdr_dx12Barrier(mcdr_command_ctx* ctx, const mcdr_barrier_desc* descs,
                                   int32_t count) {
     return d3d12_mc::submitBarriers(ctx, descs, count);
+}
+
+int32_t MCDR_CALL mcdr_dx12QuerySdkResourceState(mcdr_command_ctx* ctx, mcdr_object* texture,
+                                               uint64_t* values, int32_t count) {
+    return d3d12_mc::querySdkResourceState(ctx, texture, values, count);
 }
 
 int32_t MCDR_CALL mcdr_dx12DispatchCompute(mcdr_command_ctx* ctx, mcdr_object* pipeline,

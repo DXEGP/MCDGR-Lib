@@ -13,12 +13,18 @@ struct mcdr_dlssd_frame {
     void* list = nullptr;      // ID3D12GraphicsCommandList*
     void* radiance = nullptr;  // 带噪辐亮度（= RR 的 color 输入）
     void* output = nullptr;    // RR 输出颜色
-    void* depth = nullptr;     // 深度
+    void* depth = nullptr;     // 正的线性 viewZ，kBufferTypeLinearDepth
     void* motion = nullptr;    // 运动矢量（像素单位）
     void* normal = nullptr;    // 法线；packed 模式下是法线-粗糙度打包纹理
     void* roughness = nullptr; // 粗糙度；null 表示 packed 模式
-    // slSetConstants 的载荷，72 个浮点：四个行主序 4x4（viewToClip / clipToView / clipToPrevClip /
-    // prevClipToClip）之后是 near / far / fovY / aspect。行主序是 SL 自己的约定（float4x4 = row[4]）。
+    void* diffuseAlbedo = nullptr;
+    void* specularAlbedo = nullptr;
+    void* specularHitDistance = nullptr;
+    void* exposure = nullptr;
+    void* completionFence = nullptr;
+    uint64_t completionValue = 0;
+    float preExposure = 1.0f;
+    float exposureScale = 1.0f;
     const float* constants = nullptr;
     uint32_t width = 0;
     uint32_t height = 0;
@@ -31,3 +37,7 @@ struct mcdr_dlssd_frame {
 // 返回 1 表示 SL 接受了这次求值；0 表示未执行（SL 缺函数、参数不全）；-1 表示求值失败。
 // outText 最多写 capacity 字节，内容是一行诊断（成功与失败都会写，便于一次性看清原因）。
 extern "C" int32_t mcdr_dlssd_eval(const mcdr_dlssd_frame* frame, char* outText, int32_t capacity);
+extern "C" int32_t mcdr_dlss_sr_eval(const mcdr_dlssd_frame* frame, char* outText, int32_t capacity);
+extern "C" int32_t mcdr_rt_prepare_exposure(int32_t rr, int32_t manual, void* completionFence,
+    uint64_t completionValue, char* outText, int32_t capacity);
+extern "C" void mcdr_rt_reset_exposure();

@@ -17,6 +17,7 @@
 #include <windows.h>
 
 #include <d3d12.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <cmath>
@@ -70,6 +71,29 @@ namespace
     using DestroyTextureFn = void (*)(void*, void*);
     CreateTextureFn gCreateTexture = nullptr;
     DestroyTextureFn gDestroyTexture = nullptr;
+
+    class DlssSdkResourceScope {
+    public:
+        DlssSdkResourceScope(const DlssSdkResourceOps* operations, void* context,
+                             ID3D12Resource* color, ID3D12Resource* depth,
+                             ID3D12Resource* motion, ID3D12Resource* output)
+            : operations_(operations) {
+            if (operations_ != nullptr && operations_->acquire != nullptr && operations_->release != nullptr) {
+                scope_ = operations_->acquire(context, color, depth, motion, output);
+            }
+        }
+        ~DlssSdkResourceScope() { reclaim(); }
+        DlssSdkResourceScope(const DlssSdkResourceScope&) = delete;
+        DlssSdkResourceScope& operator=(const DlssSdkResourceScope&) = delete;
+        explicit operator bool() const { return scope_ != nullptr; }
+        void reclaim() {
+            if (scope_ != nullptr) operations_->release(std::exchange(scope_, nullptr));
+        }
+
+    private:
+        const DlssSdkResourceOps* operations_;
+        void* scope_ = nullptr;
+    };
 
     void logInfo(const char* fmt, ...) {
         if (gLogInfo == nullptr) {
@@ -169,6 +193,7 @@ namespace
         void* transitionCtx = nullptr;
         // 私有 D32 深度快照：存在时替代 JVM 的 pInDepth（DLSS 跑时它已被清空）。
         ID3D12Resource* depthSnapshot = nullptr;
+        ID3D12Resource* depthSnapshotSource = nullptr;
         void* depthSnapshotObject = nullptr;
         UINT depthSnapshotWidth = 0;
         UINT depthSnapshotHeight = 0;
@@ -176,12 +201,12 @@ namespace
         UINT depthSnapshotMips = 0;      // P108x: a full copy requires the whole shape to agree
         UINT depthSnapshotArray = 0;     // 同上：数组层数也要一起比对，否则全拷贝非法
         UINT depthSnapshotSamples = 0;
-        UINT64 depthSnapshotFrame = 0;   // frame counter at the last snapshot
         bool depthSnapshotWarned = false;
 // slDLSSSetOptions 只在选项真的变化时下发：Streamline 每次调用都会重建内部 DLSS 资源，
 // 实测逐帧调用时进程私有内存 ~800 MB/min、关掉 DLSS 则完全平坦。feature 销毁时清缓存，
 // 下次 create 重推。
         bool slOptsApplied = false;
+        uint32_t slConstantsFailures = 0;
         int32_t slOptMode = -1;
         uint32_t slOptOutW = 0;
         uint32_t slOptOutH = 0;
@@ -248,6 +273,18 @@ namespace
     };
 
     State s;
+
+    ID3D12Resource* selectDlssDepth(const mcdr_dlss_input& in) {
+        auto* depth = reinterpret_cast<ID3D12Resource*>(in.pInDepth);
+        if (s.depthSnapshotSource == nullptr || s.depthSnapshotSource != depth ||
+            s.depthSnapshot == nullptr ||
+            s.depthSnapshotWidth != static_cast<UINT>(in.renderWidth) ||
+            s.depthSnapshotHeight != static_cast<UINT>(in.renderHeight)) {
+            return depth;
+        }
+        return s.depthSnapshot;
+    }
+
 // 本模块（MCDR.dll）被加载的目录。不是 GetModuleFileNameW(nullptr)：传 NULL 返回的是**可执行
 // 文件**（开发运行时是 java.exe），厂商 DLL 实际与 MCDR.dll 同处 <user.dir>\dxrmc\。
     std::wstring moduleDirectoryW() {
@@ -1577,14 +1614,19 @@ int32_t mcdr_dlss_create(void* commandList, const mcdr_dlss_input* in, DlssTrans
 // clearDepthTexture 会把它清成 0（reverse-Z 的"远"），到 Evaluate 时实时深度已经没了，深度感知
 // 的放大因此退化成纯颜色放大。
 // 传入的深度资源只在本次调用期间是 COPY_SOURCE：查模块的跟踪状态、转换、拷贝、原样还原。
+void mcdr_dlss_invalidate_depth_snapshot(void) {
+    s.depthSnapshotSource = nullptr;
+}
+
 int32_t mcdr_dlss_snapshot_depth(void* commandList, void* depthResource, DlssTransitionFn tl,
                                  void* tlCtx, DlssQueryStateFn stateOf) {
+    mcdr_dlss_invalidate_depth_snapshot();
     if (commandList == nullptr || depthResource == nullptr || tl == nullptr) {
         return 0;
     }
     auto* cmd = static_cast<ID3D12GraphicsCommandList*>(commandList);
     auto* depth = reinterpret_cast<ID3D12Resource*>(depthResource);
-    if (cmd == nullptr || depth == nullptr || s.device == nullptr) {
+    if (cmd == nullptr || depth == nullptr) {
         return 0;
     }
     const D3D12_RESOURCE_DESC dd = depth->GetDesc();
@@ -1621,11 +1663,8 @@ int32_t mcdr_dlss_snapshot_depth(void* commandList, void* depthResource, DlssTra
             s.depthSnapshot = nullptr;
             if (!s.depthSnapshotWarned) {
                 s.depthSnapshotWarned = true;
-                logWarn("depth snapshot create failed (%ux%u fmt=%d)"
-                        "module refused or failed to create it; DLSS falls back to the "
-                        "JVM-supplied depth (which is already cleared by then, so the upscale "
-                        "loses its depth term)",
-                        w, h, static_cast<int>(dd.Format));
+                logWarn("dlss: depth snapshot create failed (%ux%u format=%u)",
+                        w, h, static_cast<unsigned>(dd.Format));
             }
             return -1;
         }
@@ -1637,40 +1676,22 @@ int32_t mcdr_dlss_snapshot_depth(void* commandList, void* depthResource, DlssTra
         s.depthSnapshotMips = (dd.MipLevels > 1) ? dd.MipLevels : 1;
         s.depthSnapshotArray = (dd.DepthOrArraySize > 1) ? dd.DepthOrArraySize : 1;
         s.depthSnapshotSamples = dd.SampleDesc.Count;
-        logInfo("depth snapshot %ux%u fmt=%d (tracked)"
-                "(private, tracked, COPY_DEST/COPY_SOURCE)",
-                w, h, static_cast<int>(dd.Format));
+        logInfo("dlss: depth snapshot %ux%u format=%u",
+                w, h, static_cast<unsigned>(dd.Format));
     }
     // 保存调用方状态 -> 拷贝 -> 复原；stateOf 为 null 时以 COMMON 为锚并还原到 COMMON。
     const int32_t before = (stateOf != nullptr)
                                ? stateOf(tlCtx, depthResource)
                                : static_cast<int32_t>(D3D12_RESOURCE_STATE_COMMON);
-    // 用 CopyTextureRegion + 显式子资源 0 的 box，不用 CopyResource（后者要求尺寸/mip/array 完全一致，
-    // 不一致时静默不拷贝）。快照自身状态必须**查询**得到，绝不假设。
-    // 在 evaluate 时读回（input-depth-after-evaluate）才是可信的判据：更早的时点读到的只能是清空值。
+    tl(tlCtx, depthResource,
+       static_cast<int32_t>(D3D12_RESOURCE_STATE_COPY_SOURCE));
     tl(tlCtx, reinterpret_cast<void*>(s.depthSnapshot),
        static_cast<int32_t>(D3D12_RESOURCE_STATE_COPY_DEST));
-    {
-        D3D12_TEXTURE_COPY_LOCATION src;
-        src.pResource = depth;
-        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        src.SubresourceIndex = 0;
-        D3D12_TEXTURE_COPY_LOCATION dst{};
-        dst.pResource = s.depthSnapshot;
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        dst.SubresourceIndex = 0;
-        const D3D12_BOX box{0, 0, 0, w, h, 1};
-        cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
-    }
+    cmd->CopyResource(s.depthSnapshot, depth);
     tl(tlCtx, reinterpret_cast<void*>(s.depthSnapshot),
        static_cast<int32_t>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
     tl(tlCtx, depthResource, before);  // hand the depth back exactly as it was found
-    ++s.depthSnapshotFrame;
-    if (s.depthSnapshotFrame == 1) {
-        logInfo("depth snapshot first %ux%u fmt=%d"
-                "replaces the JVM's depth at evaluate time",
-                w, h, static_cast<int>(dd.Format), depthResource);
-    }
+    s.depthSnapshotSource = depth;
     return 1;
 }
 // 最近一帧的 SL frame token（Reflex 的 sleep 要在 Present 前用它）。
@@ -1809,6 +1830,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
     }
 // 每帧开始（世界渲染前）建 SL frame token 并发 eSimulationStart；simulation/submit/present 必须同一帧 token。
     void mcdr_reflex_frame_begin(void) {
+        mcdr_dlss_invalidate_depth_snapshot();
         if (!reflexEnabled()) return;
         resolveReflexApi();
         gLastFrameToken = nullptr;
@@ -2029,19 +2051,21 @@ sl::FrameToken* gLastFrameToken = nullptr;
 // 避免模块私有名的修饰名在链接期对不上。
 // 状态：out 刚从 SR 输出恢复成 RENDER_TARGET，深度/MV 是只读 SRV。给错只会让 SDK 记错屏障的
 // Before 值，TagFrameResource 会返回错误码。
-    void tagFrameGenInputsFromDlss(ID3D12GraphicsCommandList* cmd, const mcdr_dlss_input& in) {
+    void tagFrameGenInputsFromDlss(ID3D12GraphicsCommandList* cmd, const mcdr_dlss_input& in,
+                                  ID3D12Resource* depth, ID3D12Resource* motionVectors) {
         if (cmd == nullptr) {
             return;
         }
         mcdr_fgTagDlssInputs(cmd, in.pInOutput, static_cast<int32_t>(D3D12_RESOURCE_STATE_RENDER_TARGET),
-                             in.pInDepth,
+                             depth,
                              static_cast<int32_t>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-                             in.pInMotionVectors,
+                             motionVectors,
                              static_cast<int32_t>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
     }
 
     int32_t streamlineEvaluate(void* commandList, const mcdr_dlss_input& in, DlssTransitionFn tl,
-                               void* tlCtx) {
+                               void* tlCtx, const DlssSdkResourceOps* resourceOps) {
+        gDlssOutputState.store(0);
         auto* cmd = static_cast<ID3D12GraphicsCommandList*>(commandList);
         if (cmd == nullptr) return 0;
         StreamlineEvalApi& api = streamlineEvalApi();
@@ -2050,11 +2074,11 @@ sl::FrameToken* gLastFrameToken = nullptr;
 
         }
         auto* color = reinterpret_cast<ID3D12Resource*>(in.pInColor);
-        auto* depth = reinterpret_cast<ID3D12Resource*>(in.pInDepth);
+        auto* depth = selectDlssDepth(in);
         auto* mv = reinterpret_cast<ID3D12Resource*>(in.pInMotionVectors);
         auto* out = reinterpret_cast<ID3D12Resource*>(in.pInOutput);
         if (api.setOptions == nullptr || api.newFrameToken == nullptr ||
-            api.setTags == nullptr || api.evaluate == nullptr) {
+            api.setTags == nullptr || api.setConstants == nullptr || api.evaluate == nullptr) {
             static bool warned = false;
             if (!warned) {
                 warned = true;
@@ -2069,11 +2093,11 @@ sl::FrameToken* gLastFrameToken = nullptr;
         // 让历史被 GUI 污染（滑动界面时文字被当成运动物体拖影）。两者都不可用才退化成直写 GUI 目标。
         ID3D12Resource* outResource = out;
         bool copyBack = false;
-        const auto fitsTarget = [&in](ID3D12Resource* res) {
+        const auto fitsTarget = [&in, out](ID3D12Resource* res) {
             if (res == nullptr) return false;
             const D3D12_RESOURCE_DESC d = res->GetDesc();
             return d.Width == static_cast<UINT64>(in.targetWidth) &&
-                   d.Height == static_cast<UINT>(in.targetHeight);
+                   d.Height == static_cast<UINT>(in.targetHeight) && d.Format == out->GetDesc().Format;
         };
         if (fitsTarget(s.externalOutput)) {
             outResource = s.externalOutput;
@@ -2084,7 +2108,6 @@ sl::FrameToken* gLastFrameToken = nullptr;
         }
         s.transitionFn = tl;
         s.transitionCtx = tlCtx;
-        // 资源状态由 SL 管理，宿主只在 evaluate 后恢复；复用 frame_begin 的 token 保证 PCL 标记与 evaluate 同帧。
         sl::FrameToken* token = gLastFrameToken;
         if (token == nullptr) {
             uint32_t frameIndex = static_cast<uint32_t>(s.submitCount);
@@ -2171,10 +2194,18 @@ sl::FrameToken* gLastFrameToken = nullptr;
             // 本版 SDK 的 sl::Constants 没有 renderingGameFrames 字段，那一位不用。
             cnst.motionVectorsDilated = sl::Boolean::eFalse;
             cnst.orthographicProjection = sl::Boolean::eFalse;
-            (void)api.setConstants(cnst, *token, viewport);
+            const sl::Result constantsResult = api.setConstants(cnst, *token, viewport);
+            if (constantsResult != sl::Result::eOk) {
+                ++s.slConstantsFailures;
+                if (s.slConstantsFailures <= 3 || std::has_single_bit(s.slConstantsFailures)) {
+                    logWarn("dlss: camera constants rejected (0x%X)",
+                            static_cast<unsigned>(constantsResult));
+                }
+                return 0;
+            }
         }
-// tag：输入/输出 eOnlyValidNow，深度/MV eValidUntilPresent；只保留输出 barrier，输入侧再切与 SMAA/GUI 冲突。
-        transition(outResource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        DlssSdkResourceScope resources(resourceOps, tlCtx, color, depth, mv, outResource);
+        if (!resources) return 0;
         sl::Resource colorRes(sl::ResourceType::eTex2d, color,
                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         sl::Resource depthRes(sl::ResourceType::eTex2d, depth,
@@ -2207,11 +2238,9 @@ sl::FrameToken* gLastFrameToken = nullptr;
             static bool warnedTag = false;
             if (!warnedTag) {
                 warnedTag = true;
-                logWarn("slSetTagForFrame failed 0x%X frame=%u",
-                        static_cast<unsigned>(tagResult), s.submitCount,
-                        static_cast<void*>(color), static_cast<void*>(depth),
-                        static_cast<void*>(mv), static_cast<void*>(outResource));
+                logWarn("DLSS tags failed: 0x%X", static_cast<unsigned>(tagResult));
             }
+            return 0;
         }
         sl::DLSSOptions opt{};
         opt.dlaaPreset = sl::DLSSPreset::ePresetK;
@@ -2259,8 +2288,25 @@ sl::FrameToken* gLastFrameToken = nullptr;
             }
         }
         const sl::BaseStructure* evalInputs[1] = {&viewport};
+        if (optResult != sl::Result::eOk) {
+            static bool warnedOptions = false;
+            if (!warnedOptions) {
+                warnedOptions = true;
+                logWarn("DLSS options failed: 0x%X", static_cast<unsigned>(optResult));
+            }
+            return 0;
+        }
         sl::Result evalResult = sl::Result::eOk;
         evalResult = api.evaluate(sl::kFeatureDLSS, *token, evalInputs, 1, cmd);
+        resources.reclaim();
+        if (evalResult != sl::Result::eOk) {
+            static bool warnedEvaluate = false;
+            if (!warnedEvaluate) {
+                warnedEvaluate = true;
+                logWarn("DLSS evaluate failed: 0x%X", static_cast<unsigned>(evalResult));
+            }
+            return 0;
+        }
         ++s.submitCount;
 // handover：只有 SL 写的那张纹理不是 GUI 目标时才需要拷回（同尺寸、同格式）。
         if (copyBack && outResource != out && evalResult == sl::Result::eOk) {
@@ -2268,10 +2314,9 @@ sl::FrameToken* gLastFrameToken = nullptr;
             transition(out, D3D12_RESOURCE_STATE_COPY_DEST);
             cmd->CopyResource(out, outResource);
         }
-        // 宿主负责恢复：只把输出恢复成 RT —— 输入侧没改状态，也没有要恢复的 barrier。
         transition(out, D3D12_RESOURCE_STATE_RENDER_TARGET);
         // SR 已跑完、输出已在 RENDER_TARGET —— 此刻把本帧输入交给 FG provider。
-        tagFrameGenInputsFromDlss(cmd, in);
+        tagFrameGenInputsFromDlss(cmd, in, depth, mv);
 // 帧生成（DLSS-G）：
 // - HUD-less 必须是"UI 之前、与 backbuffer 同尺寸"的画面（ProgrammingGuideDLSS_G.md §5.0）：
 //   只有 SR 的输出满足（此后只有 GUI 合成会写 out）。outResource == out 那张会叠上 UI，不开 FG。
@@ -2408,20 +2453,12 @@ sl::FrameToken* gLastFrameToken = nullptr;
                                              : D3D12_RESOURCE_STATE_COPY_SOURCE)
                 : 0);
 
-        if (evalResult != sl::Result::eOk) {
-            logWarn("streamline evaluate tags=0x%X options=0x%X evaluate=0x%X "
-                    "(mode=%d, out=%ux%u)",
-                    static_cast<unsigned>(tagResult), static_cast<unsigned>(optResult),
-                    static_cast<unsigned>(evalResult), static_cast<int>(opt.mode),
-                    opt.outputWidth, opt.outputHeight);
-            return 0;
-        }
         return 1;
     }
 #endif
 
 int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTransitionFn tl,
-                           void* tlCtx) {
+                           void* tlCtx, const DlssSdkResourceOps* resourceOps) {
     if (in == nullptr) {
         return -1;
     }
@@ -2430,7 +2467,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     // （每帧静默 return -1，JVM 只看到 evaluate 连续失败）。
     if (dlssImplStreamline()) {
         // streamline 模式下 NGX 从未 init/创建：直接走 SL 的 tag -> options -> evaluate（状态由内部负责）。
-        return streamlineEvaluate(commandList, *in, tl, tlCtx);
+        return streamlineEvaluate(commandList, *in, tl, tlCtx, resourceOps);
     }
 #endif
     if (s.disabled) {
@@ -2503,10 +2540,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
         s.mvCopyResourceState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     }
 // 优先用 vanilla 清深度之前拍的快照：没有它深度项恒为远平面，放大退化成纯颜色；无快照才用 JVM 送的深度。
-    ID3D12Resource* depthForDlss = depth;
-    if (s.depthSnapshot != nullptr) {
-        depthForDlss = s.depthSnapshot;
-    }
+    ID3D12Resource* depthForDlss = selectDlssDepth(*in);
 // 每次 Evaluate 前都设：输入 -> NON_PIXEL_SHADER_RESOURCE，输出 -> UNORDERED_ACCESS。NGX 用
 // compute dispatch 评价（输出是 UAV），PIXEL_SHADER_RESOURCE 在 compute 里不可读
 // —— 那是 INVALID_CALL，实测 "成功" 后 1 ms 就 GetDeviceRemovedReason=0x887A0001。
@@ -2579,7 +2613,10 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
                              : 1.0f;
     // 没有透明遮罩、曝光纹理和 subrect：数据面还不提供这些。
 
+    DlssSdkResourceScope resources(resourceOps, tlCtx, color, depthForDlss, mvForDlss, ngxTarget);
+    if (!resources) return 0;
     const NVSDK_NGX_Result er = NGX_D3D12_EVALUATE_DLSS_EXT(cmd, s.feature, s.params, &ep);
+    resources.reclaim();
     if (NVSDK_NGX_FAILED(er)) {
         if (!s.evalFailWarned) {
             s.evalFailWarned = true;
@@ -2606,7 +2643,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
         transition(out, D3D12_RESOURCE_STATE_RENDER_TARGET);
     }
     // NGX 路径同样在 SR 成功后把本帧输入交给 FG provider（深度/MV 已转成只读）。
-    tagFrameGenInputsFromDlss(cmd, *in);
+    tagFrameGenInputsFromDlss(cmd, *in, depthForDlss, mvForDlss);
     s.resetPending = false;
 
     ++s.submitCount;
@@ -2689,6 +2726,9 @@ int32_t mcdr_dlss_set_output_texture(void* resource) {
     const bool want = enabled != 0;
     const bool changed = (want != s.enabled);
     s.enabled = want;
+    if (!want) {
+        mcdr_dlss_invalidate_depth_snapshot();
+    }
     if (changed) {
         logInfo("DLSS switch %s "
                 "initOk=%d featureOk=%d)",
@@ -2698,6 +2738,8 @@ int32_t mcdr_dlss_set_output_texture(void* resource) {
     }
 
     void mcdr_dlss_shutdown(void) {
+    mcdr_rt_reset_exposure();
+    mcdr_dlss_invalidate_depth_snapshot();
     destroyFeature();
     // 三张私有纹理归模块所有：设备消失**之前**交回（ctx = nullptr：只做延迟删除，不碰命令列表）。
     destroyTrackedTexture(nullptr, &s.mvBufferObject);
@@ -2768,6 +2810,19 @@ namespace {
 
 using PFn_GetFeatureFunction = sl::Result (*)(sl::Feature, const char*, void*&);
 
+struct RtExposureState {
+    int32_t manual = -1;
+    bool evaluated = false;
+    bool resetPending = true;
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    uint64_t completionValue = 0;
+};
+
+std::array<RtExposureState, 2>& rtExposureStates() {
+    static std::array<RtExposureState, 2> states;
+    return states;
+}
+
 struct DlssdApi {
     bool resolved = false;
     bool ok = false;
@@ -2780,7 +2835,11 @@ struct DlssdApi {
     // 缺了常量 DLSS-D 不会报错，只会按「零位移」重投影（画面拖影），所以这条要单独记结果。
     sl::Result (*setConstants)(const sl::Constants&, const sl::FrameToken&,
                                const sl::ViewportHandle&) = nullptr;
+    PFun_slFreeResources* freeResources = nullptr;
     sl::Result (*setOptions)(const sl::ViewportHandle&, const sl::DLSSDOptions&) = nullptr;
+    sl::Result (*getOptimalSettings)(const sl::DLSSDOptions&, sl::DLSSDOptimalSettings&) = nullptr;
+    uint32_t inputWidth = 0u;
+    uint32_t inputHeight = 0u;
     uint32_t optionWidth = 0u;
     uint32_t optionHeight = 0u;
     int32_t optionMode = -1;
@@ -2819,8 +2878,9 @@ DlssdApi& dlssdApi() {
         reinterpret_cast<decltype(api.newFrameToken)>(::GetProcAddress(sl, "slGetNewFrameToken"));
     api.setConstants =
         reinterpret_cast<decltype(api.setConstants)>(::GetProcAddress(sl, "slSetConstants"));
+    api.freeResources = reinterpret_cast<PFun_slFreeResources*>(::GetProcAddress(sl, "slFreeResources"));
     if (api.getFeatureFunction == nullptr || api.setTag == nullptr || api.evaluate == nullptr ||
-        api.newFrameToken == nullptr) {
+        api.newFrameToken == nullptr || api.setConstants == nullptr) {
         return api;
     }
     void* raw = nullptr;
@@ -2829,6 +2889,12 @@ DlssdApi& dlssdApi() {
         return api;
     }
     api.setOptions = reinterpret_cast<decltype(api.setOptions)>(raw);
+    raw = nullptr;
+    if (api.getFeatureFunction(sl::kFeatureDLSS_RR, "slDLSSDGetOptimalSettings", raw) !=
+            sl::Result::eOk || raw == nullptr) {
+        return api;
+    }
+    api.getOptimalSettings = reinterpret_cast<decltype(api.getOptimalSettings)>(raw);
     api.ok = true;
     return api;
 }
@@ -2838,16 +2904,244 @@ void writeText(char* out, int32_t capacity, const char* text) {
     std::snprintf(out, static_cast<size_t>(capacity), "%s", text == nullptr ? "" : text);
 }
 
+sl::Constants rtCameraConstants(const mcdr_dlssd_frame& frame) {
+    const float* matrices = frame.constants;
+    sl::Constants values{};
+    for (uint32_t row = 0; row < 4u; ++row) {
+        const uint32_t offset = row * 4u;
+        values.cameraViewToClip.setRow(row, sl::float4(matrices[offset], matrices[offset + 1u],
+                                                      matrices[offset + 2u], matrices[offset + 3u]));
+        values.clipToCameraView.setRow(row, sl::float4(matrices[16u + offset], matrices[17u + offset],
+                                                      matrices[18u + offset], matrices[19u + offset]));
+        values.clipToPrevClip.setRow(row, sl::float4(matrices[32u + offset], matrices[33u + offset],
+                                                   matrices[34u + offset], matrices[35u + offset]));
+        values.prevClipToClip.setRow(row, sl::float4(matrices[48u + offset], matrices[49u + offset],
+                                                   matrices[50u + offset], matrices[51u + offset]));
+    }
+    values.jitterOffset = sl::float2(matrices[68], matrices[69]);
+    values.cameraPinholeOffset = sl::float2(0.0f, 0.0f);
+    values.cameraPos = sl::float3(matrices[100], matrices[101], matrices[102]);
+    values.cameraRight = sl::float3(matrices[88], matrices[89], matrices[90]);
+    values.cameraUp = sl::float3(matrices[92], matrices[93], matrices[94]);
+    values.cameraFwd = sl::float3(-matrices[96], -matrices[97], -matrices[98]);
+    values.mvecScale = sl::float2(1.0f / static_cast<float>(frame.width),
+                                1.0f / static_cast<float>(frame.height));
+    values.cameraNear = matrices[64];
+    values.cameraFar = matrices[65];
+    values.cameraFOV = matrices[66];
+    values.cameraAspectRatio = matrices[67];
+    values.depthInverted = sl::Boolean::eFalse;
+    values.cameraMotionIncluded = sl::Boolean::eTrue;
+    values.motionVectors3D = sl::Boolean::eFalse;
+    values.motionVectorsDilated = sl::Boolean::eFalse;
+    values.motionVectorsJittered = sl::Boolean::eFalse;
+    values.orthographicProjection = sl::Boolean::eFalse;
+    values.reset = frame.reset != 0 ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+    return values;
+}
+
+struct RtSrApi {
+    bool resolved = false;
+    sl::Result (*setOptions)(const sl::ViewportHandle&, const sl::DLSSOptions&) = nullptr;
+    sl::Result (*getOptimalSettings)(const sl::DLSSOptions&, sl::DLSSOptimalSettings&) = nullptr;
+    uint32_t width = 0u;
+    uint32_t height = 0u;
+    uint32_t outputWidth = 0u;
+    uint32_t outputHeight = 0u;
+    sl::DLSSMode mode = sl::DLSSMode::eOff;
+    float preExposure = 0.0f;
+    float exposureScale = 0.0f;
+};
+
+RtSrApi& rtSrApi() {
+    static RtSrApi api{};
+    if (api.resolved) return api;
+    api.resolved = true;
+    const auto& common = dlssdApi();
+    if (common.getFeatureFunction == nullptr) return api;
+    void* function = nullptr;
+    if (common.getFeatureFunction(sl::kFeatureDLSS, "slDLSSSetOptions", function) != sl::Result::eOk) return api;
+    api.setOptions = reinterpret_cast<decltype(api.setOptions)>(function);
+    function = nullptr;
+    if (common.getFeatureFunction(sl::kFeatureDLSS, "slDLSSGetOptimalSettings", function) != sl::Result::eOk) return api;
+    api.getOptimalSettings = reinterpret_cast<decltype(api.getOptimalSettings)>(function);
+    return api;
+}
+
 }  // namespace
+
+extern "C" void mcdr_rt_reset_exposure() {
+    rtExposureStates() = {};
+}
+
+extern "C" int32_t mcdr_rt_prepare_exposure(int32_t rr, int32_t manual, void* completionFence,
+    uint64_t completionValue, char* outText, int32_t capacity) {
+    auto& state = rtExposureStates()[rr != 0 ? 1 : 0];
+    if (state.manual == manual) return 1;
+    auto& common = dlssdApi();
+    if ((rr != 0 && !common.ok) || common.setConstants == nullptr || common.setTag == nullptr ||
+        common.evaluate == nullptr || common.newFrameToken == nullptr) {
+        writeText(outText, capacity, "exposure: streamline api unavailable");
+        return 0;
+    }
+    if (state.evaluated) {
+        if (common.freeResources == nullptr || state.fence == nullptr) return 0;
+        const uint64_t completed = state.fence->GetCompletedValue();
+        if (completed == UINT64_MAX) return 0;
+        if (completed < state.completionValue) {
+            if (state.fence.Get() == completionFence && state.completionValue == completionValue) {
+                writeText(outText, capacity, "exposure: submit before switching modes");
+                return 0;
+            }
+            HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (event == nullptr) return 0;
+            const HRESULT result = state.fence->SetEventOnCompletion(state.completionValue, event);
+            const bool ready = SUCCEEDED(result) && WaitForSingleObject(event, 5000) == WAIT_OBJECT_0;
+            CloseHandle(event);
+            if (!ready) {
+                writeText(outText, capacity, "exposure: previous frame still in flight");
+                return 0;
+            }
+        }
+        const auto feature = rr != 0 ? sl::kFeatureDLSS_RR : sl::kFeatureDLSS;
+        const sl::ViewportHandle viewport(rr != 0 ? 1 : 2);
+        if (common.freeResources(feature, viewport) != sl::Result::eOk) {
+            writeText(outText, capacity, "exposure: feature release failed");
+            return 0;
+        }
+    }
+    state.manual = manual;
+    state.evaluated = false;
+    state.resetPending = true;
+    state.fence.Reset();
+    state.completionValue = 0;
+    if (rr != 0) {
+        common.inputWidth = common.inputHeight = common.optionWidth = common.optionHeight = 0;
+    } else {
+        auto& api = rtSrApi();
+        api.width = api.height = api.outputWidth = api.outputHeight = 0;
+    }
+    return 1;
+}
+
+extern "C" int32_t mcdr_dlss_sr_eval(const mcdr_dlssd_frame* frame, char* outText, int32_t capacity) {
+    writeText(outText, capacity, "rt sr: inputs unavailable");
+    if (frame == nullptr || frame->list == nullptr || frame->radiance == nullptr || frame->output == nullptr ||
+        frame->depth == nullptr || frame->motion == nullptr || frame->constants == nullptr ||
+        frame->width == 0u || frame->height == 0u || frame->outputWidth == 0u || frame->outputHeight == 0u) return 0;
+    auto& api = rtSrApi();
+    const auto& common = dlssdApi();
+    if (api.setOptions == nullptr || api.getOptimalSettings == nullptr || common.setConstants == nullptr ||
+        common.setTag == nullptr || common.evaluate == nullptr || common.newFrameToken == nullptr) {
+        writeText(outText, capacity, "rt sr: streamline api unavailable");
+        return 0;
+    }
+    const sl::ViewportHandle viewport(2);
+    sl::DLSSOptions options{};
+    options.outputWidth = frame->outputWidth;
+    options.outputHeight = frame->outputHeight;
+    options.colorBuffersHDR = sl::Boolean::eTrue;
+    options.alphaUpscalingEnabled = sl::Boolean::eFalse;
+    options.preExposure = frame->preExposure;
+    options.exposureScale = frame->exposureScale;
+    options.useAutoExposure = frame->exposure == nullptr ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+    const bool sizeChanged = api.width != frame->width || api.height != frame->height ||
+        api.outputWidth != frame->outputWidth || api.outputHeight != frame->outputHeight;
+    if (sizeChanged) {
+        bool supported = false;
+        const std::array modes{sl::DLSSMode::eMaxQuality, sl::DLSSMode::eBalanced,
+                               sl::DLSSMode::eMaxPerformance, sl::DLSSMode::eUltraPerformance,
+                               sl::DLSSMode::eDLAA};
+        for (const auto mode : modes) {
+            options.mode = mode;
+            sl::DLSSOptimalSettings settings{};
+            if (api.getOptimalSettings(options, settings) != sl::Result::eOk) continue;
+            const uint32_t minWidth = settings.renderWidthMin != 0u
+                                          ? settings.renderWidthMin : settings.optimalRenderWidth;
+            const uint32_t minHeight = settings.renderHeightMin != 0u
+                                           ? settings.renderHeightMin : settings.optimalRenderHeight;
+            const uint32_t maxWidth = settings.renderWidthMax != 0u
+                                          ? settings.renderWidthMax : settings.optimalRenderWidth;
+            const uint32_t maxHeight = settings.renderHeightMax != 0u
+                                           ? settings.renderHeightMax : settings.optimalRenderHeight;
+            if (frame->width < minWidth || frame->width > maxWidth ||
+                frame->height < minHeight || frame->height > maxHeight) continue;
+            api.mode = mode;
+            supported = true;
+            break;
+        }
+        if (!supported) {
+            writeText(outText, capacity, "rt sr: input size unsupported");
+            return 0;
+        }
+    }
+    options.mode = api.mode;
+    if (sizeChanged || api.preExposure != options.preExposure || api.exposureScale != options.exposureScale) {
+        if (api.setOptions(viewport, options) != sl::Result::eOk) {
+            writeText(outText, capacity, "rt sr: options rejected");
+            return -1;
+        }
+        api.width = frame->width;
+        api.height = frame->height;
+        api.outputWidth = frame->outputWidth;
+        api.outputHeight = frame->outputHeight;
+        api.preExposure = options.preExposure;
+        api.exposureScale = options.exposureScale;
+    }
+    sl::FrameToken* token = nullptr;
+    if (common.newFrameToken(token, &frame->frameIndex) != sl::Result::eOk || token == nullptr) return -1;
+    auto values = rtCameraConstants(*frame);
+    auto& exposureState = rtExposureStates()[0];
+    if (exposureState.resetPending) values.reset = sl::Boolean::eTrue;
+    values.depthInverted = frame->constants[10] >= 0.0f ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+    const sl::Result constantsResult = common.setConstants(values, *token, viewport);
+    if (constantsResult != sl::Result::eOk) {
+        writeText(outText, capacity, "rt sr: camera constants rejected");
+        return -1;
+    }
+    auto* list = static_cast<ID3D12GraphicsCommandList*>(frame->list);
+    sl::Resource radiance(sl::ResourceType::eTex2d, frame->radiance, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    sl::Resource output(sl::ResourceType::eTex2d, frame->output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    sl::Resource depth(sl::ResourceType::eTex2d, frame->depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    sl::Resource motion(sl::ResourceType::eTex2d, frame->motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    sl::Resource exposure(sl::ResourceType::eTex2d, frame->exposure, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const sl::Extent exposureExtent{0u, 0u, 1u, 1u};
+    const std::array tags{
+        sl::ResourceTag(&radiance, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eOnlyValidNow),
+        sl::ResourceTag(&output, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eOnlyValidNow),
+        sl::ResourceTag(&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate),
+        sl::ResourceTag(&motion, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate),
+        sl::ResourceTag(&exposure, sl::kBufferTypeExposure, sl::ResourceLifecycle::eOnlyValidNow, &exposureExtent)};
+    const uint32_t tagCount = frame->exposure != nullptr ? 5u : 4u;
+    if (common.setTag(*token, viewport, tags.data(), tagCount, list) != sl::Result::eOk) {
+        writeText(outText, capacity, "rt sr: resource tags rejected");
+        return -1;
+    }
+    const sl::BaseStructure* inputs[]{&viewport};
+    exposureState.fence = static_cast<ID3D12Fence*>(frame->completionFence);
+    exposureState.completionValue = frame->completionValue;
+    exposureState.evaluated = true;
+    const sl::Result result = common.evaluate(sl::kFeatureDLSS, *token, inputs, 1u, list);
+    if (result == sl::Result::eOk) exposureState.resetPending = false;
+    char text[160]{};
+    std::snprintf(text, sizeof(text), "rt sr: eval=0x%X consts=0x%X %ux%u -> %ux%u",
+                  static_cast<unsigned>(result), static_cast<unsigned>(constantsResult),
+                  frame->width, frame->height, frame->outputWidth, frame->outputHeight);
+    writeText(outText, capacity, text);
+    return result == sl::Result::eOk ? 1 : -1;
+}
 
 extern "C" int32_t mcdr_dlssd_eval(const mcdr_dlssd_frame* frame, char* outText, int32_t capacity) {
     writeText(outText, capacity, "dlssd: frame inputs incomplete");
-    if (frame == nullptr) return 0;
+    if (frame == nullptr || frame->constants == nullptr || frame->width == 0u ||
+        frame->height == 0u || frame->outputWidth == 0u || frame->outputHeight == 0u) return 0;
     // 位序：1 list、2 radiance、4 output、8 depth、16 motion、32 normal。缺哪个一眼看得出来。
     const unsigned missing =
         (frame->list == nullptr ? 1u : 0u) | (frame->radiance == nullptr ? 2u : 0u) |
         (frame->output == nullptr ? 4u : 0u) | (frame->depth == nullptr ? 8u : 0u) |
-        (frame->motion == nullptr ? 16u : 0u) | (frame->normal == nullptr ? 32u : 0u);
+        (frame->motion == nullptr ? 16u : 0u) | (frame->normal == nullptr ? 32u : 0u) |
+        (frame->diffuseAlbedo == nullptr ? 64u : 0u) | (frame->specularAlbedo == nullptr ? 128u : 0u) |
+        (frame->specularHitDistance == nullptr ? 256u : 0u);
     if (missing != 0u) {
         char line[64] = {};
         std::snprintf(line, sizeof(line), "dlssd: frame inputs missing 0x%X", missing);
@@ -2860,39 +3154,76 @@ extern "C" int32_t mcdr_dlssd_eval(const mcdr_dlssd_frame* frame, char* outText,
         return 0;
     }
     auto* list = static_cast<ID3D12GraphicsCommandList*>(frame->list);
-    const sl::ViewportHandle viewport(0);
+    const sl::ViewportHandle viewport(1);
 
-    // 选项只在输出尺寸/模式变化时下发：每帧下发会让 SL 重建内部资源。
-    const int32_t mode = static_cast<int32_t>(sl::DLSSMode::eMaxQuality);
-    if (api.optionWidth != frame->outputWidth || api.optionHeight != frame->outputHeight ||
-        api.optionMode != mode) {
-        sl::DLSSDOptions options{};
-        options.mode = sl::DLSSMode::eMaxQuality;
-        options.outputWidth = frame->outputWidth;
-        options.outputHeight = frame->outputHeight;
-        options.preExposure = 1.0f;
-        options.exposureScale = 1.0f;
-        // RR 吃的是线性 HDR 辐亮度（RGBA16F），不是 SDR 颜色。
-        options.colorBuffersHDR = sl::Boolean::eTrue;
-        options.alphaUpscalingEnabled = sl::Boolean::eFalse;
-        options.normalRoughnessMode = frame->roughness != nullptr
-                                          ? sl::DLSSDNormalRoughnessMode::eUnpacked
-                                          : sl::DLSSDNormalRoughnessMode::ePacked;
-        options.dlaaPreset = sl::DLSSDPreset::ePresetF;
-        options.qualityPreset = sl::DLSSDPreset::ePresetF;
-        options.balancedPreset = sl::DLSSDPreset::ePresetF;
-        options.performancePreset = sl::DLSSDPreset::ePresetF;
-        const sl::Result r = api.setOptions(viewport, options);
-        if (r != sl::Result::eOk) {
-            char line[160] = {};
-            std::snprintf(line, sizeof(line), "dlssd: setOptions 0x%X out %ux%u",
-                          static_cast<unsigned>(r), frame->outputWidth, frame->outputHeight);
-            writeText(outText, capacity, line);
+    sl::DLSSDOptions options{};
+    options.outputWidth = frame->outputWidth;
+    options.outputHeight = frame->outputHeight;
+    options.colorBuffersHDR = sl::Boolean::eTrue;
+    options.alphaUpscalingEnabled = sl::Boolean::eFalse;
+    options.preExposure = frame->preExposure;
+    options.exposureScale = frame->exposureScale;
+    options.normalRoughnessMode = frame->roughness != nullptr
+                                      ? sl::DLSSDNormalRoughnessMode::eUnpacked
+                                      : sl::DLSSDNormalRoughnessMode::ePacked;
+    options.dlaaPreset = sl::DLSSDPreset::ePresetF;
+    options.qualityPreset = sl::DLSSDPreset::ePresetF;
+    options.balancedPreset = sl::DLSSDPreset::ePresetF;
+    options.performancePreset = sl::DLSSDPreset::ePresetF;
+    options.ultraPerformancePreset = sl::DLSSDPreset::ePresetF;
+    if (api.inputWidth != frame->width || api.inputHeight != frame->height ||
+        api.optionWidth != frame->outputWidth || api.optionHeight != frame->outputHeight) {
+        const bool nativeScale = frame->width == frame->outputWidth &&
+                                 frame->height == frame->outputHeight;
+        const std::array modes{
+            nativeScale ? sl::DLSSMode::eDLAA : sl::DLSSMode::eMaxQuality,
+            sl::DLSSMode::eBalanced, sl::DLSSMode::eMaxPerformance,
+            sl::DLSSMode::eUltraPerformance, sl::DLSSMode::eDLAA};
+        bool supported = false;
+        for (const auto mode : modes) {
+            options.mode = mode;
+            sl::DLSSDOptimalSettings settings{};
+            if (api.getOptimalSettings(options, settings) != sl::Result::eOk) continue;
+            const uint32_t minWidth = settings.renderWidthMin != 0u
+                                          ? settings.renderWidthMin : settings.optimalRenderWidth;
+            const uint32_t minHeight = settings.renderHeightMin != 0u
+                                           ? settings.renderHeightMin : settings.optimalRenderHeight;
+            const uint32_t maxWidth = settings.renderWidthMax != 0u
+                                          ? settings.renderWidthMax : settings.optimalRenderWidth;
+            const uint32_t maxHeight = settings.renderHeightMax != 0u
+                                           ? settings.renderHeightMax : settings.optimalRenderHeight;
+            if (frame->width < minWidth || frame->width > maxWidth ||
+                frame->height < minHeight || frame->height > maxHeight) continue;
+            api.optionMode = static_cast<int32_t>(mode);
+            supported = true;
+            logInfo("dlssd: input %ux%u, bounds %ux%u-%ux%u",
+                    frame->width, frame->height, minWidth, minHeight, maxWidth, maxHeight);
+            break;
+        }
+        if (!supported) {
+            writeText(outText, capacity, "dlssd: input size outside supported bounds");
             return -1;
         }
+        api.inputWidth = frame->width;
+        api.inputHeight = frame->height;
         api.optionWidth = frame->outputWidth;
         api.optionHeight = frame->outputHeight;
-        api.optionMode = mode;
+    }
+    options.mode = static_cast<sl::DLSSMode>(api.optionMode);
+    const float* camera = frame->constants;
+    for (uint32_t row = 0u; row < 4u; ++row) {
+        const uint32_t offset = row * 4u;
+        options.worldToCameraView.setRow(row,
+            sl::float4(camera[72u + offset], camera[73u + offset],
+                       camera[74u + offset], camera[75u + offset]));
+        options.cameraViewToWorld.setRow(row,
+            sl::float4(camera[88u + offset], camera[89u + offset],
+                       camera[90u + offset], camera[91u + offset]));
+    }
+    const sl::Result optionsResult = api.setOptions(viewport, options);
+    if (optionsResult != sl::Result::eOk) {
+        writeText(outText, capacity, "dlssd: options rejected");
+        return -1;
     }
 
     sl::FrameToken* token = nullptr;
@@ -2903,37 +3234,16 @@ extern "C" int32_t mcdr_dlssd_eval(const mcdr_dlssd_frame* frame, char* outText,
     }
 
     // slSetConstants：DLSS-D 靠它做重投影。四个矩阵是行主序（SL 的 float4x4 就是 row[4]），
-    // 且明确禁止含抖动偏移；Kotlin 侧已按这个约定摊成 72 个浮点。
+    // 且明确禁止含抖动偏移；Kotlin 侧的 104 个浮点还包含相机视图正逆矩阵。
     sl::Result constantsResult = sl::Result::eErrorMissingInputParameter;
     if (api.setConstants != nullptr && frame->constants != nullptr) {
-        const float* m = frame->constants;
-        sl::Constants values{};
-        for (uint32_t row = 0; row < 4u; ++row) {
-            const uint32_t r = row * 4u;
-            values.cameraViewToClip.setRow(
-                row, sl::float4(m[r], m[r + 1u], m[r + 2u], m[r + 3u]));
-            values.clipToCameraView.setRow(
-                row, sl::float4(m[16u + r], m[17u + r], m[18u + r], m[19u + r]));
-            values.clipToPrevClip.setRow(
-                row, sl::float4(m[32u + r], m[33u + r], m[34u + r], m[35u + r]));
-            values.prevClipToClip.setRow(
-                row, sl::float4(m[48u + r], m[49u + r], m[50u + r], m[51u + r]));
-        }
-        // 本渲染器不做时间抖动，MV 是像素单位且 +y 朝下，所以 jitter 恒 0、mvecScale 取 1/w、1/h。
-        values.jitterOffset = sl::float2(0.0f, 0.0f);
-        values.mvecScale =
-            sl::float2(frame->width > 0 ? 1.0f / static_cast<float>(frame->width) : 0.0f,
-                       frame->height > 0 ? 1.0f / static_cast<float>(frame->height) : 0.0f);
-        values.cameraNear = m[64];
-        values.cameraFar = m[65];
-        values.cameraFOV = m[66];
-        values.cameraAspectRatio = m[67];
-        values.depthInverted = sl::Boolean::eFalse;
-        values.cameraMotionIncluded = sl::Boolean::eTrue;
-        values.motionVectors3D = sl::Boolean::eFalse;
-        values.orthographicProjection = sl::Boolean::eFalse;
-        values.reset = frame->reset != 0 ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+        auto values = rtCameraConstants(*frame);
+        if (rtExposureStates()[1].resetPending) values.reset = sl::Boolean::eTrue;
         constantsResult = api.setConstants(values, *token, viewport);
+    }
+    if (constantsResult != sl::Result::eOk) {
+        writeText(outText, capacity, "dlssd: camera constants rejected");
+        return -1;
     }
 
     auto* radiance = static_cast<ID3D12Resource*>(frame->radiance);
@@ -2954,25 +3264,47 @@ extern "C" int32_t mcdr_dlssd_eval(const mcdr_dlssd_frame* frame, char* outText,
     sl::Resource roughnessRes(sl::ResourceType::eTex2d,
                               static_cast<ID3D12Resource*>(frame->roughness),
                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    sl::Resource diffuseAlbedoRes(sl::ResourceType::eTex2d,
+                                  static_cast<ID3D12Resource*>(frame->diffuseAlbedo),
+                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    sl::Resource specularAlbedoRes(sl::ResourceType::eTex2d,
+                                   static_cast<ID3D12Resource*>(frame->specularAlbedo),
+                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    sl::Resource specularHitDistanceRes(sl::ResourceType::eTex2d,
+                                        static_cast<ID3D12Resource*>(frame->specularHitDistance),
+                                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    sl::Resource exposureRes(sl::ResourceType::eTex2d, frame->exposure,
+                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const sl::Extent exposureExtent{0u, 0u, 1u, 1u};
 
     // packed 模式下 normal 就是打包后的法线-粗糙度纹理；unpacked 模式多一张粗糙度。
     // 注意枚举名：SL 叫 kBufferTypeNormals（复数），没有 kBufferTypeNormal。
     const sl::BufferType normalType = frame->roughness != nullptr ? sl::kBufferTypeNormals
                                                                  : sl::kBufferTypeNormalRoughness;
-    sl::ResourceTag tags[6] = {
+    sl::ResourceTag tags[10] = {
         sl::ResourceTag(&colorRes, sl::kBufferTypeScalingInputColor,
                         sl::ResourceLifecycle::eOnlyValidNow),
         sl::ResourceTag(&outputRes, sl::kBufferTypeScalingOutputColor,
                         sl::ResourceLifecycle::eOnlyValidNow),
-        sl::ResourceTag(&depthRes, sl::kBufferTypeDepth,
-                        sl::ResourceLifecycle::eValidUntilPresent),
+        sl::ResourceTag(&depthRes, sl::kBufferTypeLinearDepth,
+                        sl::ResourceLifecycle::eValidUntilEvaluate),
         sl::ResourceTag(&motionRes, sl::kBufferTypeMotionVectors,
-                        sl::ResourceLifecycle::eValidUntilPresent),
+                        sl::ResourceLifecycle::eValidUntilEvaluate),
         sl::ResourceTag(&normalRes, normalType, sl::ResourceLifecycle::eOnlyValidNow),
+        sl::ResourceTag(&diffuseAlbedoRes, sl::kBufferTypeAlbedo,
+                        sl::ResourceLifecycle::eOnlyValidNow),
+        sl::ResourceTag(&specularAlbedoRes, sl::kBufferTypeSpecularAlbedo,
+                        sl::ResourceLifecycle::eOnlyValidNow),
+        sl::ResourceTag(&specularHitDistanceRes, sl::kBufferTypeSpecularHitDistance,
+                        sl::ResourceLifecycle::eOnlyValidNow),
         sl::ResourceTag(&roughnessRes, sl::kBufferTypeRoughness,
                         sl::ResourceLifecycle::eOnlyValidNow),
     };
-    const uint32_t tagCount = frame->roughness != nullptr ? 6u : 5u;
+    uint32_t tagCount = frame->roughness != nullptr ? 9u : 8u;
+    if (frame->exposure != nullptr) {
+        tags[tagCount++] = sl::ResourceTag(&exposureRes, sl::kBufferTypeExposure,
+            sl::ResourceLifecycle::eOnlyValidNow, &exposureExtent);
+    }
     const sl::Result tagResult = api.setTag(*token, viewport, tags, tagCount, list);
     if (tagResult != sl::Result::eOk) {
         char line[160] = {};
@@ -2983,7 +3315,12 @@ extern "C" int32_t mcdr_dlssd_eval(const mcdr_dlssd_frame* frame, char* outText,
     }
 
     const sl::BaseStructure* inputs[1] = {&viewport};
+    auto& exposureState = rtExposureStates()[1];
+    exposureState.fence = static_cast<ID3D12Fence*>(frame->completionFence);
+    exposureState.completionValue = frame->completionValue;
+    exposureState.evaluated = true;
     const sl::Result evalResult = api.evaluate(sl::kFeatureDLSS_RR, *token, inputs, 1, list);
+    if (evalResult == sl::Result::eOk) exposureState.resetPending = false;
     char line[176] = {};
     std::snprintf(line, sizeof(line), "dlssd: eval 0x%X consts=0x%X %ux%u -> %ux%u packed=%d",
                   static_cast<unsigned>(evalResult), static_cast<unsigned>(constantsResult),
@@ -2994,6 +3331,19 @@ extern "C" int32_t mcdr_dlssd_eval(const mcdr_dlssd_frame* frame, char* outText,
 }
 
 #else
+
+extern "C" void mcdr_rt_reset_exposure() {}
+
+extern "C" int32_t mcdr_rt_prepare_exposure(int32_t, int32_t, void*, uint64_t, char*, int32_t) {
+    return 0;
+}
+
+extern "C" int32_t mcdr_dlss_sr_eval(const mcdr_dlssd_frame*, char* outText, int32_t capacity) {
+    if (outText != nullptr && capacity > 0) {
+        std::snprintf(outText, static_cast<size_t>(capacity), "%s", "rt sr: streamline unavailable");
+    }
+    return 0;
+}
 
 extern "C" int32_t mcdr_dlssd_eval(const mcdr_dlssd_frame*, char* outText, int32_t capacity) {
     if (outText != nullptr && capacity > 0) {

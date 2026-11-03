@@ -87,6 +87,10 @@ int32_t mcdr_dlss_set_constants(const mcdr_dlss_constants* constants);
 // attachment to COMMON, so a mismatched Before state is a debug-layer error and a TDR freeze.
 using DlssTransitionFn = void (*)(void* ctx, void* resource, int32_t toState);
 using DlssQueryStateFn = int32_t (*)(void* ctx, void* resource);
+typedef struct DlssSdkResourceOps {
+    void* (*acquire)(void* ctx, void* color, void* depth, void* motion, void* output);
+    void (*release)(void* scope);
+} DlssSdkResourceOps;
 // Private textures are created BY the device module (this unit creates none): a resource created here is in
 // nobody's state table. Destroy goes through the module's deferred-delete path (a bare Release() with an
 // open command list reports "deleted prior to closing the command list"). `flags` is D3D12_RESOURCE_FLAGS
@@ -114,12 +118,13 @@ int32_t mcdr_dlss_create(void* commandList, const mcdr_dlss_input* in, DlssTrans
                          void* tlCtx);
 // One real NGX evaluation per frame. commandList is ID3D12GraphicsCommandList*.
 int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTransitionFn tl,
-                           void* tlCtx);
+                           void* tlCtx, const DlssSdkResourceOps* resourceOps);
 
 // Depth snapshot. Called BEFORE vanilla's clearDepthTexture wipes the depth to 0.0 (reverse-Z "far"); the
 // passed resource's state is restored exactly as found.
 int32_t mcdr_dlss_snapshot_depth(void* commandList, void* depthResource, DlssTransitionFn tl,
                                  void* tlCtx, DlssQueryStateFn stateOf);
+void mcdr_dlss_invalidate_depth_snapshot(void);
 
 // Independent DLSS switch: records the state for the ABI query and the log only, never touching the loaded
 // NGX runtime. The gate is the device module's applyDlssToTexture (gCtx.dlssEnabled). Idempotent.

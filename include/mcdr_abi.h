@@ -42,7 +42,7 @@ extern "C" {
 // 13 -> 14：mcdr_dx12NrdDenoise 多一个 resetHistory（1 = 这一帧丢历史）。
 // 14 -> 15：新增 mcdr_dx12DlssdEval（DLSS-D 逐帧求值，走 Streamline）。
 // 15 -> 16：mcdr_dx12DlssdEval 多一个 constants（slSetConstants 的 72 个浮点）。
-#define MCDR_ABI_VERSION 16u
+#define MCDR_ABI_VERSION 23u
 
 // Same value at runtime, so a stale Java constant fails at load time, not at first draw.
 MCDR_API uint32_t MCDR_CALL mcdrABIVersion(void);
@@ -433,6 +433,8 @@ typedef struct mcdr_sr_caps {
     char note[28];           // 52 短原因，NUL 结尾（52 + 28 = 80）
 } mcdr_sr_caps;
 
+#define MCDR_SR_FLAG_UNJITTERED_MV 1
+
 // 与厂商无关的每帧载荷。sizeof = 136、align = 8（Kotlin 镜像：SR_DISPATCH）。
 //
 // 约定（与 mcdr_dlss_input 一致，别改）：渲染尺寸是**渲染目标**尺寸、显示尺寸是**窗口**尺寸；jitter 是
@@ -456,7 +458,7 @@ typedef struct mcdr_sr_dispatch {
     int32_t reset;                // 56 1 = 丢弃历史
     int32_t hdrInput;             // 60 1 = 输入是 HDR 线性色
     int32_t backend;              // 64 MCDR_SR_BACKEND_*（0 = 用 SrPick 选的那个）
-    int32_t flags;                // 68 保留，必须为 0
+    int32_t flags;                // 68 MCDR_SR_FLAG_*；0 = 光栅 MV 含 jitter
     void* pColorInput;            // 72 渲染尺寸颜色
     void* pColorOutput;           // 80 显示尺寸颜色（UAV 写）
     void* pDepth;                 // 88 渲染尺寸深度
@@ -1084,6 +1086,8 @@ typedef struct mcdr_rt_track_stats {
 } mcdr_rt_track_stats;
 
 MCDR_API int32_t MCDR_CALL mcdr_dx12QueryRtTrackStats(mcdr_rt_track_stats* out);
+MCDR_API int32_t MCDR_CALL mcdr_dx12QuerySdkResourceState(mcdr_command_ctx* ctx,
+    mcdr_object* texture, uint64_t* values, int32_t count);
 
 typedef struct mcdr_barrier_desc {
     mcdr_object* resource;
@@ -1297,24 +1301,25 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12NrdInit(int32_t width, int32_t height, char*
                                             int32_t capacity);
 MCDR_API int32_t MCDR_CALL mcdr_dx12NrdShutdown(void);
 
-// 逐帧降噪派发（S4 4-c）：五张纹理按 motion / normal-roughness / viewZ / radiance-in /
-// radiance-out 的顺序传，matrices 是 4 个列主序 4x4（当前视投影、上一帧视投影、当前世界到视图、
-// 上一帧世界到视图）。返回派发的 pass 数，失败为 0 或 -2（没有打开的列表）。
 MCDR_API int32_t MCDR_CALL mcdr_dx12NrdDenoise(mcdr_command_ctx* ctx, mcdr_object* const* textures,
                                                int32_t textureCount, const float* matrices,
                                                uint32_t frameIndex, uint32_t resetHistory, char* outText,
                                                int32_t capacity);
 
+MCDR_API int32_t MCDR_CALL mcdr_dx12NrdDenoiseTemporal(
+    mcdr_command_ctx* ctx, mcdr_object* const* textures, int32_t textureCount,
+    const float* matrices, const float* jitter, uint32_t frameIndex, uint32_t resetHistory,
+    char* outText, int32_t capacity);
+
 // ---- DLSS-D / Ray Reconstruction 逐帧求值（S4 4-d） ------------------------
 //
 // 游戏进程里 NGX 由 Streamline 持有，所以这里必须走 slSetTagForFrame + slEvaluateFeature，不能自己调
 // NVSDK_NGX_D3D12_Init_*（同进程双 NGX 会撞 0xBAD00005）。textures 顺序：
-//   [0] 带噪辐亮度（color 输入） [1] 输出颜色 [2] 深度 [3] 运动矢量
-//   [4] 法线（packed 模式下是打包后的法线-粗糙度）
-//   [5] 粗糙度（仅 unpacked 模式，textureCount == 6）
+//   [0] 带噪线性颜色 [1] 输出颜色 [2] 正的线性 viewZ [3] 像素运动矢量
+//   [4] 原始世界空间法线 xyz / 粗糙度 w [5] diffuse albedo [6] specular albedo
 // width/height 是渲染尺寸，outputWidth/outputHeight 是输出尺寸（超分档位不同则两者不等）。
-// constants 是 slSetConstants 的载荷，72 个浮点：四个行主序 4x4（viewToClip / clipToView /
-// clipToPrevClip / prevClipToClip）+ near / far / fovY / aspect；行主序是 SL 的约定（float4x4 = row[4]）。
+// constants 有 104 个浮点：[0..63] 四个行主序重投影矩阵，[64..67] near/far/fovY/aspect，
+// [68..71] 当前/上一帧像素 jitter xy，[72..87] worldToView，[88..103] viewToWorld。
 // 返回 1=SL 接受 0=未执行（SL 缺函数/参数不全）-1=求值失败 -2=没有打开的命令列表；
 // outText 一行诊断，成功与失败都会写。
 MCDR_API int32_t MCDR_CALL mcdr_dx12DlssdEval(mcdr_command_ctx* ctx, mcdr_object* const* textures,
@@ -1323,6 +1328,25 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12DlssdEval(mcdr_command_ctx* ctx, mcdr_object
                                               uint32_t frameIndex, int32_t reset,
                                               const float* constants, char* outText,
                                               int32_t capacity);
+
+MCDR_API int32_t MCDR_CALL mcdr_dx12RtSrEval(mcdr_command_ctx* ctx, mcdr_object* const* textures,
+                                            int32_t textureCount, uint32_t width, uint32_t height,
+                                            uint32_t outputWidth, uint32_t outputHeight,
+                                            uint32_t frameIndex, int32_t reset,
+                                            const float* constants, char* outText,
+                                            int32_t capacity);
+
+MCDR_API int32_t MCDR_CALL mcdr_dx12DlssdEvalExposure(
+    mcdr_command_ctx* ctx, mcdr_object* const* textures, int32_t textureCount,
+    uint32_t width, uint32_t height, uint32_t outputWidth, uint32_t outputHeight,
+    uint32_t frameIndex, int32_t reset, const float* constants, const float* exposure,
+    char* outText, int32_t capacity);
+
+MCDR_API int32_t MCDR_CALL mcdr_dx12RtSrEvalExposure(
+    mcdr_command_ctx* ctx, mcdr_object* const* textures, int32_t textureCount,
+    uint32_t width, uint32_t height, uint32_t outputWidth, uint32_t outputHeight,
+    uint32_t frameIndex, int32_t reset, const float* constants, const float* exposure,
+    char* outText, int32_t capacity);
 
 #ifdef __cplusplus
 } // extern "C"

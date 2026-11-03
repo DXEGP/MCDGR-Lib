@@ -4,7 +4,7 @@
 // 输入分辨率每帧告诉它（Dynamic Input Resolution），init 只定 [min, max]；qualitySetting 按 doc 表格（1.3 起默认映射）
 // 从 display/render 比值取最近一档，对不上不报错。
 // 深度 reverse-Z → XESS_INIT_FLAG_INVERTED_DEPTH；MV 是渲染分辨率像素位移 → 不置 USE_NDC_VELOCITY / HIGH_RES_MV，
-// 但要置 XESS_INIT_FLAG_JITTERED_MV；v1 不接曝光纹理（exposureScale 直传 preExposure）。
+// 只有 MV 含 jitter 时才置 XESS_INIT_FLAG_JITTERED_MV；曝光倍率直传 preExposure。
 // 失败策略：每条失败路径最多一行日志并钉住状态，失败不让帧失败（调用方退回无超分）。
 module;
 #include "_d3d12_module_prelude.h"
@@ -210,6 +210,9 @@ void fillCapsFields(mcdr_sr_caps& out, bool available, const std::string& note) 
 class XessSrProvider final : public IUpscaleProvider {
 public:
     SrBackendId backend() const override { return SrBackendId::XeSS; }
+    bool motionVectorsJittered() const override {
+        return (initFlags_ & XESS_INIT_FLAG_JITTERED_MV) != 0;
+    }
 
     void fillCaps(mcdr_sr_caps& out) const override {
         std::string why;
@@ -237,6 +240,7 @@ public:
         }
         adoptSizes(seed.renderWidth, seed.renderHeight, seed.displayWidth, seed.displayHeight);
         maskExpected_ = seed.pReactiveMask != nullptr;
+        motionUnjittered_ = (seed.flags & MCDR_SR_FLAG_UNJITTERED_MV) != 0;
         return ensureContext(ctx);
     }
 
@@ -277,6 +281,15 @@ public:
             problem_ = "render size below the 320x180 minimum";
             return false;
         }
+        const bool unjittered = (dispatch.flags & MCDR_SR_FLAG_UNJITTERED_MV) != 0;
+        if (motionUnjittered_ != unjittered) {
+            if (handle_ != nullptr && !completion_.ready(ctx)) {
+                problem_ = "previous evaluation pending";
+                return false;
+            }
+            motionUnjittered_ = unjittered;
+            needsRecreate_ = true;
+        }
         if (mask == nullptr && maskExpected_) {
             // 掩码是 init 期开关（RESPONSIVE_PIXEL_MASK）：这一帧缺席就重建一次。
             maskExpected_ = false;
@@ -289,14 +302,17 @@ public:
                    dispatch.displayHeight);
         if (!ensureContext(ctx)) { return false; }
 
-        // XeSS 不替我们转输入输出（见文件头第 1 条）。走模块的状态跟踪过渡，不猜 Before 状态。
-        transitionTextureTo(ctx, color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        transitionTextureTo(ctx, depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        transitionTextureTo(ctx, motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        std::vector<SdkResourceAccess> accesses = {
+            {color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON},
+            {depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON},
+            {motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON},
+            {output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RENDER_TARGET}};
         if (mask != nullptr) {
-            transitionTextureTo(ctx, mask, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            accesses.push_back({mask, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                 D3D12_RESOURCE_STATE_COMMON});
         }
-        transitionTextureTo(ctx, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        SdkResourceScope resources(ctx, SdkResourceOwner::XeSS, std::move(accesses));
+        if (!resources) return false;
 
         xess_d3d12_execute_params_t params{};
         params.pColorTexture = color->resource.Get();
@@ -309,14 +325,14 @@ public:
         params.jitterOffsetX = dispatch.jitterOffsetX;
         params.jitterOffsetY = dispatch.jitterOffsetY;
         params.exposureScale = dispatch.preExposure > 0.0f ? dispatch.preExposure : 1.0f;
-        params.resetHistory = dispatch.reset != 0 ? 1u : 0u;
+        params.resetHistory = dispatch.reset != 0 || resetPending_ ? 1u : 0u;
         params.inputWidth = static_cast<uint32_t>(renderW_);
         params.inputHeight = static_cast<uint32_t>(renderH_);
         params.pDescriptorHeap = nullptr;            // 堆通过 init 的 pTempBufferHeap/pTempTextureHeap 给
 
+        completion_.record(ctx);
         const xess_result_t rc = runtime().api.execute(handle_, ctx->commandList, &params);
-        // 无论成功与否都得把输出交回 RENDER_TARGET（接口契约，GUI 还要当渲染目标用）。
-        transitionTextureTo(ctx, output, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        resources.reclaim();
         if (rc != XESS_RESULT_SUCCESS) {
             problem_ = "xessD3D12Execute failed rc=";
             problem_ += std::to_string(static_cast<int>(rc));
@@ -327,6 +343,7 @@ public:
             return false;
         }
         problem_.clear();
+        resetPending_ = false;
         return true;
     }
 
@@ -425,9 +442,7 @@ private:
         }
         if (handle_ != nullptr) {
             // 旧上下文的内部资源可能还在飞：先等 GPU 追平最后一次提交再销毁。只在首次建 / 换显示尺寸 / 越界 / 掩码开关变化时发生。
-            if (ctx != nullptr && ctx->fenceValue > 0) {
-                (void)waitForFenceValue(ctx, ctx->fenceValue, 2000000000ull);
-            }
+            if (!completion_.ready(ctx)) { problem_ = "previous evaluation pending"; return false; }
             destroyContext();
         }
 
@@ -457,7 +472,8 @@ private:
         inputMax_ = xess_2d_t{};
         const xess_quality_settings_t quality = pickQualityForSize(outputResolution, optimal);
 
-        uint32_t flags = XESS_INIT_FLAG_INVERTED_DEPTH | XESS_INIT_FLAG_JITTERED_MV;
+        uint32_t flags = XESS_INIT_FLAG_INVERTED_DEPTH;
+        if (!motionUnjittered_) { flags |= XESS_INIT_FLAG_JITTERED_MV; }
         if (maskExpected_) { flags |= XESS_INIT_FLAG_RESPONSIVE_PIXEL_MASK; }
 
         // 非阻塞的管线预建：init 会等它完成，先发出去能省一点排队时间。
@@ -495,6 +511,8 @@ private:
 
         builtDisplayW_ = displayW_;
         builtDisplayH_ = displayH_;
+        initFlags_ = flags;
+        resetPending_ = true;
         needsRecreate_ = false;
         std::string version;
         {
@@ -516,6 +534,8 @@ private:
         }
         builtDisplayW_ = 0;
         builtDisplayH_ = 0;
+        completion_.clear();
+        initFlags_ = 0;
         // 顺序要紧：上下文先没了，堆才能放（SDK 在上下文生命周期内持有这些堆上的资源）。
         tempBufferHeap_.Reset();
         tempTextureHeap_.Reset();
@@ -588,6 +608,10 @@ private:
     int32_t displayW_ = 0;
     int32_t displayH_ = 0;
     bool maskExpected_ = false;
+    bool motionUnjittered_ = false;
+    uint32_t initFlags_ = 0;
+    SrContextCompletion completion_;
+    bool resetPending_ = true;
     bool needsRecreate_ = false;
     std::string problem_;
     bool logged_ = false;

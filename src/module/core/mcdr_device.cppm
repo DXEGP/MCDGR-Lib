@@ -138,13 +138,6 @@ struct DeviceContext {
     ComPtr<ID3D12DescriptorHeap> samplerHeap;  // Sampler（SHADER_VISIBLE）
     ComPtr<ID3D12DescriptorHeap> drawHeap;     // P6：每帧瞬时 CBV/SRV 描述符（SHADER_VISIBLE，ring x2）
 
-    // compute 的 typed UAV 描述符堆（SHADER_VISIBLE，64 槽 ring，懒建）。root UAV 只支持 raw / structured
-    // buffer，`RWTexture2D` 这类 **typed** UAV 必须走描述符表 —— 声明成 ROOT_PARAMETER_TYPE_UAV 只会
-    // 拿到 E_INVALIDARG（0x80070057）。着色率图像本身就是 typed UAV（R8_UINT）。
-    ComPtr<ID3D12DescriptorHeap> computeUavHeap;  // 懒建
-    UINT computeUavStride = 0;
-    UINT computeUavNext = 0;
-
     // 当前挂在命令列表 SRI 槽位上的着色率图像。SHADING_RATE_SOURCE 只有「绑定期间」合法：解绑/换绑时必须转回 COMMON，否则读回、拷贝、UAV 全错配。
     Dx12Object* shadingRateImageBound = nullptr;
 
@@ -396,12 +389,16 @@ int dispatchComputeEx(CommandContext* ctx, Dx12Object* pipeline, Dx12Object* con
                       uint64_t cbvOffset, int32_t x, int32_t y, int32_t z);
     int nrdDenoise(CommandContext* ctx, Dx12Object* const* textures, int32_t textureCount,
                const float* matrices, uint32_t frameIndex, uint32_t resetHistory, char* outText,
-               int32_t capacity);
+               int32_t capacity, const float* jitter);
     // DLSS-D（S4 4-d）：5 张 = packed 法线-粗糙度，6 张 = 法线 + 粗糙度分开。
     int dlssdEval(CommandContext* ctx, Dx12Object* const* textures, int32_t textureCount,
                   uint32_t width, uint32_t height, uint32_t outputWidth, uint32_t outputHeight,
                   uint32_t frameIndex, int32_t reset, const float* constants, char* outText,
-                  int32_t capacity);
+                  int32_t capacity, const float* exposure);
+    int rtSrEval(CommandContext* ctx, Dx12Object* const* textures, int32_t textureCount,
+                 uint32_t width, uint32_t height, uint32_t outputWidth, uint32_t outputHeight,
+                 uint32_t frameIndex, int32_t reset, const float* constants, char* outText,
+                 int32_t capacity, const float* exposure);
 
 // 光线追踪状态对象（S3 3-f）：lib_6_x 库 + raygen/miss + 1..kMaxRtHitGroups 个 hit group；全局根签名与
 // compute 共用同一套四参数（SRV 表 / UAV 表 / b0 CBV / b1 八 dword）。
@@ -525,6 +522,15 @@ struct RtvDsvKeyHash {
     }
 };
 
+enum class SdkResourceOwner : uint32_t { None, Nrd, RayReconstruction, DlssSr, XeSS, Fsr };
+
+struct FrameUploadPage {
+    ComPtr<ID3D12Resource> resource;
+    uint8_t* mapped = nullptr;
+    uint64_t capacity = 0;
+    uint64_t used = 0;
+};
+
 struct CommandContext {
     ComPtr<ID3D12CommandAllocator> allocators[3];   // 三帧飞行，等待 value-2 后复用
     // command list 也是 3 路 ring，与 allocator 同槽位：录制帧 N 用帧 N-3 的槽位，只需等该槽位 fence。单条 list 会让主线程等上一帧 GPU 执行完才能 Reset。
@@ -539,6 +545,12 @@ struct CommandContext {
     UINT currentListSlot = 0;
     // 各槽位最后一次提交的 per-list fence 值。begin 时等本槽位的值，保证该槽位 list/allocator 不再被 GPU 引用后再 Reset。
     UINT64 slotFence[3] = {0, 0, 0};
+    std::array<std::vector<ComPtr<ID3D12DescriptorHeap>>, 3> computeDescriptorHeaps;
+    std::array<std::vector<FrameUploadPage>, 3> frameUploadPages;
+    std::array<std::vector<ComPtr<ID3D12Resource>>, 3> textureReadbackStaging;
+    size_t frameUploadPage = 0;
+    size_t computeDescriptorPage = 0;
+    UINT nextComputeDescriptor = 0;
     // 指向 commandLists[currentListSlot] 的裸指针，供全部录制调用点直接用（保持 `ctx->commandList->` 写法）。
     ID3D12GraphicsCommandList* commandList = nullptr;
 
@@ -568,6 +580,12 @@ struct CommandContext {
 
     // 本 list 内已过渡的资源状态（资源 → 当前状态）。beginCommandList 清空（上一 list 结束后提升状态已隐式 decay 回 COMMON）；绝不在 list 内显式回退 COMMON。
     std::unordered_map<ID3D12Resource*, D3D12_RESOURCE_STATES> resourceState;
+    std::unordered_map<ID3D12Resource*, SdkResourceOwner> externalResources;
+    uint64_t sdkAcquired = 0;
+    uint64_t sdkReleased = 0;
+    uint64_t sdkRejected = 0;
+    uint64_t sdkViolations = 0;
+    uint64_t sdkHeapRestores = 0;
     // 本 list 内被 transition 到 COPY_SOURCE 的 UPLOAD 堆 staging buffer；endCommandList 必须回切 GENERIC_READ（下一帧 begin 以此为初始假设）。
     std::unordered_set<ID3D12Resource*> stagingCopySourceResources;
 
@@ -681,6 +699,39 @@ void transitionBufferTo(CommandContext* ctx, Dx12Object* buf, D3D12_RESOURCE_STA
 // 底层过渡：直接接受 ID3D12Resource*，用于 swapchain back buffer 等不在 Dx12Object 里的资源。
 void transitionTo(CommandContext* ctx, ID3D12Resource* res, D3D12_RESOURCE_STATES fromInitial,
                   D3D12_RESOURCE_STATES to);
+
+struct SdkResourceAccess {
+    Dx12Object* texture;
+    D3D12_RESOURCE_STATES sdkState;
+    D3D12_RESOURCE_STATES engineState;
+};
+
+struct SdkRawResourceAccess {
+    ID3D12Resource* resource;
+    D3D12_RESOURCE_STATES sdkState;
+    D3D12_RESOURCE_STATES engineState;
+};
+
+class SdkResourceScope {
+public:
+    SdkResourceScope(CommandContext* ctx, SdkResourceOwner owner,
+                     std::vector<SdkResourceAccess> resources);
+    SdkResourceScope(CommandContext* ctx, SdkResourceOwner owner,
+                     std::vector<SdkRawResourceAccess> resources);
+    ~SdkResourceScope();
+    SdkResourceScope(const SdkResourceScope&) = delete;
+    SdkResourceScope& operator=(const SdkResourceScope&) = delete;
+    explicit operator bool() const { return acquired_; }
+    void reclaim();
+
+private:
+    CommandContext* ctx_;
+    std::vector<SdkRawResourceAccess> resources_;
+    bool acquired_ = false;
+};
+
+int querySdkResourceState(CommandContext* ctx, Dx12Object* texture, uint64_t* values,
+                          int32_t count);
 
 // clear 颜色纹理（整纹理，RENDER_ATTACHMENT）。
 mcdr::Result<void> clearColorTexture(CommandContext* ctx, Dx12Object* tex, float r, float g, float b, float a);
@@ -857,6 +908,17 @@ enum class SrBackendId : int32_t {
     XeSS = 3,
 };
 
+class SrContextCompletion {
+public:
+    bool ready(CommandContext* ctx) const;
+    void record(CommandContext* ctx);
+    void clear();
+
+private:
+    ComPtr<ID3D12Fence> fence_;
+    UINT64 value_ = 0;
+};
+
 class IUpscaleProvider {
 public:
     IUpscaleProvider() = default;
@@ -865,6 +927,7 @@ public:
     virtual ~IUpscaleProvider() = default;
 
     virtual SrBackendId backend() const = 0;
+    virtual bool motionVectorsJittered() const { return true; }
     // 填能力表（`note` 由实现写；清零与 `backend` 字段由注册表负责）。
     virtual void fillCaps(mcdr_sr_caps& out) const = 0;
     // 建。失败时不得留下任何设备状态改动（调用方会保持既有路径）。`seed` 带首批尺寸：DLSS 的 feature

@@ -14,15 +14,22 @@ extern "C" int32_t mcdr_nrd_context_shutdown(void);
 // 逐帧派发用的一帧参数。纹理都是引擎的 ID3D12Resource*；矩阵是列主序、非抖动。
 struct mcdr_nrd_frame {
     void* list;               // ID3D12GraphicsCommandList*，必须已经打开
+    void* completionFence;
+    uint64_t completionValue;
     void* motion;             // IN_MV，像素单位
     void* normalRoughness;    // IN_NORMAL_ROUGHNESS，R10G10B10A2 打包值（我们存 RGBA16F）
     void* viewZ;              // IN_VIEWZ，R32_FLOAT，视线投影距离
     void* radianceIn;         // IN_DIFF_RADIANCE_HITDIST
     void* radianceOut;        // OUT_DIFF_RADIANCE_HITDIST
+    void* specularIn;
+    void* specularOut;
+    void* validationOutput;
     float viewToClip[16];
     float viewToClipPrev[16];
     float worldToView[16];
     float worldToViewPrev[16];
+    float cameraJitter[2];
+    float cameraJitterPrev[2];
     uint32_t frameIndex;
     // 1 = 这一帧丢掉历史（切轨道、改分辨率、首帧），0 = 继续累积。
     uint32_t resetHistory;

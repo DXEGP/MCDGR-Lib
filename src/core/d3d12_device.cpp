@@ -2291,8 +2291,6 @@ PFun_slSetD3DDevice* gSlSetDevice = nullptr;
 PFun_slIsFeatureLoaded* gSlIsLoaded = nullptr;
 }
 
-// SL 的 NGX 后端要求一个**数字** applicationId：只给 engine/engineVersion 时 SL 直接拒绝，随后 "Missing NGX
-// context" ⇒ kFeatureDLSS 永远 not loaded（0x1F）。这里取 modid 的 FNV-1a 32 位哈希（稳定可复现）。
 constexpr uint32_t fnv1a32(const char* s, uint32_t h = 2166136261u) {
     return (*s == '\0')
                ? h
@@ -2338,9 +2336,9 @@ void streamlineInitEarly() {
                                 sl::kFeatureDLSS_G, sl::kFeatureDLSS_RR };
     sl::Preferences pref{};
     pref.engine = sl::EngineType::eCustom;
-    pref.engineVersion = "1.0.0";
+    pref.engineVersion = "1.0";
     pref.applicationId = fnv1a32("dxr_mc");  // = modid 的 FNV-1a 哈希
-    pref.projectId = "";
+    pref.projectId = "7c1f4a52-9b3e-4d68-8f21-5a6c0e2d9b74";
     pref.renderAPI = sl::RenderAPI::eD3D12;
     pref.logLevel = sl::LogLevel::eDefault;
     pref.pathsToPlugins = paths;
@@ -2464,14 +2462,16 @@ void applyStreamline(ID3D12Device* device) {
                 const sl::Result r = optimal(opt, settings);
                 rrdResult = static_cast<unsigned>(r);
                 if (r == sl::Result::eOk) {
-                    renderWidth = settings.renderWidthMin;
-                    renderHeight = settings.renderHeightMin;
+                    renderWidth = settings.optimalRenderWidth;
+                    renderHeight = settings.optimalRenderHeight;
                 }
             }
         }
-        dbgLogInfo("streamline: dlssd supported=%d load=0x%X optimal=%ux%u call=0x%X",
-                   rrSupport, static_cast<unsigned>(rrLoad), static_cast<unsigned>(renderWidth),
-                   static_cast<unsigned>(renderHeight), rrdResult);
+        dbgLogInfo("streamline: dlssd supported=%d loaded=%d optimal=%ux%u",
+                   rrSupport == static_cast<int>(sl::Result::eOk) ? 1 : 0,
+                   rrLoaded ? 1 : 0, renderWidth, renderHeight);
+        dbgLogDebug("streamline: dlssd support=0x%X load=0x%X optimal=0x%X",
+                    static_cast<unsigned>(rrSupport), static_cast<unsigned>(rrLoad), rrdResult);
     }
 
     }
@@ -3156,7 +3156,69 @@ bool accelList(CommandContext* ctx, const char* where, ComPtr<ID3D12GraphicsComm
     return true;
 }
 
-// 结果/scratch 缓冲的公共校验：必须是 default 堆缓冲，且大小不小于查询值。
+mcdr::Result<D3D12_GPU_VIRTUAL_ADDRESS> snapshotUploadBuffer(
+    CommandContext* ctx, Dx12Object* source, uint64_t offset, uint64_t bytes) {
+    if (!ctx || !ctx->listOpen || !source || source->kind != Dx12Object::Kind::Buffer ||
+        !source->resource || bytes == 0 || offset > static_cast<uint64_t>(source->size) ||
+        bytes > static_cast<uint64_t>(source->size) - offset) {
+        return mcdr::err("rt upload", "rt upload: invalid buffer range");
+    }
+    if (source->heapType != D3D12_HEAP_TYPE_UPLOAD) {
+        return source->resource->GetGPUVirtualAddress() + offset;
+    }
+    constexpr uint64_t alignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+    constexpr uint64_t pageBytes = 64ull * 1024ull;
+    const uint64_t alignedBytes = (bytes + alignment - 1) & ~(alignment - 1);
+    auto& pages = ctx->frameUploadPages[ctx->currentListSlot];
+    while (ctx->frameUploadPage < pages.size() &&
+        alignedBytes > pages[ctx->frameUploadPage].capacity - pages[ctx->frameUploadPage].used) {
+        ++ctx->frameUploadPage;
+    }
+    if (ctx->frameUploadPage == pages.size()) {
+        FrameUploadPage page;
+        page.capacity = std::max(pageBytes, alignedBytes);
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        heap.CreationNodeMask = 1;
+        heap.VisibleNodeMask = 1;
+        D3D12_RESOURCE_DESC description{};
+        description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        description.Width = page.capacity;
+        description.Height = 1;
+        description.DepthOrArraySize = 1;
+        description.MipLevels = 1;
+        description.SampleDesc.Count = 1;
+        description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        auto status = gCtx.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &description,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&page.resource));
+        if (FAILED(status)) return mcdr::err("rt upload", "rt upload: allocation failed");
+        void* mapped = nullptr;
+        const D3D12_RANGE emptyRange{};
+        status = page.resource->Map(0, &emptyRange, &mapped);
+        if (FAILED(status)) return mcdr::err("rt upload", "rt upload: page map failed");
+        page.mapped = static_cast<uint8_t*>(mapped);
+        pages.push_back(std::move(page));
+    }
+    void* sourceData = source->mappedPtr;
+    const bool temporaryMap = sourceData == nullptr;
+    if (temporaryMap) {
+        const D3D12_RANGE readRange{static_cast<SIZE_T>(offset), static_cast<SIZE_T>(offset + bytes)};
+        if (FAILED(source->resource->Map(0, &readRange, &sourceData))) {
+            return mcdr::err("rt upload", "rt upload: source map failed");
+        }
+    }
+    auto& page = pages[ctx->frameUploadPage];
+    std::memcpy(page.mapped + page.used, static_cast<const uint8_t*>(sourceData) + offset,
+        static_cast<size_t>(bytes));
+    if (temporaryMap) {
+        const D3D12_RANGE emptyRange{};
+        source->resource->Unmap(0, &emptyRange);
+    }
+    const auto address = page.resource->GetGPUVirtualAddress() + page.used;
+    page.used += alignedBytes;
+    return address;
+}
+
 bool accelStorage(Dx12Object* obj, const char* where, const char* role, unsigned long long need,
                   bool allowUpload = false) {
     if (obj == nullptr || obj->kind != Dx12Object::Kind::Buffer || !obj->resource) {
@@ -3345,6 +3407,13 @@ mcdr::Result<void> buildBlas(CommandContext* ctx, Dx12Object* dest, Dx12Object* 
     desc.ScratchAccelerationStructureData = scratch->resource->GetGPUVirtualAddress();
     desc.SourceAccelerationStructureData =
         update ? dest->resource->GetGPUVirtualAddress() : 0ull;
+    for (int geometryIndex = 0; geometryIndex < count; ++geometryIndex) {
+        transitionBufferTo(ctx, static_cast<Dx12Object*>(geometries[geometryIndex].vertexBuffer),
+                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        transitionBufferTo(ctx, static_cast<Dx12Object*>(geometries[geometryIndex].indexBuffer),
+                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    transitionBufferTo(ctx, scratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list4->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
     // 建完必须给 UAV 屏障，否则后续 TLAS 构建或着色器读到的可能是半成品。
     accelBarrier(list4.Get(), dest->resource.Get());
@@ -3367,15 +3436,22 @@ mcdr::Result<void> buildTlas(CommandContext* ctx, Dx12Object* dest, Dx12Object* 
     if (instanceCount <= 0) {
         return mcdr::err("buildTlas", "buildTlas: instance count must be positive");
     }
+    auto instanceSnapshot = snapshotUploadBuffer(ctx, instances, 0,
+        static_cast<uint64_t>(instanceCount) * sizeof(D3D12_RAYTRACING_INSTANCE_DESC));
+    if (!instanceSnapshot) return std::unexpected(instanceSnapshot.error());
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc{};
     desc.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
     desc.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
     desc.Inputs.NumDescs = static_cast<UINT>(instanceCount);
-    desc.Inputs.InstanceDescs = instances->resource->GetGPUVirtualAddress();
+    desc.Inputs.InstanceDescs = *instanceSnapshot;
     // TLAS 每帧重建，不做增量：加 ALLOW_UPDATE 只多付一次拷贝，实际从不 refit。
     desc.Inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
     desc.DestAccelerationStructureData = dest->resource->GetGPUVirtualAddress();
     desc.ScratchAccelerationStructureData = scratch->resource->GetGPUVirtualAddress();
+    if (instances->heapType == D3D12_HEAP_TYPE_DEFAULT) {
+        transitionBufferTo(ctx, instances, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    transitionBufferTo(ctx, scratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list4->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
     // 同一帧的 DispatchRays 会把它当 SRV 读，缺这条屏障等于读未完成的 TLAS。
     accelBarrier(list4.Get(), dest->resource.Get());
@@ -3859,6 +3935,10 @@ mcdr::Result<void> flushAndWait(ID3D12CommandList* list, const char* where) {
 void transitionTo(CommandContext* ctx, ID3D12Resource* res, D3D12_RESOURCE_STATES fromInitial,
                   D3D12_RESOURCE_STATES to) {
     if (!ctx || !res) return;
+    if (ctx->externalResources.contains(res)) {
+        ++ctx->sdkViolations;
+        return;
+    }
     auto& m = ctx->resourceState;
     D3D12_RESOURCE_STATES from;
     auto it = m.find(res);
@@ -3892,6 +3972,133 @@ void transitionBufferTo(CommandContext* ctx, Dx12Object* buf, D3D12_RESOURCE_STA
 void transitionTextureTo(CommandContext* ctx, Dx12Object* tex, D3D12_RESOURCE_STATES to) {
     if (!tex || !tex->resource) return;
     transitionTo(ctx, tex->resource.Get(), D3D12_RESOURCE_STATE_COMMON, to);
+}
+
+SdkResourceScope::SdkResourceScope(CommandContext* ctx, SdkResourceOwner owner,
+                                   std::vector<SdkResourceAccess> resources)
+    : SdkResourceScope(ctx, owner, [&resources] {
+        std::vector<SdkRawResourceAccess> raw;
+        raw.reserve(resources.size());
+        for (const auto& access : resources) {
+            raw.push_back({access.texture != nullptr && access.texture->kind == Dx12Object::Kind::Texture
+                               ? access.texture->resource.Get() : nullptr,
+                           access.sdkState, access.engineState});
+        }
+        return raw;
+    }()) {}
+
+SdkResourceScope::SdkResourceScope(CommandContext* ctx, SdkResourceOwner owner,
+                                   std::vector<SdkRawResourceAccess> resources)
+    : ctx_(ctx), resources_(std::move(resources)) {
+    if (ctx_ == nullptr) return;
+    const auto reject = [this] { ++ctx_->sdkRejected; };
+    if (!ctx_->listOpen || !ctx_->commandList || ctx_->inRenderPass ||
+        owner == SdkResourceOwner::None || resources_.empty()) {
+        reject();
+        return;
+    }
+    std::unordered_set<ID3D12Resource*> unique;
+    for (const auto& access : resources_) {
+        if (access.resource == nullptr) {
+            reject();
+            return;
+        }
+        auto* resource = access.resource;
+        const auto description = resource->GetDesc();
+        const bool write = access.sdkState == D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        if (!unique.insert(resource).second || ctx_->externalResources.contains(resource) ||
+            description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+            description.MipLevels != 1 || description.DepthOrArraySize != 1 ||
+            description.SampleDesc.Count != 1 ||
+            (write && !(description.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) ||
+            (!write && (description.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))) {
+            reject();
+            return;
+        }
+    }
+    std::vector<D3D12_RESOURCE_BARRIER> barriers;
+    barriers.reserve(resources_.size());
+    for (const auto& access : resources_) {
+        auto* resource = access.resource;
+        const auto found = ctx_->resourceState.find(resource);
+        const auto before = found == ctx_->resourceState.end()
+            ? D3D12_RESOURCE_STATE_COMMON : found->second;
+        D3D12_RESOURCE_BARRIER barrier{};
+        if (before != access.sdkState) {
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                  before, access.sdkState};
+            mcdr_rt_track_transition(resource, static_cast<uint32_t>(before),
+                                     static_cast<uint32_t>(access.sdkState),
+                                     D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+            barriers.push_back(barrier);
+        } else if (before == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            barrier.UAV.pResource = resource;
+            mcdr_rt_track_uav(resource);
+            barriers.push_back(barrier);
+        }
+        ctx_->resourceState[resource] = access.sdkState;
+        ctx_->externalResources.emplace(resource, owner);
+    }
+    if (!barriers.empty()) {
+        ctx_->commandList->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+    }
+    ++ctx_->sdkAcquired;
+    acquired_ = true;
+}
+
+SdkResourceScope::~SdkResourceScope() { reclaim(); }
+
+void SdkResourceScope::reclaim() {
+    if (!acquired_) return;
+    std::vector<D3D12_RESOURCE_BARRIER> barriers;
+    barriers.reserve(resources_.size());
+    for (const auto& access : resources_) {
+        auto* resource = access.resource;
+        ctx_->resourceState[resource] = access.sdkState;
+        ctx_->externalResources.erase(resource);
+        if (access.sdkState != access.engineState) {
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                  access.sdkState, access.engineState};
+            mcdr_rt_track_transition(resource, static_cast<uint32_t>(access.sdkState),
+                                     static_cast<uint32_t>(access.engineState),
+                                     D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+            barriers.push_back(barrier);
+        }
+        ctx_->resourceState[resource] = access.engineState;
+    }
+    if (!barriers.empty()) {
+        ctx_->commandList->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+    }
+    restoreDrawHeap(ctx_);
+    ctx_->cachedPso = nullptr;
+    ++ctx_->sdkHeapRestores;
+    ++ctx_->sdkReleased;
+    acquired_ = false;
+}
+
+int querySdkResourceState(CommandContext* ctx, Dx12Object* texture, uint64_t* values,
+                          int32_t count) {
+    if (ctx == nullptr || texture == nullptr || texture->kind != Dx12Object::Kind::Texture ||
+        !texture->resource || values == nullptr || count != 8)
+        return 0;
+    auto* resource = texture->resource.Get();
+    const auto state = ctx->resourceState.find(resource);
+    const auto owner = ctx->externalResources.find(resource);
+    values[0] = static_cast<uint64_t>(state == ctx->resourceState.end()
+        ? D3D12_RESOURCE_STATE_COMMON : state->second);
+    values[1] = static_cast<uint64_t>(owner == ctx->externalResources.end()
+        ? SdkResourceOwner::None : owner->second);
+    values[2] = ctx->sdkAcquired;
+    values[3] = ctx->sdkReleased;
+    values[4] = ctx->sdkRejected;
+    values[5] = ctx->externalResources.size();
+    values[6] = ctx->sdkViolations;
+    values[7] = ctx->sdkHeapRestores;
+    return 1;
 }
 
 // 阻塞等待 GPU 队列空闲：Signal 新 fence 并等完成。用于销毁 swapchain/设备前，等待有界（5s）。
@@ -3984,6 +4191,10 @@ void destroyCommandEncoder(CommandContext* ctx) {
 }
 
 mcdr::Result<void> beginCommandList(CommandContext* ctx) {
+    if (ctx != nullptr && !ctx->externalResources.empty()) {
+        ++ctx->sdkViolations;
+        return mcdr::err("beginCommandList", "SDK resources remain externally owned");
+    }
     if (!ctx) {
         return mcdr::err("beginCommandList", "beginCommandList: null ctx");
     }
@@ -4190,15 +4401,16 @@ mcdr::Result<void> beginCommandListWithWait(CommandContext* ctx, UINT64 waitForV
         }
         dbgLogDebug("beginCommandListWithWait: wait done");
     }
-    if (waitForValue > 0) {
-        auto wl = waitForFenceValue(ctx, waitForValue, 5'000'000'000ULL);
+    const UINT64 reuseValue = std::max(waitForValue, ctx->slotFence[ctx->currentListSlot]);
+    if (reuseValue > 0) {
+        auto wl = waitForContextFenceValue(ctx, reuseValue, 5'000'000'000ULL);
         if (!wl) {
             dbgLogError("beginCommandListWithWait: per-list fence wait FAILED: %s",
                         errorMessage(wl.error()).c_str());
             return mcdr::err("beginCommandListWithWait", errorMessage(wl.error()));
         }
         dbgLogDebug("beginCommandListWithWait: per-list fence wait done val=%llu",
-                    static_cast<unsigned long long>(waitForValue));
+                    static_cast<unsigned long long>(reuseValue));
     }
     dbgLogDebug("beginCommandListWithWait: begin allocator reset");
     HRESULT hr = ctx->currentAllocator()->Reset();
@@ -4212,6 +4424,11 @@ mcdr::Result<void> beginCommandListWithWait(CommandContext* ctx, UINT64 waitForV
         return mcdr::err("beginCommandListWithWait", "beginCommandListWithWait: list Reset " + hrText(hr));
     }
     dbgLogDebug("beginCommandListWithWait: list reset ok");
+    ctx->computeDescriptorPage = 0;
+    ctx->nextComputeDescriptor = 0;
+    ctx->frameUploadPage = 0;
+    for (auto& page : ctx->frameUploadPages[ctx->currentListSlot]) page.used = 0;
+    ctx->textureReadbackStaging[ctx->currentListSlot].clear();
     // Reset 之后列表就是 D3D12 默认的 1X1；只有 Java 侧的 scope（setShadingRateNow）才会把某一批绘制改粗。
     dbgLogDebug("beginCommandListWithWait: pre-increment ctx=%p", reinterpret_cast<void*>(ctx));
     ctx->listOpen = 1;
@@ -4257,6 +4474,10 @@ mcdr::Result<void> endCommandList(CommandContext* ctx) {
         return mcdr::err("endCommandList", "endCommandList: null ctx");
     }
     if (!ctx->listOpen) return {};  // 幂等
+    if (!ctx->externalResources.empty()) {
+        ++ctx->sdkViolations;
+        return mcdr::err("endCommandList", "SDK resources remain externally owned");
+    }
     // 采样纹理在本 list 内被 transition 到 SHADER_RESOURCE 后，列表结束必须回切 COMMON，以维持「列表结束一切资源
     // 回 COMMON」的约定。否则下一 list 按 COMMON 写 Before 状态，与 GPU 上遗留的 SHADER_RESOURCE 错配 → 每帧验证 ERROR。
     for (auto it = ctx->resourceState.begin(); it != ctx->resourceState.end();) {
@@ -4928,52 +5149,77 @@ mcdr::Result<void> copyTextureToBuffer(CommandContext* ctx, Dx12Object* srcTex, 
     if (w <= 0 || h <= 0) {
         return mcdr::err("copyTextureToBuffer", "copyTextureToBuffer: non-positive size");
     }
-    UINT block = blockSizeFor(srcTex->dxgiFormat);
-    UINT rowBytes = static_cast<UINT>(w) * block;
+    const auto description = srcTex->resource->GetDesc();
+    if (mip < 0 || mip >= description.MipLevels || layer < 0 || layer >= description.DepthOrArraySize ||
+        srcX < 0 || srcY < 0 || static_cast<UINT64>(srcX) + w > std::max(1ull, description.Width >> mip) ||
+        static_cast<UINT64>(srcY) + h > std::max(1u, description.Height >> mip)) {
+        return mcdr::err("copyTextureToBuffer", "copyTextureToBuffer: invalid source region");
+    }
+    const UINT64 rowBytes = static_cast<UINT64>(w) * blockSizeFor(srcTex->dxgiFormat);
+    const UINT64 destinationSize = static_cast<UINT64>(dstBuf->size);
+    if (dstOffset < 0 || static_cast<UINT64>(dstOffset) > destinationSize ||
+        rowBytes * h > destinationSize - static_cast<UINT64>(dstOffset)) {
+        return mcdr::err("copyTextureToBuffer", "copyTextureToBuffer: destination buffer too small");
+    }
+    constexpr UINT64 pitchAlignment = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+    const UINT64 rowPitch = (rowBytes + pitchAlignment - 1) & ~(pitchAlignment - 1);
+    if (rowPitch > UINT_MAX) {
+        return mcdr::err("copyTextureToBuffer", "copyTextureToBuffer: row pitch too large");
+    }
+    const bool aligned = rowPitch == rowBytes && dstOffset % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT == 0;
+    ComPtr<ID3D12Resource> staging;
+    if (!aligned) {
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        heap.CreationNodeMask = 1;
+        heap.VisibleNodeMask = 1;
+        D3D12_RESOURCE_DESC stagingDescription{};
+        stagingDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        stagingDescription.Width = rowPitch * h;
+        stagingDescription.Height = 1;
+        stagingDescription.DepthOrArraySize = 1;
+        stagingDescription.MipLevels = 1;
+        stagingDescription.SampleDesc.Count = 1;
+        stagingDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const auto status = gCtx.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
+            &stagingDescription, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&staging));
+        if (FAILED(status)) {
+            return mcdr::err("copyTextureToBuffer", "copyTextureToBuffer: staging allocation failed");
+        }
+        ctx->textureReadbackStaging[ctx->currentListSlot].push_back(staging);
+    }
 
     transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COPY_SOURCE);
     transitionBufferTo(ctx, dstBuf, D3D12_RESOURCE_STATE_COPY_DEST);
 
-    UINT subresource = static_cast<UINT>(mip + layer * srcTex->resource->GetDesc().MipLevels);
-    // 客户端按紧凑行距访问读回数据，读回 buffer 也只分配了紧凑大小；RowPitch 未 256 对齐时逐行紧凑拷贝。
-    constexpr UINT kPitchAlign = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
-    bool aligned = (rowBytes % kPitchAlign) == 0;
-    if (dstOffset + static_cast<UINT64>(rowBytes) * h > static_cast<UINT64>(dstBuf->size)) {
-        return mcdr::err("copyTextureToBuffer", "copyTextureToBuffer: destination buffer too small");
-    }
-
     D3D12_TEXTURE_COPY_LOCATION src{};
     src.pResource = srcTex->resource.Get();
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    src.SubresourceIndex = subresource;
-    if (aligned) {
-        D3D12_TEXTURE_COPY_LOCATION dst{};
-        dst.pResource = dstBuf->resource.Get();
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        dst.PlacedFootprint.Offset = static_cast<UINT64>(dstOffset);
-        dst.PlacedFootprint.Footprint.Format = srcTex->dxgiFormat;
-        dst.PlacedFootprint.Footprint.Width = static_cast<UINT>(w);
-        dst.PlacedFootprint.Footprint.Height = static_cast<UINT>(h);
-        dst.PlacedFootprint.Footprint.Depth = 1;
-        dst.PlacedFootprint.Footprint.RowPitch = rowBytes;
-        D3D12_BOX srcBox{static_cast<UINT>(srcX),     static_cast<UINT>(srcY),     0,
-                         static_cast<UINT>(srcX + w), static_cast<UINT>(srcY + h), 1};
-        ctx->commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, &srcBox);
-    } else {
-        // 逐行拷贝：目标 buffer 紧凑布局，RowPitch=rowBytes（每行 1 像素高）。
+    src.SubresourceIndex = static_cast<UINT>(mip + layer * description.MipLevels);
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = aligned ? dstBuf->resource.Get() : staging.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Offset = aligned ? static_cast<UINT64>(dstOffset) : 0;
+    dst.PlacedFootprint.Footprint.Format = srcTex->dxgiFormat;
+    dst.PlacedFootprint.Footprint.Width = static_cast<UINT>(w);
+    dst.PlacedFootprint.Footprint.Height = static_cast<UINT>(h);
+    dst.PlacedFootprint.Footprint.Depth = 1;
+    dst.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(rowPitch);
+    D3D12_BOX srcBox{static_cast<UINT>(srcX), static_cast<UINT>(srcY), 0,
+        static_cast<UINT>(srcX + w), static_cast<UINT>(srcY + h), 1};
+    ctx->commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, &srcBox);
+    if (!aligned) {
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = staging.Get();
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        ctx->commandList->ResourceBarrier(1, &barrier);
         for (int row = 0; row < h; ++row) {
-            D3D12_TEXTURE_COPY_LOCATION dst{};
-            dst.pResource = dstBuf->resource.Get();
-            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            dst.PlacedFootprint.Offset = static_cast<UINT64>(dstOffset) + static_cast<UINT64>(row) * rowBytes;
-            dst.PlacedFootprint.Footprint.Format = srcTex->dxgiFormat;
-            dst.PlacedFootprint.Footprint.Width = static_cast<UINT>(w);
-            dst.PlacedFootprint.Footprint.Height = 1;
-            dst.PlacedFootprint.Footprint.Depth = 1;
-            dst.PlacedFootprint.Footprint.RowPitch = rowBytes;
-            D3D12_BOX srcBox{static_cast<UINT>(srcX),     static_cast<UINT>(srcY + row),     0,
-                             static_cast<UINT>(srcX + w), static_cast<UINT>(srcY + row + 1), 1};
-            ctx->commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, &srcBox);
+            ctx->commandList->CopyBufferRegion(dstBuf->resource.Get(),
+                static_cast<UINT64>(dstOffset) + static_cast<UINT64>(row) * rowBytes,
+                staging.Get(), static_cast<UINT64>(row) * rowPitch, rowBytes);
         }
     }
     // 源纹理显式回切 COMMON：显式进入的 COPY_SOURCE 不会随命令列表完成 decay。
@@ -5318,39 +5564,44 @@ static std::string sm69RequirementText() {
 
 // ---- compute 最小通路 ----
 // 根签名固定为 root UAV u0 + 8 个根常量 b0（避开描述符堆与跨模块根签名布局）。compute 跑在普通 DIRECT 列表上，可与图形命令同列表
-//（SRI 生成、NRC 都依赖）。typed UAV/SRV 必须经描述符表绑定 —— root descriptor 只支持 raw / structured buffer；堆懒建、64 槽 ring，
-// 同帧多次 dispatch 各占各的格。
-bool ensureComputeHeap() {
-    if (gCtx.computeUavHeap) return true;
-    D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
-    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heapDesc.NumDescriptors = 64;
-    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    const HRESULT hr =
-        gCtx.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&gCtx.computeUavHeap));
-    if (FAILED(hr)) {
-        dbgLogError("compute: CreateDescriptorHeap hr=0x%s", hrText(hr).c_str());
-        return false;
+struct ComputeDescriptorAllocation {
+    ID3D12DescriptorHeap* heap = nullptr;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu{};
+    UINT stride = 0;
+};
+
+ComputeDescriptorAllocation allocateComputeDescriptors(CommandContext* ctx, UINT count) {
+    constexpr UINT descriptorsPerPage = 256;
+    if (count == 0 || count > descriptorsPerPage) return {};
+    if (ctx->nextComputeDescriptor + count > descriptorsPerPage) {
+        ++ctx->computeDescriptorPage;
+        ctx->nextComputeDescriptor = 0;
     }
-    gCtx.computeUavStride =
-        gCtx.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    gCtx.computeUavNext = 0;
-    dbgLogInfo("compute: descriptor heap ready (64 slots, stride=%u)", gCtx.computeUavStride);
-    return true;
-}
-
-UINT computeHeapSlot() { return gCtx.computeUavNext++ % 64; }
-
-D3D12_CPU_DESCRIPTOR_HANDLE computeHeapCpu(UINT slot) {
-    D3D12_CPU_DESCRIPTOR_HANDLE h = gCtx.computeUavHeap->GetCPUDescriptorHandleForHeapStart();
-    h.ptr += static_cast<SIZE_T>(slot) * gCtx.computeUavStride;
-    return h;
-}
-
-D3D12_GPU_DESCRIPTOR_HANDLE computeHeapGpu(UINT slot) {
-    D3D12_GPU_DESCRIPTOR_HANDLE h = gCtx.computeUavHeap->GetGPUDescriptorHandleForHeapStart();
-    h.ptr += static_cast<UINT64>(slot) * gCtx.computeUavStride;
-    return h;
+    auto& pages = ctx->computeDescriptorHeaps[ctx->currentListSlot];
+    if (ctx->computeDescriptorPage == pages.size()) {
+        D3D12_DESCRIPTOR_HEAP_DESC description{};
+        description.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        description.NumDescriptors = descriptorsPerPage;
+        description.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        ComPtr<ID3D12DescriptorHeap> heap;
+        const HRESULT result = gCtx.device->CreateDescriptorHeap(&description, IID_PPV_ARGS(&heap));
+        if (FAILED(result)) {
+            dbgLogError("compute: descriptor allocation failed (0x%s)", hrText(result).c_str());
+            return {};
+        }
+        pages.push_back(std::move(heap));
+    }
+    ComputeDescriptorAllocation allocation;
+    allocation.heap = pages[ctx->computeDescriptorPage].Get();
+    allocation.stride = gCtx.device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    allocation.cpu = allocation.heap->GetCPUDescriptorHandleForHeapStart();
+    allocation.gpu = allocation.heap->GetGPUDescriptorHandleForHeapStart();
+    allocation.cpu.ptr += static_cast<SIZE_T>(ctx->nextComputeDescriptor) * allocation.stride;
+    allocation.gpu.ptr += static_cast<UINT64>(ctx->nextComputeDescriptor) * allocation.stride;
+    ctx->nextComputeDescriptor += count;
+    return allocation;
 }
 
 mcdr::Result<void*> createComputePipeline(const void* dxil, int32_t dxilSize) {
@@ -5447,6 +5698,12 @@ int submitBarriers(CommandContext* ctx, const void* descs, int32_t count) {
     out.reserve(static_cast<size_t>(count));
     for (int32_t i = 0; i < count; ++i) {
         const mcdr_barrier_desc& d = src[i];
+        if ((d.resource && ctx->externalResources.contains(d.resource->resource.Get())) ||
+            (d.resourceAfter && ctx->externalResources.contains(d.resourceAfter->resource.Get())) ||
+            (d.kind == 1 && d.resource == nullptr && !ctx->externalResources.empty())) {
+            ++ctx->sdkViolations;
+            return 0;
+        }
         D3D12_RESOURCE_BARRIER b{};
         if (d.kind == 0) {
             if (d.resource == nullptr || !d.resource->resource) {
@@ -5520,13 +5777,10 @@ int dispatchCompute(CommandContext* ctx, Dx12Object* pipeline, Dx12Object* uavTe
     }
 
     ID3D12GraphicsCommandList* list = ctx->commandList;
-    // typed UAV 必须经描述符表绑定（见根签名 uavRange）。堆懒建、64 槽 ring，一次 dispatch 占一格。
-    if (!ensureComputeHeap()) {
-        return 0;
-    }
-    const UINT uavSlot = computeHeapSlot();
-    const D3D12_CPU_DESCRIPTOR_HANDLE uavCpu = computeHeapCpu(uavSlot);
-    const D3D12_GPU_DESCRIPTOR_HANDLE uavGpu = computeHeapGpu(uavSlot);
+    const auto descriptors = allocateComputeDescriptors(ctx, 1);
+    if (descriptors.heap == nullptr) return 0;
+    const D3D12_CPU_DESCRIPTOR_HANDLE uavCpu = descriptors.cpu;
+    const D3D12_GPU_DESCRIPTOR_HANDLE uavGpu = descriptors.gpu;
     D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
     uavDesc.Format = uavTexture->dxgiFormat;
     uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
@@ -5538,7 +5792,7 @@ int dispatchCompute(CommandContext* ctx, Dx12Object* pipeline, Dx12Object* uavTe
     transitionTextureTo(ctx, uavTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list->SetPipelineState(pipeline->computePipelineState.Get());
     list->SetComputeRootSignature(pipeline->computeRootSignature.Get());
-    ID3D12DescriptorHeap* heaps[1] = {gCtx.computeUavHeap.Get()};
+    ID3D12DescriptorHeap* heaps[1] = {descriptors.heap};
     list->SetDescriptorHeaps(1, heaps);
     list->SetComputeRootDescriptorTable(0, uavGpu);
     if (constantCount > 0) {
@@ -5546,7 +5800,6 @@ int dispatchCompute(CommandContext* ctx, Dx12Object* pipeline, Dx12Object* uavTe
     }
     list->Dispatch(static_cast<UINT>(x), static_cast<UINT>(y), static_cast<UINT>(z));
     transitionTextureTo(ctx, uavTexture, D3D12_RESOURCE_STATE_COMMON);
-    // 上面把堆切成了 computeUavHeap。命令列表级状态不回退，同列表后续走瞬时 SRV 的绘制会撞 "descriptor heap ... different"；这里把主堆绑回来。
     restoreDrawHeap(ctx);
     return 1;
 }
@@ -5668,18 +5921,29 @@ bool bindComputeStyle(CommandContext* ctx, ID3D12GraphicsCommandList* list, ID3D
                       Dx12Object* const* srvs, int32_t srvCount, Dx12Object* const* uavs,
                       int32_t uavCount, const int32_t* constants, int32_t constantCount,
                       Dx12Object* cbv, uint64_t cbvOffset, bool setRoot = true) {
-    if (!ensureComputeHeap()) return false;
-    const UINT total = static_cast<UINT>(srvCount + uavCount);
-    UINT base = computeHeapSlot();
-    if (base + total > 64) {
-        base = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS constantAddress = 0;
+    if (cbv != nullptr) {
+        if (cbv->kind != Dx12Object::Kind::Buffer || !cbv->resource || cbv->size <= 0 ||
+            cbvOffset % D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT != 0 ||
+            cbvOffset >= static_cast<uint64_t>(cbv->size)) {
+            dbgLogError("rt constants: invalid buffer range");
+            return false;
+        }
+        const auto constantBytes = std::min(static_cast<uint64_t>(cbv->size) - cbvOffset, uint64_t{65536});
+        auto snapshot = snapshotUploadBuffer(ctx, cbv, cbvOffset, constantBytes);
+        if (!snapshot) {
+            dbgLogError("rt constants: snapshot failed");
+            return false;
+        }
+        constantAddress = *snapshot;
     }
-    gCtx.computeUavNext = base + total;
-
-    const D3D12_CPU_DESCRIPTOR_HANDLE first = computeHeapCpu(base);
+    const UINT total = static_cast<UINT>(srvCount + uavCount);
+    const auto descriptors = allocateComputeDescriptors(ctx, total);
+    if (descriptors.heap == nullptr) return false;
+    const D3D12_CPU_DESCRIPTOR_HANDLE first = descriptors.cpu;
     for (int32_t i = 0; i < srvCount; ++i) {
         D3D12_CPU_DESCRIPTOR_HANDLE dst = first;
-        dst.ptr += static_cast<SIZE_T>(i) * gCtx.computeUavStride;
+        dst.ptr += static_cast<SIZE_T>(i) * descriptors.stride;
         if (srvs[i]->cpuHandle.ptr != 0) {
             gCtx.device->CopyDescriptorsSimple(1, dst, srvs[i]->cpuHandle,
                                                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -5705,7 +5969,7 @@ bool bindComputeStyle(CommandContext* ctx, ID3D12GraphicsCommandList* list, ID3D
     }
     for (int32_t i = 0; i < uavCount; ++i) {
         D3D12_CPU_DESCRIPTOR_HANDLE dst = first;
-        dst.ptr += static_cast<SIZE_T>(srvCount + i) * gCtx.computeUavStride;
+        dst.ptr += static_cast<SIZE_T>(srvCount + i) * descriptors.stride;
         D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
         if (uavs[i]->kind == Dx12Object::Kind::Buffer) {
             uavDesc.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -5736,16 +6000,17 @@ bool bindComputeStyle(CommandContext* ctx, ID3D12GraphicsCommandList* list, ID3D
     }
 
     if (setRoot) list->SetComputeRootSignature(root);
-    ID3D12DescriptorHeap* heaps[1] = {gCtx.computeUavHeap.Get()};
+    ID3D12DescriptorHeap* heaps[1] = {descriptors.heap};
     list->SetDescriptorHeaps(1, heaps);
     if (srvCount > 0) {
-        list->SetComputeRootDescriptorTable(0, computeHeapGpu(base));
+        list->SetComputeRootDescriptorTable(0, descriptors.gpu);
     }
     if (uavCount > 0) {
-        list->SetComputeRootDescriptorTable(1, computeHeapGpu(base + static_cast<UINT>(srvCount)));
+        auto uavHandle = descriptors.gpu;
+        uavHandle.ptr += static_cast<UINT64>(srvCount) * descriptors.stride;
+        list->SetComputeRootDescriptorTable(1, uavHandle);
     }
-    list->SetComputeRootConstantBufferView(
-        2, cbv != nullptr ? cbv->resource->GetGPUVirtualAddress() + cbvOffset : 0);
+    list->SetComputeRootConstantBufferView(2, constantAddress);
     if (constantCount > 0) {
         list->SetComputeRoot32BitConstants(3, static_cast<UINT>(constantCount), constants, 0);
     }
@@ -5796,7 +6061,7 @@ int dispatchComputeEx(CommandContext* ctx, Dx12Object* pipeline, Dx12Object* con
         return 0;
     }
     // 纹理和缓冲都可以进描述符表：缓冲走 raw view（HLSL 侧是 ByteAddressBuffer /
-    // RWByteAddressBuffer），这是 B-Mega 线性扫描读顶点池的唯一办法。加速结构的 SRV 自带描述符
+    // RWByteAddressBuffer），这是硬件追踪着色器读取镜像顶点池的接口。加速结构的 SRV 自带描述符
     // （AccelStructView），既不是纹理也不是缓冲，但要允许它进来，否则 RayQuery 那一路绑不上 TLAS。
     for (int32_t i = 0; i < srvCount; ++i) {
         if (srvs[i] == nullptr) {
@@ -5845,17 +6110,13 @@ int dispatchComputeEx(CommandContext* ctx, Dx12Object* pipeline, Dx12Object* con
     for (int32_t i = 0; i < srvCount; ++i) {
         transitionTextureTo(ctx, srvs[i], D3D12_RESOURCE_STATE_COMMON);
     }
-    // 描述符堆是命令列表级状态：不切回主堆，之后每条走瞬时 SRV 的绘制都会拿 drawHeap 的句柄配
-    // computeUavHeap（调试层 #708），且根表按错误的堆解释。
     restoreDrawHeap(ctx);
     return 1;
 }
 
-// NRD 逐帧派发（S4 4-c）：纹理先回 COMMON（NRD 自己按 pass 用 SRV/UAV，靠 COMMON 的自动
-// 提升/衰减），派发完仍留在 COMMON，与 dispatchComputeEx 收尾的做法一致。
 int nrdDenoise(CommandContext* ctx, Dx12Object* const* textures, int32_t textureCount,
                const float* matrices, uint32_t frameIndex, uint32_t resetHistory, char* outText,
-               int32_t capacity) {
+               int32_t capacity, const float* jitter) {
     if (outText != nullptr && capacity > 0) {
         outText[0] = '\0';
     }
@@ -5863,24 +6124,34 @@ int nrdDenoise(CommandContext* ctx, Dx12Object* const* textures, int32_t texture
         dbgLogError("nrdDenoise: called without an open command list");
         return -2;
     }
-    if (textures == nullptr || textureCount < 5 || matrices == nullptr) {
-        dbgLogError("nrdDenoise: expects 5 textures and 4 matrices");
+    if (textures == nullptr || textureCount != 7 || matrices == nullptr) {
+        dbgLogError("nrdDenoise: expects 7 textures and 4 matrices");
         return 0;
     }
-    for (int32_t i = 0; i < textureCount; ++i) {
-        if (textures[i] == nullptr || textures[i]->kind != Dx12Object::Kind::Texture) {
-            dbgLogError("nrdDenoise: texture %d is not a texture", i);
-            return 0;
+    if (jitter != nullptr) {
+        for (int32_t index = 0; index < 4; ++index) {
+            if (!std::isfinite(jitter[index]) || std::abs(jitter[index]) > 0.5f) return 0;
         }
-        transitionTextureTo(ctx, textures[i], D3D12_RESOURCE_STATE_COMMON);
     }
+    std::vector<SdkResourceAccess> accesses;
+    for (int32_t index = 0; index < textureCount; ++index) {
+        accesses.push_back({textures[index], index == 4 || index == 6
+            ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COMMON});
+    }
+    SdkResourceScope resources(ctx, SdkResourceOwner::Nrd, std::move(accesses));
+    if (!resources) return 0;
     mcdr_nrd_frame frame{};
     frame.list = ctx->commandList;
+    frame.completionFence = ctx->fence.Get();
+    frame.completionValue = ctx->fenceValue + 1;
     frame.motion = textures[0]->resource.Get();
     frame.normalRoughness = textures[1]->resource.Get();
     frame.viewZ = textures[2]->resource.Get();
     frame.radianceIn = textures[3]->resource.Get();
     frame.radianceOut = textures[4]->resource.Get();
+    frame.specularIn = textures[5]->resource.Get();
+    frame.specularOut = textures[6]->resource.Get();
     for (int i = 0; i < 16; ++i) {
         frame.viewToClip[i] = matrices[i];
         frame.viewToClipPrev[i] = matrices[16 + i];
@@ -5889,11 +6160,97 @@ int nrdDenoise(CommandContext* ctx, Dx12Object* const* textures, int32_t texture
     }
     frame.frameIndex = frameIndex;
     frame.resetHistory = resetHistory;
-    const int32_t result = mcdr_nrd_dispatch(&frame, outText, capacity);
-    for (int32_t i = 0; i < textureCount; ++i) {
-        transitionTextureTo(ctx, textures[i], D3D12_RESOURCE_STATE_COMMON);
+    if (jitter != nullptr) {
+        frame.cameraJitter[0] = jitter[0];
+        frame.cameraJitter[1] = jitter[1];
+        frame.cameraJitterPrev[0] = jitter[2];
+        frame.cameraJitterPrev[1] = jitter[3];
     }
-    restoreDrawHeap(ctx);
+    const int32_t result = mcdr_nrd_dispatch(&frame, outText, capacity);
+    resources.reclaim();
+    return result;
+}
+
+static bool validRtJitter(const float* constants) {
+    if (constants == nullptr) return false;
+    for (int32_t index = 68; index < 72; ++index) {
+        if (!std::isfinite(constants[index]) || std::abs(constants[index]) > 0.5f) return false;
+    }
+    return true;
+}
+
+static bool validRtExposureInputs(CommandContext* ctx, Dx12Object* const* textures,
+    int32_t textureCount, int32_t baseCount, uint32_t width, uint32_t height,
+    uint32_t outputWidth, uint32_t outputHeight, const float* exposure) {
+    if (textures == nullptr || (textureCount != baseCount &&
+        (exposure == nullptr || textureCount != baseCount + 1))) return false;
+    if (exposure != nullptr) {
+        for (int32_t index = 0; index < 2; ++index) {
+            if (!std::isfinite(exposure[index]) || exposure[index] < 0x1p-16f ||
+                exposure[index] > 0x1p16f) return false;
+        }
+    }
+    std::unordered_set<ID3D12Resource*> unique;
+    for (int32_t index = 0; index < textureCount; ++index) {
+        const auto* texture = textures[index];
+        if (texture == nullptr || texture->kind != Dx12Object::Kind::Texture || !texture->resource) return false;
+        auto* resource = texture->resource.Get();
+        const auto description = resource->GetDesc();
+        const uint32_t expectedWidth = index == baseCount ? 1u : index == 1 ? outputWidth : width;
+        const uint32_t expectedHeight = index == baseCount ? 1u : index == 1 ? outputHeight : height;
+        if (!unique.insert(resource).second || ctx->externalResources.contains(resource) ||
+            description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+            description.MipLevels != 1 || description.DepthOrArraySize != 1 || description.SampleDesc.Count != 1 ||
+            description.Width != expectedWidth || description.Height != expectedHeight ||
+            (index == 1 && !(description.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) ||
+            (index != 1 && (description.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) ||
+            (index == baseCount && description.Format != DXGI_FORMAT_R32_FLOAT)) return false;
+    }
+    return true;
+}
+
+int rtSrEval(CommandContext* ctx, Dx12Object* const* textures, int32_t textureCount,
+             uint32_t width, uint32_t height, uint32_t outputWidth, uint32_t outputHeight,
+             uint32_t frameIndex, int32_t reset, const float* constants, char* outText,
+             int32_t capacity, const float* exposure) {
+    if (outText != nullptr && capacity > 0) outText[0] = '\0';
+    if (ctx == nullptr || !ctx->commandList || !ctx->listOpen || ctx->inRenderPass) return -2;
+    if (!validRtJitter(constants) || width == 0u ||
+        height == 0u || outputWidth == 0u || outputHeight == 0u) return 0;
+    if (!validRtExposureInputs(ctx, textures, textureCount, 4, width, height,
+                               outputWidth, outputHeight, exposure)) return 0;
+    if (mcdr_rt_prepare_exposure(0, textureCount == 5, ctx->fence.Get(), ctx->fenceValue + 1,
+                                 outText, capacity) <= 0) return 0;
+    std::vector<SdkResourceAccess> accesses;
+    for (int32_t index = 0; index < textureCount; ++index) {
+        accesses.push_back({textures[index], index == 1 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                                                       : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_COMMON});
+    }
+    SdkResourceScope resources(ctx, SdkResourceOwner::DlssSr, std::move(accesses));
+    if (!resources) return 0;
+    mcdr_dlssd_frame frame{};
+    frame.list = ctx->commandList;
+    frame.radiance = textures[0]->resource.Get();
+    frame.output = textures[1]->resource.Get();
+    frame.depth = textures[2]->resource.Get();
+    frame.motion = textures[3]->resource.Get();
+    frame.exposure = textureCount == 5 ? textures[4]->resource.Get() : nullptr;
+    frame.completionFence = ctx->fence.Get();
+    frame.completionValue = ctx->fenceValue + 1;
+    if (exposure != nullptr) {
+        frame.preExposure = exposure[0];
+        frame.exposureScale = exposure[1];
+    }
+    frame.constants = constants;
+    frame.width = width;
+    frame.height = height;
+    frame.outputWidth = outputWidth;
+    frame.outputHeight = outputHeight;
+    frame.frameIndex = frameIndex;
+    frame.reset = reset;
+    const int32_t result = mcdr_dlss_sr_eval(&frame, outText, capacity);
+    resources.reclaim();
     return result;
 }
 
@@ -5903,29 +6260,31 @@ int nrdDenoise(CommandContext* ctx, Dx12Object* const* textures, int32_t texture
 int dlssdEval(CommandContext* ctx, Dx12Object* const* textures, int32_t textureCount,
               uint32_t width, uint32_t height, uint32_t outputWidth, uint32_t outputHeight,
               uint32_t frameIndex, int32_t reset, const float* constants, char* outText,
-              int32_t capacity) {
+              int32_t capacity, const float* exposure) {
     if (outText != nullptr && capacity > 0) {
         outText[0] = '\0';
     }
-    if (ctx == nullptr || !ctx->commandList || !ctx->listOpen) {
+    if (ctx == nullptr || !ctx->commandList || !ctx->listOpen || ctx->inRenderPass) {
         dbgLogError("dlssdEval: called without an open command list");
         return -2;
     }
-    // 5 张 = packed（normal 就是打包后的法线-粗糙度），6 张 = unpacked（多一张粗糙度）。
-    if (textures == nullptr || (textureCount != 5 && textureCount != 6)) {
-        dbgLogError("dlssdEval: expects 5 or 6 textures");
+    if (!validRtJitter(constants) || width == 0u ||
+        height == 0u || outputWidth == 0u || outputHeight == 0u) {
+        dbgLogError("RR: invalid frame inputs");
         return 0;
     }
-    for (int32_t i = 0; i < textureCount; ++i) {
-        if (textures[i] == nullptr || textures[i]->kind != Dx12Object::Kind::Texture) {
-            dbgLogError("dlssdEval: texture %d is not a texture", i);
-            return 0;
-        }
+    if (!validRtExposureInputs(ctx, textures, textureCount, 8, width, height,
+                               outputWidth, outputHeight, exposure)) return 0;
+    if (mcdr_rt_prepare_exposure(1, textureCount == 9, ctx->fence.Get(), ctx->fenceValue + 1,
+                                 outText, capacity) <= 0) return 0;
+    std::vector<SdkResourceAccess> accesses;
+    for (int32_t index = 0; index < textureCount; ++index) {
+        accesses.push_back({textures[index], index == 1 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                                                       : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_COMMON});
     }
-    for (int32_t i = 0; i < textureCount; ++i) {
-        transitionTextureTo(ctx, textures[i], i == 1 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-                                                    : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    }
+    SdkResourceScope resources(ctx, SdkResourceOwner::RayReconstruction, std::move(accesses));
+    if (!resources) return 0;
     mcdr_dlssd_frame frame{};
     frame.list = ctx->commandList;
     frame.radiance = textures[0]->resource.Get();
@@ -5933,7 +6292,16 @@ int dlssdEval(CommandContext* ctx, Dx12Object* const* textures, int32_t textureC
     frame.depth = textures[2]->resource.Get();
     frame.motion = textures[3]->resource.Get();
     frame.normal = textures[4]->resource.Get();
-    frame.roughness = textureCount == 6 ? textures[5]->resource.Get() : nullptr;
+    frame.diffuseAlbedo = textures[5]->resource.Get();
+    frame.specularAlbedo = textures[6]->resource.Get();
+    frame.specularHitDistance = textures[7]->resource.Get();
+    frame.exposure = textureCount == 9 ? textures[8]->resource.Get() : nullptr;
+    frame.completionFence = ctx->fence.Get();
+    frame.completionValue = ctx->fenceValue + 1;
+    if (exposure != nullptr) {
+        frame.preExposure = exposure[0];
+        frame.exposureScale = exposure[1];
+    }
     frame.constants = constants;
     frame.width = width;
     frame.height = height;
@@ -5942,10 +6310,7 @@ int dlssdEval(CommandContext* ctx, Dx12Object* const* textures, int32_t textureC
     frame.frameIndex = frameIndex;
     frame.reset = reset;
     const int32_t result = mcdr_dlssd_eval(&frame, outText, capacity);
-    for (int32_t i = 0; i < textureCount; ++i) {
-        transitionTextureTo(ctx, textures[i], D3D12_RESOURCE_STATE_COMMON);
-    }
-    restoreDrawHeap(ctx);
+    resources.reclaim();
     return result;
 }
 
@@ -6373,29 +6738,27 @@ int dispatchComputeShadingRate(CommandContext* ctx, Dx12Object* pipeline, Dx12Ob
         return 0;
     }
 
-    if (!ensureComputeHeap()) return 0;
+    const auto descriptors = allocateComputeDescriptors(ctx, 4);
+    if (descriptors.heap == nullptr) return 0;
     ID3D12GraphicsCommandList* list = ctx->commandList;
 
-    // 三张 SRV 必须落在同一条连续区间（根参数 [0] 是 3 个描述符的表）。
-    const UINT srvSlot = computeHeapSlot();
-    const UINT uavSlot = srvSlot + 3;
-    gCtx.computeUavNext = srvSlot + 4;
-    const D3D12_CPU_DESCRIPTOR_HANDLE srvCpu = computeHeapCpu(srvSlot);
-    const D3D12_CPU_DESCRIPTOR_HANDLE uavCpu = computeHeapCpu(uavSlot);
+    const D3D12_CPU_DESCRIPTOR_HANDLE srvCpu = descriptors.cpu;
+    auto uavCpu = descriptors.cpu;
+    uavCpu.ptr += 3 * descriptors.stride;
     if (srvDepth->cpuHandle.ptr != 0) {
         gCtx.device->CopyDescriptorsSimple(1, srvCpu, srvDepth->cpuHandle,
                                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
     if (srvMotion->cpuHandle.ptr != 0) {
         D3D12_CPU_DESCRIPTOR_HANDLE second{};
-        second.ptr = srvCpu.ptr + gCtx.computeUavStride;
+        second.ptr = srvCpu.ptr + descriptors.stride;
         gCtx.device->CopyDescriptorsSimple(1, second, srvMotion->cpuHandle,
                                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
     // t2 = 上一帧的着色率图像。没有历史时也要放一张有效描述符：着色器由 constants 的 bit1 决定要不要读它。
     if (srvPrevious->cpuHandle.ptr != 0) {
         D3D12_CPU_DESCRIPTOR_HANDLE third{};
-        third.ptr = srvCpu.ptr + 2 * gCtx.computeUavStride;
+        third.ptr = srvCpu.ptr + 2 * descriptors.stride;
         gCtx.device->CopyDescriptorsSimple(1, third, srvPrevious->cpuHandle,
                                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     } else {
@@ -6425,17 +6788,18 @@ int dispatchComputeShadingRate(CommandContext* ctx, Dx12Object* pipeline, Dx12Ob
 
     list->SetPipelineState(pipeline->computePipelineState.Get());
     list->SetComputeRootSignature(pipeline->computeRootSignature.Get());
-    ID3D12DescriptorHeap* heaps[1] = {gCtx.computeUavHeap.Get()};
+    ID3D12DescriptorHeap* heaps[1] = {descriptors.heap};
     list->SetDescriptorHeaps(1, heaps);
-    list->SetComputeRootDescriptorTable(0, computeHeapGpu(srvSlot));
-    list->SetComputeRootDescriptorTable(1, computeHeapGpu(uavSlot));
+    list->SetComputeRootDescriptorTable(0, descriptors.gpu);
+    auto uavGpu = descriptors.gpu;
+    uavGpu.ptr += 3 * descriptors.stride;
+    list->SetComputeRootDescriptorTable(1, uavGpu);
     if (constantCount > 0) {
         list->SetComputeRoot32BitConstants(2, static_cast<UINT>(constantCount), constants, 0);
     }
     list->Dispatch(static_cast<UINT>(x), static_cast<UINT>(y), static_cast<UINT>(z));
     // 图像留在 COMMON：绑定前由 setShadingRateImage 单独转到 SHADING_RATE_SOURCE。
     transitionTextureTo(ctx, image, D3D12_RESOURCE_STATE_COMMON);
-    // 着色率图像这条 compute 派发同样把堆切成 computeUavHeap，必须切回主堆（见 dispatchComputeEx）。
     restoreDrawHeap(ctx);
     return 1;
 }
@@ -7164,6 +7528,26 @@ mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBi
     }
     UINT count = static_cast<UINT>(bindings.size());
     if (count == 0) return {};
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> constantAddresses(count);
+    for (size_t bindingIndex = 0; bindingIndex < bindings.size(); ++bindingIndex) {
+        const auto& binding = bindings[bindingIndex];
+        if (binding.type != 0) continue;
+        const auto* buffer = binding.buffer;
+        if (!buffer || buffer->kind != Dx12Object::Kind::Buffer || !buffer->resource ||
+            binding.offset < 0 || binding.offset >= buffer->size || binding.offset % 256 != 0 ||
+            binding.length < 0 || binding.length > 65536 || binding.length > buffer->size - binding.offset) {
+            return mcdr::err("pushDescriptors", "graphics constants: invalid buffer range");
+        }
+    }
+    for (size_t bindingIndex = 0; bindingIndex < bindings.size(); ++bindingIndex) {
+        const auto& binding = bindings[bindingIndex];
+        if (binding.type != 0) continue;
+        const auto bytes = binding.length > 0 ? static_cast<uint64_t>(binding.length) :
+            std::min(static_cast<uint64_t>(binding.buffer->size - binding.offset), uint64_t{65536});
+        auto snapshot = snapshotUploadBuffer(ctx, binding.buffer, static_cast<uint64_t>(binding.offset), bytes);
+        if (!snapshot) return mcdr::err("pushDescriptors", "graphics constants: snapshot failed");
+        constantAddresses[bindingIndex] = *snapshot;
+    }
     // CBV 走 root descriptor（不占堆槽位），只有 SRV 需要写瞬时描述符堆。
     UINT cbvCount = 0;
     UINT srvCount = 0;
@@ -7254,8 +7638,7 @@ mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBi
                                      "pushDescriptors: invalid buffer for CBV entry " + std::to_string(i));
                 }
                 transitionBufferTo(ctx, b.buffer, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
-                D3D12_GPU_VIRTUAL_ADDRESS va =
-                    b.buffer->resource->GetGPUVirtualAddress() + static_cast<UINT64>(b.offset);
+                const D3D12_GPU_VIRTUAL_ADDRESS va = constantAddresses[i];
                 // CBV 的 GPU 地址必须 256 字节对齐（root descriptor 同一条约束）。缓冲基址永远对齐，问题只可能出在 b.offset：
                 // 不放行的话调试层只报 "pBufferLocation must be 256-byte aligned"，零售驱动下则是 shader 读到错位数据。
                 constexpr UINT64 kCbvAlignment = 256;
@@ -7582,6 +7965,13 @@ mcdr::Result<void> drawMeshlets(CommandContext* ctx, Dx12Object* vertexBuffer, l
     if (meshletsLength > 0 && meshletsLength > remainingToEnd(meshlets, meshletsOffset)) {
         return mcdr::err(kApi, "meshletDispatch: meshlet range overflow");
     }
+    if (globalsOffset < 0 || globalsOffset >= globals->size || globalsOffset % 256 != 0 ||
+        globals->size - globalsOffset < 32) {
+        return mcdr::err(kApi, "mesh constants: invalid buffer range");
+    }
+    auto globalsSnapshot = snapshotUploadBuffer(ctx, globals, static_cast<uint64_t>(globalsOffset),
+        std::min(static_cast<uint64_t>(globals->size - globalsOffset), uint64_t{256}));
+    if (!globalsSnapshot) return mcdr::err(kApi, "mesh constants: snapshot failed");
 
     const UINT slotCount = 3u;
     if (ctx->nextDrawSlot + slotCount > syncRingCapacity()) {
@@ -7611,13 +8001,7 @@ mcdr::Result<void> drawMeshlets(CommandContext* ctx, Dx12Object* vertexBuffer, l
     gpuRoot.ptr += base;
     ctx->commandList->SetGraphicsRootDescriptorTable(ctx->currentPipeline->geometryParam, gpuRoot);
 
-    const D3D12_GPU_VIRTUAL_ADDRESS globalsVA =
-        globals->resource->GetGPUVirtualAddress() + static_cast<UINT64>(globalsOffset);
-    if (globalsVA % 256ULL != 0) {
-        return mcdr::err(kApi, std::string("meshletDispatch: globals root CBV is not 256-byte aligned (offset=") +
-                                   std::to_string(globalsOffset) + ")");
-    }
-    ctx->commandList->SetGraphicsRootConstantBufferView(ctx->currentPipeline->segmentParam, globalsVA);
+    ctx->commandList->SetGraphicsRootConstantBufferView(ctx->currentPipeline->segmentParam, *globalsSnapshot);
 
     ComPtr<ID3D12GraphicsCommandList6> list6;
     if (FAILED(ctx->commandList->QueryInterface(IID_PPV_ARGS(&list6))) || !list6) {
@@ -9506,9 +9890,15 @@ mcdr::Result<void> smaaEnsureWorldResult(const D3D12_RESOURCE_DESC& srcDesc) {
     if (!gCtx.smaaRtvHeap) {
         return mcdr::err("smaaEnsureWorldResult", "RTV heap not created (smaaEnsureTargets must run first)");
     }
-    if (gCtx.smaaWorldResult && gCtx.smaaWorldResultFormat == srcDesc.Format &&
-        gCtx.smaaWidth == srcDesc.Width && gCtx.smaaHeight == srcDesc.Height) {
-        return {};
+    if (gCtx.smaaWorldResult) {
+        const auto existing = gCtx.smaaWorldResult->GetDesc();
+        if (existing.Dimension == srcDesc.Dimension && existing.Width == srcDesc.Width &&
+            existing.Height == srcDesc.Height && existing.DepthOrArraySize == srcDesc.DepthOrArraySize &&
+            existing.MipLevels == srcDesc.MipLevels && existing.Format == srcDesc.Format &&
+            existing.SampleDesc.Count == srcDesc.SampleDesc.Count &&
+            existing.SampleDesc.Quality == srcDesc.SampleDesc.Quality) {
+            return {};
+        }
     }
 
     D3D12_RESOURCE_DESC desc = srcDesc;  // 宽高 / mip / array / 格式全部对齐，CopyResource 才合法
@@ -9958,14 +10348,34 @@ bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
     if (!ctx || !ctx->listOpen || ctx->commandList == nullptr) {
         return false;
     }
-    if (in.pInColor == nullptr || in.pInDepth == nullptr || in.pInMotionVectors == nullptr ||
-        in.pInOutput == nullptr) {
-        return false;
+    std::unordered_set<ID3D12Resource*> unique;
+    for (auto* handle : {in.pInColor, in.pInDepth, in.pInMotionVectors, in.pInOutput}) {
+        auto* texture = reinterpret_cast<Dx12Object*>(handle);
+        if (texture == nullptr || texture->kind != Dx12Object::Kind::Texture || !texture->resource) {
+            ++ctx->sdkRejected;
+            return false;
+        }
+        const auto description = texture->resource->GetDesc();
+        if (!unique.insert(texture->resource.Get()).second ||
+            ctx->externalResources.contains(texture->resource.Get()) ||
+            description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || description.MipLevels != 1 ||
+            description.DepthOrArraySize != 1 || description.SampleDesc.Count != 1 ||
+            (handle != in.pInOutput && (description.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))) {
+            ++ctx->sdkRejected;
+            return false;
+        }
     }
+    if (gCtx.dlssOutputOverride != nullptr && gCtx.dlssOutputOverride != in.pInOutput) {
+        auto* output = reinterpret_cast<Dx12Object*>(gCtx.dlssOutputOverride);
+        if (output->kind != Dx12Object::Kind::Texture || !output->resource ||
+            unique.contains(output->resource.Get()) || ctx->externalResources.contains(output->resource.Get()) ||
+            !(output->resource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+            ++ctx->sdkRejected;
+            return false;
+        }
+    }
+    if (ctx->inRenderPass && !endRenderPass(ctx)) return false;
     wireDlssImpl();
-    // 四个 pIn* 是 JVM 侧的 **Dx12Object* 包装句柄**，**不是** ID3D12Resource*。实现单元是普通 TU、看不到 Dx12Object 的布局，
-    // 只能把句柄原样交给 NGX —— NGX 拿到包装体地址，lpVtbl 读出来是垃圾/0，首次 mv->GetDesc() 就 AV reading 0x50 崩溃。
-    // **解包必须在本模块里做**：这里知道真实布局（ComPtr<ID3D12Resource> resource），取出裸指针再往下传。
     auto unwrapResource = [](mcdr_object* handle) -> void* {
         auto* obj = reinterpret_cast<Dx12Object*>(handle);
         return obj != nullptr ? reinterpret_cast<void*>(obj->resource.Get()) : nullptr;
@@ -9975,28 +10385,6 @@ bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
     resolved.pInDepth = reinterpret_cast<mcdr_object*>(unwrapResource(in.pInDepth));
     resolved.pInMotionVectors = reinterpret_cast<mcdr_object*>(unwrapResource(in.pInMotionVectors));
     resolved.pInOutput = reinterpret_cast<mcdr_object*>(unwrapResource(in.pInOutput));
-    dbgLogInfo("dlss unwrap %p/%p/%p/%p -> %p/%p/%p/%p",
-               resolved.pInColor, resolved.pInDepth, resolved.pInMotionVectors, resolved.pInOutput,
-               static_cast<void*>(in.pInColor), static_cast<void*>(in.pInDepth),
-               static_cast<void*>(in.pInMotionVectors), static_cast<void*>(in.pInOutput));
-    // 运动矢量缺失时 DLSS 无法工作：显式降级（打一次 INFO），而不是把空资源交给 NGX。
-    if (resolved.pInColor == nullptr || resolved.pInDepth == nullptr || resolved.pInOutput == nullptr) {
-        static bool s_loggedMissing = false;
-        if (!s_loggedMissing) {
-            s_loggedMissing = true;
-            dbgLogWarn("dlss skipped: color/depth/out not a live texture (%p/%p/%p)",
-                       resolved.pInColor, resolved.pInDepth, resolved.pInOutput);
-        }
-        return false;
-    }
-    if (resolved.pInMotionVectors == nullptr) {
-        static bool s_loggedNoMv = false;
-        if (!s_loggedNoMv) {
-            s_loggedNoMv = true;
-            dbgLogWarn("dlss skipped: no motion vectors this frame");
-        }
-        return false;
-    }
     // DLSS 的初始化与建特征都必须在**命令列表打开**时做（CreateFeature 会录制 NGX 自己的命令），所以走这里。
     if (mcdr_dlss_can_run(reinterpret_cast<void*>(gCtx.device.Get())) != 1) {
         return false;  // 失败已经一次性 WARN 过；保持既有路径
@@ -10026,18 +10414,30 @@ bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
     }
     const int32_t created = mcdr_dlss_create(reinterpret_cast<void*>(ctx->commandList), &resolved,
                                              tl, ctx);
+    restoreDrawHeap(ctx);
+    ctx->cachedPso = nullptr;
     if (created != 1) {
         return false;
     }
-    // NGX 录制一次 COMPUTE dispatch，而 D3D12 禁止在 render target 仍绑定时这么做 —— 这是 DXGI_ERROR_INVALID_CALL(0x887A0001) 的
-    // 经典来源。结束未关闭的 pass 会把所有附件回切 COMMON，dispatch 才合法。
-    if (ctx->inRenderPass) {
-        // 谁留下未结束的 pass 必须写进日志，否则 pass 状态与调用点对不上。
-        dbgLogWarn("dlss: closed a render pass left open before evaluate");
-        (void)endRenderPass(ctx);
-    }
-    // 这里**不**用显式 OMSetRenderTargets(0, nullptr, ...)：本 TU 的命令列表句柄对该调用不是普通 ID3D12GraphicsCommandList*。
-    const int32_t evaluated = mcdr_dlss_evaluate(reinterpret_cast<void*>(ctx->commandList), &resolved, tl, ctx);
+    const DlssSdkResourceOps resourceOps{
+        [](void* opaqueCtx, void* color, void* depth, void* motion, void* output) -> void* {
+            constexpr auto inputState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            constexpr auto outputState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            std::vector<SdkRawResourceAccess> accesses{
+                {static_cast<ID3D12Resource*>(color), inputState, inputState},
+                {static_cast<ID3D12Resource*>(depth), inputState, inputState},
+                {static_cast<ID3D12Resource*>(motion), inputState, inputState},
+                {static_cast<ID3D12Resource*>(output), outputState, outputState}};
+            auto scope = std::make_unique<SdkResourceScope>(static_cast<CommandContext*>(opaqueCtx),
+                SdkResourceOwner::DlssSr, std::move(accesses));
+            return *scope ? scope.release() : nullptr;
+        },
+        [](void* scope) { std::unique_ptr<SdkResourceScope> resources(static_cast<SdkResourceScope*>(scope)); }};
+    const int32_t evaluated = mcdr_dlss_evaluate(reinterpret_cast<void*>(ctx->commandList), &resolved,
+                                                tl, ctx, &resourceOps);
+    transitionTextureTo(ctx, reinterpret_cast<Dx12Object*>(in.pInOutput), D3D12_RESOURCE_STATE_RENDER_TARGET);
+    restoreDrawHeap(ctx);
+    ctx->cachedPso = nullptr;
     if (evaluated != 1) {
         return false;
     }
@@ -10108,6 +10508,7 @@ int setDlssRenderPreset(int preset) {
 
 // 深度快照（详见 mcdr_dlss_impl.h）。JVM 在**清深度之前**那一处调用；本函数只做解包 + 把跟踪型过渡回调交给实现单元。
 int snapshotDlssDepth(CommandContext* ctx, mcdr_object* depthHandle) {
+    mcdr_dlss_invalidate_depth_snapshot();
     if (ctx == nullptr || ctx->commandList == nullptr || depthHandle == nullptr) {
         return 0;
     }

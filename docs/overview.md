@@ -37,6 +37,7 @@ MCDR 是 Minecraft 模组 DXRMC 的 **native 渲染库**：一个 C++23 动态�
 | [`advanced/upscalers.md`](advanced/upscalers.md) | 超分抽象层与 FSR / XeSS 后端 | 加超分后端、对不齐抖动 |
 | [`advanced/mesh.md`](advanced/mesh.md) | mesh shader（meshlet）管线与 HLSL→DXIL | 地形管线、mesh PSO |
 | [`advanced/rt-probe.md`](advanced/rt-probe.md) | 光线追踪能力探测与状态上报 | 光追开关、能力上报 |
+| [`advanced/nrd.md`](advanced/nrd.md) | NRD diffuse/specular 双通道与 SDK validation | 资源映射、诊断输出、在途槽位验证 |
 | [`misc/build-and-modules.md`](misc/build-and-modules.md) | 构建配置、C++23 模块规则、依赖与 SMAA 查找表 | 模块编译报错、加模块、换依赖 |
 | [`misc/debug-and-logging.md`](misc/debug-and-logging.md) | 日志通道与级别、FATAL 旁路、PIX 抓帧、诊断层 | 看日志、抓帧、排查崩溃 |
 

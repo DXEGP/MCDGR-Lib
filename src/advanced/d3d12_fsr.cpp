@@ -3,7 +3,7 @@
 // 返回前必须把输出切回 RENDER_TARGET（接口契约，GUI 还要当渲染目标用）。
 // 上下文按最大尺寸建、按实际尺寸 dispatch，越界要等 GPU 追平后重建（见 ensureContext）。
 // 深度 reverse-Z → DEPTH_INVERTED（不置 DEPTH_INFINITE，26.3 远平面有限）；MV 是渲染分辨率像素位移
-// → motionVectorScale=1 并置 MOTION_VECTORS_JITTER_CANCELLATION，否则 FSR 会把 jitter 当物体运动。
+// → motionVectorScale=1；只有 MV 含 jitter 时才置 MOTION_VECTORS_JITTER_CANCELLATION。
 // 失败策略：每条失败路径最多一行日志并钉住状态，不每帧重试；失败不让帧失败（调用方退回无超分）。
 module;
 #include "_d3d12_module_prelude.h"
@@ -251,7 +251,9 @@ Dx12Object* asObject(void* handle) {
 // 上下文创建标志。**每帧不变**，所以只在建/重建上下文时算一次。
 uint32_t contextFlagsFor(const mcdr_sr_dispatch& seed) {
     uint32_t flags = FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
-    flags |= FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
+    if ((seed.flags & MCDR_SR_FLAG_UNJITTERED_MV) == 0) {
+        flags |= FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
+    }
     if (seed.hdrInput != 0) { flags |= FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE; }
     // 不置 DISPLAY_RESOLUTION_MOTION_VECTORS（MV 是渲染分辨率的像素位移）、DEPTH_INFINITE（26.3 远平面有限）、
     // AUTO_EXPOSURE（曝光由 JVM 给 preExposure）。
@@ -289,6 +291,9 @@ void fillCapsFields(mcdr_sr_caps& out, bool available, const std::string& note) 
 class FsrSrProvider final : public IUpscaleProvider {
 public:
     SrBackendId backend() const override { return SrBackendId::Fsr; }
+    bool motionVectorsJittered() const override {
+        return (flags_ & FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION) != 0;
+    }
 
     void fillCaps(mcdr_sr_caps& out) const override {
         std::string why;
@@ -353,23 +358,32 @@ public:
             problem_ = "render size below the 320x180 minimum";
             return false;
         }
-        if (flags_ == 0) { flags_ = contextFlagsFor(dispatch); }
+        const uint32_t flags = contextFlagsFor(dispatch);
+        if (flags_ != flags && context_ != nullptr) {
+            if (!completion_.ready(ctx)) { problem_ = "previous evaluation pending"; return false; }
+            destroyContext();
+        }
+        flags_ = flags;
         adoptSizes(dispatch.renderWidth, dispatch.renderHeight, dispatch.displayWidth,
                    dispatch.displayHeight);
         if (!ensureContext(ctx)) { return false; }
 
-        // FFX 不替我们转屏障（见文件头第 1 条）：走模块的状态跟踪过渡，不猜 Before 状态。
-        transitionTextureTo(ctx, color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        transitionTextureTo(ctx, depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        transitionTextureTo(ctx, motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         // reactive mask 是可选的第五个输入：句柄在但资源为空时当作没有 —— 把半个对象交给 FFX 会发屏障到空指针上。
         Dx12Object* reactive = asObject(dispatch.pReactiveMask);
-        if (reactive != nullptr && reactive->resource != nullptr) {
-            transitionTextureTo(ctx, reactive, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        } else {
+        if (reactive != nullptr && reactive->resource == nullptr) {
             reactive = nullptr;
         }
-        transitionTextureTo(ctx, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        std::vector<SdkResourceAccess> accesses = {
+            {color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON},
+            {depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON},
+            {motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON},
+            {output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RENDER_TARGET}};
+        if (reactive != nullptr) {
+            accesses.push_back({reactive, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                 D3D12_RESOURCE_STATE_COMMON});
+        }
+        SdkResourceScope resources(ctx, SdkResourceOwner::Fsr, std::move(accesses));
+        if (!resources) return false;
 
         ffxDispatchDescUpscale desc{};
         desc.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
@@ -398,7 +412,7 @@ public:
         desc.sharpness = std::clamp(dispatch.sharpness, 0.0f, 1.0f);
         desc.frameTimeDelta = dispatch.frameTimeDeltaMs > 0.0f ? dispatch.frameTimeDeltaMs : 16.7f;
         desc.preExposure = dispatch.preExposure > 0.0f ? dispatch.preExposure : 1.0f;
-        desc.reset = dispatch.reset != 0;
+        desc.reset = dispatch.reset != 0 || resetPending_;
         desc.cameraNear = dispatch.cameraNear;
         desc.cameraFar = dispatch.cameraFar;
         desc.cameraFovAngleVertical =
@@ -408,9 +422,9 @@ public:
             dispatch.viewSpaceToMetersFactor > 0.0f ? dispatch.viewSpaceToMetersFactor : 1.0f;
         desc.flags = 0;
 
+        completion_.record(ctx);
         const ffxReturnCode_t rc = runtime().api.dispatch(&context_, &desc.header);
-        // 无论成功与否都得把输出交回 RENDER_TARGET（接口契约，GUI 还要当渲染目标用）。
-        transitionTextureTo(ctx, output, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        resources.reclaim();
         if (rc != FFX_API_RETURN_OK) {
             problem_ = "ffxDispatch failed rc=";
             problem_ += std::to_string(static_cast<int>(rc));
@@ -421,6 +435,7 @@ public:
             return false;
         }
         problem_.clear();
+        resetPending_ = false;
         return true;
     }
 
@@ -464,9 +479,7 @@ private:
         }
         if (context_ != nullptr) {
             // 旧上下文的内部资源可能还在飞：先等 GPU 追平最后一次提交再销毁。只在首次建 / 尺寸变大时发生。
-            if (ctx != nullptr && ctx->fenceValue > 0) {
-                (void)waitForFenceValue(ctx, ctx->fenceValue, 2000000000ull);
-            }
+            if (!completion_.ready(ctx)) { problem_ = "previous evaluation pending"; return false; }
             destroyContext();
         }
 
@@ -520,6 +533,7 @@ private:
             return false;
         }
         problem_.clear();
+        resetPending_ = true;
         return true;
     }
 
@@ -537,6 +551,7 @@ private:
             b.cursor = 0;
         }
         context_ = nullptr;
+        completion_.clear();
         maxRenderW_ = 0;
         maxRenderH_ = 0;
         maxDisplayW_ = 0;
@@ -546,6 +561,8 @@ private:
     ID3D12Device* device_ = nullptr;
     ffxContext context_ = nullptr;
     uint32_t flags_ = 0;
+    SrContextCompletion completion_;
+    bool resetPending_ = true;
     int32_t renderW_ = 0;
     int32_t renderH_ = 0;
     int32_t displayW_ = 0;

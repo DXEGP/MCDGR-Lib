@@ -16,8 +16,8 @@ DLSS 的 native 部分全部收在 `MCDR\src\advanced\d3d12_dlss.cpp`（3397 行
 ### 1.1 调用方要做的事
 
 1. 设备就绪时（一次）：`mcdr_dlss_install_log(info, warn, error)` → `mcdr_dlss_install_texture_ops(createFn, destroyFn)` → `mcdr_dlss_register_vendor_dir(utf8Dir, cap)`。三个都必须在任何其它入口之前完成，否则本层既不记日志、也建不出私有纹理。
-2. 每帧（低分辨率世界层画完、GUI 合成之前）：填 `mcdr_dlss_input` → `mcdr_dx12CreateDlssFeature(ctx, &in)` → `mcdr_dx12EvaluateDlss(ctx, &in)`。
-3. 清深度之前（世界渲染中途）：可选 `mcdr_dx12SnapshotDlssDepth(ctx, depth)`，见 §4.4。
+2. 每帧世界渲染前：调用 `mcdr_dx12ReflexFrameBegin()`，使上帧快照失效；该失效不受 Reflex 开关影响。
+3. main pass RETURN、清深度之前：可选 `mcdr_dx12SnapshotDlssDepth(ctx, depth)`；世界层画完、GUI 合成之前填 `mcdr_dlss_input` → `mcdr_dx12CreateDlssFeature(ctx, &in)` → `mcdr_dx12EvaluateDlss(ctx, &in)`，见 §4.4。
 4. 设备销毁时：`mcdr_dlss_shutdown()`。这一步**必须在设备还活着时**调用，它要 `ReleaseFeature` / `Shutdown1` / 交回私有纹理。
 
 ### 1.2 时序图
@@ -296,7 +296,7 @@ tooSmall(have, need) := have < need * 0.995      // 0.5% 容差
 1. 所有 `NVSDK_NGX_Parameter_Set*` 必须在 `NVSDK_NGX_D3D12_GetScratchBufferSize` **之前**，也在 `NGX_D3D12_CREATE_DLSS_EXT` 之前。
 2. 所有 `sl::DLSSOptions` / `NVSDK_NGX_DLSS_Eval_Params` 的赋值必须在 `EvaluateFeature` 调用**之前**；本层没有"设一半"的路径，构造完结构体一次性下发。
 3. 命令列表必须先打开（`NGX_D3D12_CREATE_DLSS_EXT` 与 `EVALUATE` 都要录自己的命令）。
-4. render pass 必须先结束。`applyDlssToTexture` 在 create 之后检查 `ctx->inRenderPass`，为真就 `endRenderPass(ctx)`，并假定调用方之后会自己开新的 pass。
+4. render pass 必须在 create 之前结束。`applyDlssToTexture` 完成绑定预检后调用 `endRenderPass(ctx)`，调用方后续重新开 pass。
 
 ### 4.2 jitter 约定
 
@@ -323,15 +323,33 @@ tooSmall(have, need) := have < need * 0.995      // 0.5% 容差
 
 DLSS 的评估点在世界画完、GUI 之前，而 vanilla 在 `GameRenderer.render` 里已经把深度清成 0.0（reverse-Z 的"远"）。直接把 JVM 传来的深度喂进去等于没有深度，深度感知升采样退化成纯色彩升采样。
 
-`mcdr_dlss_snapshot_depth`（`d3d12_dlss.cpp:1611`）在世界渲染中途（录速度矢量那一处）调用，把有效深度拷进私有纹理：
+`mcdr_dlss_snapshot_depth`（`src/advanced/d3d12_dlss.cpp`）在世界渲染中途（录速度矢量那一处）调用，把有效深度拷进私有纹理：
 
 | 项目 | 规则 |
 | --- | --- |
 | 复用条件 | `Width/Height/Format/MipLevels/DepthOrArraySize/SampleDesc.Count` 六项全一致 |
+| 有效期 | 帧起点、每次捕获尝试开始、关闭 DLSS 与 shutdown 均失效；完整录制拷贝和源状态恢复后才记录本帧源资源 |
+| 选择条件 | 本帧成功捕获、源资源与 `pInDepth` 相同、快照尺寸与 `renderWidth/renderHeight` 完全一致；否则两实现均使用本次 `pInDepth` |
 | TYPELESS 映射 | `R32_TYPELESS→D32_FLOAT`、`R16_TYPELESS→D16_UNORM`、`R24G8_TYPELESS→D24_UNORM_S8_UINT`、`R32G8X24_TYPELESS→D32_FLOAT_S8X24_UINT` |
-| 拷贝方式 | `CopyTextureRegion`（显式 box `{0,0,0,w,h,1}`，subresource 0），不是 `CopyResource` |
-| 状态 | 快照 `COPY_DEST → NON_PIXEL_SHADER_RESOURCE`；调用方深度原状态由 `DlssQueryStateFn` 查出（缺省 `COMMON`），拷完恢复 |
-| 返回 | 1 = 已建/复用，0 = 参数不可用（INFO），-1 = 创建或拷贝失败（WARN 一次，退回 JVM 深度） |
+| 拷贝方式 | 六项形状匹配后使用 `CopyResource`，拷贝全部 mip、array layer 和 depth/stencil plane |
+| 状态 | 源深度原状态由 `DlssQueryStateFn` 查出（缺省 `COMMON`），转 `COPY_SOURCE` 后拷贝并恢复原状态；快照 `COPY_DEST → NON_PIXEL_SHADER_RESOURCE` |
+| 返回 | 1 = 已录制快照，0 = 参数不可用，-1 = 私有纹理创建失败；拷贝本身无同步返回值，须用 debug layer 与 fence 验证 |
+
+调用方深度处于 `DEPTH_WRITE` 时也必须显式转 `COPY_SOURCE`，不能依赖 `COMMON` 的隐式提升。
+归还原状态后，调用方可以继续清除或使用深度；NGX 与 Streamline 共用 `selectDlssDepth`，仅读取满足选择条件的独立快照。
+JVM 在 `GameRenderer.render` HEAD 调用帧起点，必须早于 main pass RETURN 的捕获；不要在捕获后的清深度挂点重开本帧。
+设备模块在校验捕获参数之前使快照失效，空 encoder 或空深度也不能让之前的成功捕获继续生效。
+私有纹理由设备模块提供的回调创建，不以 NGX 专用的初始化状态作为快照前置条件。
+实际选中的深度用于 SDK scope 与 Streamline tag；SR 完成后，FG provider 桥接也接收同一深度，
+并在 NGX 使用 MV 中间纹理时接收该实际 MV，不能把原资源误声明为 SRV。
+工作区离线检查 `python _port/rt_dlss_depth_check.py` 分别执行隔离 NGX 运行库与开发目录 Streamline，按
+R32_FLOAT、D32_FLOAT、D24_UNORM_S8_UINT、D32_FLOAT_S8X24_UINT、R32_FLOAT、D32_FLOAT 的顺序提交。
+每种格式四帧，另对 R32/D32 各执行捕获、漏捕获、空深度、空 encoder、不同源、320×180 快照、关闭再开启、重新捕获八帧。
+每实现 40 次，共 80 次实际 SDK 求值；全部在求值前清零当前源深度。
+有效快照的当前源状态保持原值；回退当前源时状态为 `NON_PIXEL_SHADER_RESOURCE`，从实际接管资源区分两条路径。
+逐帧检查 SDK scope、后续颜色 compute 读回，并验证两实现合计 18,432,000 个源深度值为零，D3D12 corruption/error 为零。
+此检查已接 GPU 总门；当前覆盖 2D 单 mip/单 layer/单 sample 的录制、格式往返与状态归属，
+不直接读回快照内部 depth/stencil texel，也不证明 FG 实际消费、世界离开/分辨率切换的实机行为、世界内深度感知画质或 MSAA/数组/mip 的实际拷贝结果。
 
 reset / history 的触发：
 
@@ -369,6 +387,53 @@ reset / history 的触发：
 
 `applyDlssToTexture` 每次调用都重新下发 `mcdr_dlss_request_quality(gCtx.dlssQualityTier)`、`mcdr_dlss_request_preset(gCtx.dlssPreset)`、`mcdr_dlss_set_output_texture(overrideRaw)`。这三个都是幂等的，目的是**自愈**：`mcdr_dlss_shutdown()` 之后实现单元状态被清空，而设备模块的 `gCtx` 还留着旧值，不重申就会停在"没有 handover 纹理"的降级路径上。
 
+### 4.8 SDK 资源归属
+
+`applyDlssToTexture` 在任何转态、create 或求值前校验四张包装纹理，拒绝空资源、buffer、
+输入/GUI 输出别名和正在被 SDK 接管的纹理。独立 handover 还必须有 UAV 标志且不与输入别名。
+create 在 render pass 结束后执行，返回后恢复 draw heap 并清空 `cachedPso`。
+
+实际求值使用 `DlssSdkResourceOps` 注入的 acquire/release 回调。
+普通 TU 的 `DlssSdkResourceScope` 将真正选中的 color/depth/MV/output 裸资源交给设备模块；
+设备模块以 `SdkRawResourceAccess` 创建统一 `SdkResourceScope`，记录 owner 为 `DlssSr`。
+NGX 的深度快照、MV 中间纹理和私有/外部输出因此与其他 SDK 共用完整校验及归属机制。
+Streamline 在 tagging 前接管，NGX 在 Evaluate 前接管；tag/options/evaluate 失败或提前返回均归还。
+Streamline 要求 `slSetConstants` 入口存在；常量提交返回非 `eOk` 时，在 SDK 资源接管之前返回 0，
+不执行后续 tag/evaluate、拷回或 FG 输入提交，输出交接状态为 0。
+同一 frame token/viewport 的相同常量允许重复提交，不同常量由 SDK 返回 `eErrorDuplicatedConstants`（27/`0x1B`）。
+常量错误日志前 3 次逐条输出，之后仅第 4、8、16…次输出；失败不锁死 DLSS，下一个新帧可正常重试。
+tag 与 options 也必须成功后才执行 Evaluate；接管之后的失败由 scope 归还资源。
+
+scope 归还时，实际输入保持 `NON_PIXEL_SHADER_RESOURCE`、实际输出保持 UAV；
+后续宿主拷回可以继续调用跟踪式 transition，GUI 输出最终回到 `RENDER_TARGET`。
+Streamline 的无 FG handover 在拷回后为 `COPY_SOURCE`，NGX handover 为 UAV。
+NGX 使用 MV 中间纹理时，原 MV 因预备拷贝保持 `COPY_SOURCE`，实际中间纹理作为 SRV 归还。
+这些是录制期间的归属规则，资源仍须保持有效直到提交 fence 完成；FG 的 Present 消费另行验证。
+
+工作区 `rt_sr_signal_check.py --backends` 包含四帧光栅 DLSS SDR 检查，
+固定 Performance 档、640×360 到 1280×720、独立 GUI 目标与 handover。
+实际归还后查询状态、接管/归还/恢复堆计数，再 compute 读回输出；
+常量 RGB 采样误差必须小于 0.08，D3D12 debug layer corruption/error 必须为空。
+额外拒绝输入/输出别名、buffer 输出、handover 与输入别名和缺 UAV 标志。
+`--raster-only --runtime-directory <dir>` 可在独立目录运行 NGX 实现，目录不放 Streamline DLL，
+须包含匹配的 D3D12Core、d3d12SDKLayers、DXC、NGX SR 与 MCDR.dll。
+无需环境变量或启动游戏；报告区分默认完整后端检查与独立光栅检查。
+独立 NGX 检查增加 `--depth-snapshot` 可验证实际快照分支；四格式、有效期与回退检查见 §4.4。
+`python _port/rt_dlss_failure_check.py` 在每次成功求值后，同 frame token 改变相机位置再求值，
+要求实际 SDK 的 `0x1B` 诊断共四次，ABI 返回 0，五个宿主资源的状态与接管/归还/恢复堆计数完全不变。
+每次拒绝后另建 frame token 并提交正确常量，要求恢复成功，随后实际 compute 读回颜色。
+常量拒绝与求值拒绝检查已接 GPU 总门。
+同一进程内，测试桥接使用 SDK 原始头编译，通过 `slGetFeatureFunction` 取得实际 `slDLSSSetOptions`，
+临时将 viewport 0 设为 `eOff`；产品继续使用已有选项缓存，实际 Evaluate 返回 `eErrorInvalidIntegration`（19/`0x13`）。
+每次该错误均须完整归还一次 scope，输入保持 SRV、实际输出保持 UAV、GUI 输出恢复 `RENDER_TARGET`，输出交接为 0。
+失败后先执行实际 compute 并保存 GUI 输出读回，再恢复 SDK 选项、另建 frame token，要求重新求值成功。
+成功求值次数只在 Evaluate 返回 `eOk` 后增加，失败不能计入 `mcdr_dx12QueryDlss` 的成功次数。
+完整检查为四次常量拒绝、四次接管后 Evaluate 拒绝与十二次成功求值；接管/归还/恢复堆各 16 次。
+恢复前的 compute 共检查 12,464 个颜色样本，最大误差 `0.0009765625`；D3D12 corruption/error 为零。
+桥接由 runner 用 MSVC x64 `/std:c++latest` 自动编译到工作区临时目录，源代码、SDK 头、DLL 哈希均保存到报告。
+此项不证明 tag/options 错误、SDK 部分写入 GPU 后的错误、NGX SDK 错误或 FG 失败收尾。
+这组检查没有 HDR surface，光栅仅测 SDR；不代替非零 jitter、动态场景或窗口/世界内画质验收。
+
 ## 5. 输出资源的所有权
 
 | 资源 | 谁创建 | 谁持有 | 谁销毁 | 入口 |
@@ -392,7 +457,7 @@ reset / history 的触发：
 | 资源 | evaluate 结束后停在 | 依据 |
 | --- | --- | --- |
 | `out`（JVM 输出） | `RENDER_TARGET` | 本层最后一步 transition |
-| handover 纹理 | `UNORDERED_ACCESS`（FG 开）/ `COPY_SOURCE`（FG 关） | `mcdr_dlss_output_state()` 回报，见下 |
+| handover 纹理 | Streamline：FG 开为 UAV、FG 关为 COPY_SOURCE；NGX：UAV | Streamline 由 `mcdr_dlss_output_state()` 回报，NGX 由资源跟踪查询 |
 | `dlssOutput`（私有） | `UNORDERED_ACCESS` | copy-back 之后 |
 | 深度快照 | `NON_PIXEL_SHADER_RESOURCE` | 供本次 evaluate 读 |
 | scratch | 不转换 | 由 NGX 内部管理 |
@@ -517,7 +582,7 @@ note 的优先级：`"DLSS runtime not loaded"` → `"not on the Streamline path
 
 > **缺陷**：没有 reactive mask / transparency mask。水面、玻璃、粒子这类"有颜色但运动矢量不可信"的像素只能靠 DLSS 自己的启发式，表现是实体/粒子边缘残影。`NVSDK_NGX_DLSS_Eval_Params` 里对应的指针本层全部留空。
 
-> **缺陷**：`MVJittered` 不置位。jitter 被烘进了投影矩阵（TAA 与 DLSS 共用一条 Halton 序列），而 MV 是在 jittered 网格上算的，`InJitterOffsetX/Y` 又照实传了。不置位意味着 NGX 把这些 jitter 差当成真实运动。`d3d12_dlss.cpp` 的注释仍写着"MVJittered 恒置位"，与 `computeFeatureFlags` 的实际行为相反——读注释会被误导。
+> **验收限制**：`MVJittered` 保持关闭，调用方必须移除 MV 中的 jitter 差。RT 的产品 HLSL 数值对照与 RR/SR 偏移负例覆盖该约定；光栅 DLSS 的动态场景、残影与窗口切换仍需单独验收。
 
 > **缺陷**：私有 UAV 兜底路径写不进像素。同源、同调用点、同一条命令列表的对照：写进模块建的目标读回 `mean=17.8/16.5/11.6/255.0`，写进本层自建的私有纹理读回 `mean=0.0/0.0/0.0/0.0`。所以 handover 纹理（`mcdr_dlss_set_output_texture`）是**唯一**可用路径，私有纹理只是历史兜底；返回 2 的那一帧等于黑屏。
 
@@ -562,3 +627,122 @@ note 的优先级：`"DLSS runtime not loaded"` → `"not on the Streamline path
 3. 新增/删除 `mcdr_dlss_impl.h` 的导出时，更新 §1.3、§5 的表与 §9 的导航；签名里只允许 `void*` / POD / `char*`。
 4. 改 `mcdr_fg_caps` 的字段或 `fillDlssGCaps` 的判定时，更新 §6.2，并确认 `sizeof = 80` / `align = 4` 未变（Kotlin 侧 `MCDR_Layout.kt` 有镜像）。
 5. 任何涉及动态分辨率、档位或输出纹理的改动，先确认手写表格里的百分比与代码里的常数一致；本层所有阈值（`0.995`、`1.10`、`64 MiB`、`[1,5]`、`1024` 字节日志缓冲）都在代码里，不要凭记忆写。
+
+## 11. 光追 Ray Reconstruction
+
+光追 RR 通过 `mcdr_dx12DlssdEval` 进入本单元的 `mcdr_dlssd_eval`，使用独立的 viewport 1。
+光栅 DLSS-SR 与帧生成仍使用 viewport 0。八张纹理与 104-float 相机载荷遵守 [ABI 契约](../abi/README.md)。
+反射重投影使用 `kBufferTypeSpecularHitDistance`，绑定 render 尺寸的 `R32_FLOAT` 世界单位距离，
+并在 `DLSSDOptions` 中填写 `worldToCameraView/cameraViewToWorld`。
+反射打空写 `1e9`；禁止复用 NRD 输入 alpha 中的粗糙度归一化距离。
+
+- Streamline 与 NGX 探测使用相同的 Project ID `7c1f4a52-9b3e-4d68-8f21-5a6c0e2d9b74`、engine version `1.0`。
+  engineVersion 非空时必须提供 projectId，保证 feature-requirements 查询和初始化使用相同身份。
+- 输入为带噪、已重调制的线性 HDR 颜色，深度以 `kBufferTypeLinearDepth` 传正 viewZ，`depthInverted=eFalse`。
+  法线使用原始世界空间 xyz，粗糙度放 w；禁止将 NRD 的八面体编码纹理当作 RR packed normal。
+- 输入/输出尺寸变化时调用 `slDLSSDGetOptimalSettings`，确认输入位于 SDK 的动态范围。
+  原生输入优先 DLAA，缩放输入按质量档依次查询；没有合法范围则拒绝求值。
+- 相机位置、方向、pinhole、抖动、MV 比例与布尔标志必须完整填写。相机视图正逆矩阵每帧更新到 DLSSDOptions。
+  `slSetConstants` 失败时停止求值；帧号保持递增，重置历史时禁止复用已提交的编号。
+- 输入转 NPSR、输出转 UAV，连续调用 setTag/evaluate，完成后由设备模块恢复 COMMON 与绘制描述符堆。
+  返回成功仅表示 SDK 接受命令；需结合后续帧无回退、调试层与世界画面验证。
+
+输出是显示尺寸的线性最终颜色，合光禁止再次乘 albedo 或叠加 emissive。
+RR 不可用时由 JVM 重打包 YCoCg 再调用 NRD；低倍率 NRD 输出允许继续调用独立 SR。
+
+### 11.1 NRD 后独立 DLSS-SR
+
+`mcdr_dx12RtSrEval` 转入 `mcdr_dlss_sr_eval`，固定使用 viewport 2。输入为重调制后的线性 HDR 颜色、
+设备深度与像素 MV，输出为显示尺寸 RGBA16F。四张纹理顺序与返回值见 [ABI 契约](../abi/README.md)。
+SR 的 `kBufferTypeDepth` 必须绑定设备深度，不能复用 RR 的正 viewZ 标签。
+JVM 重调制 pass 用本帧投影从 viewZ 生成设备深度，`depthInverted` 根据投影方向填写。
+
+SR 与 RR 共用 104-float 相机转换，矩阵保持无 jitter，68–71 传当前/上一帧屏幕内容偏移 xy。
+`jitterOffset` 读取 68/69，单位为 render 像素；共享 Halton `(Jx,Jy)` 对应 `(Jx,-Jy)`。
+四分量须有限且在 `[-0.5,0.5]`，两个入口均在接管资源前校验。
+MV 已移除 jitter 差，`mvecScale=(1/renderWidth,1/renderHeight)`，
+相机常量每帧更新。尺寸变化时查询 `slDLSSGetOptimalSettings` 的合法范围再设选项；
+无合法范围时拒绝求值。资源状态与恢复规则和 RR 相同，两个入口使用独立的递增帧号。
+JVM 在 Plan 变化时复位历史，失败后保留 NRD 合光，避免重复重调制和曝光。
+
+### 11.2 RR 离线输入与历史对照
+
+RR、NRD 与不同 SR provider 的最终画面按各自效果独立验收，不要求图像级或像素级一致。
+以下误差、宽度和负例倍数属于指定合成场景的诊断配置，不作为 S4 的退出条件。
+同一 SDK 的不同入口、历史路径或重建前后也不要求最终颜色逐位相等。
+SDK 输入/标签/单位、编码、真实求值、资源归还、互斥和失败恢复是工程检查；主观画质由用户在世界内确认。
+总门所用 RR core、共享 jitter 与曝光 ABI 报告的 `passed` / `engineering_passed` 只表示该探针的工程检查。
+图像指标写入 `image_diagnostics`，汇总为 `image_diagnostics_passed`，未达到预算不改变工程退出码。
+`world_quality=unverified` 保留世界内目视验收的状态，不能由离线报告自动置为通过。
+
+在工作区根执行 `python _port/rt_rr_temporal_check.py --case core`，通过公开八纹理 ABI 求值实际 RR，
+不启动游戏。使用 640×360 原生输入/输出，每组 24 帧，主进程 123 次求值与独立对照进程 122 次求值；
+逐帧等 fence 后通过 compute 读回，要求全部输出分量有限。
+
+| 检查 | 场景与对照 | 当前脚本诊断配置 |
+| --- | --- | --- |
+| HDR | 带噪线性 RGB `(4, 2, 0.5)` | 每通道相对 RMSE 小于 5%，R 通道 MSE 小于带噪输入的 1/4 |
+| MV | 世界位置线性辐亮度渐变，相机 yaw 在 0/0.45 rad 间交替；像素 MV 对比反号/误喂 UV 单位 | 正确 R 通道 MSE 小于 0.005，两个负例均超过正确值 2 倍 |
+| 历史 | 预热后信号从 0.8 变为 1.0；按需 reset 对比独立进程的每帧 reset | 对齐求值次数、SDK 帧号及输入，RGB 最大差小于 0.002；CONTINUE 的各通道 MSE 均超过 reset 2 倍 |
+
+相机矩阵遵守与产品相同的行向量转换，MV 为 `prevUV-curUV` 的 render 像素位移。
+历史对照必须同时对齐 SDK frameIndex 与实际求值次数；只对齐帧号或比较相邻两次 reset，
+内部采样相位会产生差异。独立对照使用全程 reset 预热，不应描述成冷启动首帧对照。
+
+结果写入工作区 `_tmp_s4_rr_temporal.json`，包含设备、运行库与探针 SHA-256、参数、阈值、
+逐路误差和未覆盖项；`rt_check_all.py --gpu` 仅调用上述 `core` 检查。
+`--case all` 另外执行遮挡平面的深度负例、曲面 GGX 高光的法线/粗糙度探索，
+写入 `_tmp_s4_rr_exploratory.json`。这些场景的负例敏感度与过滤后高光宽度只作诊断，
+不改变工程退出码，也不替代世界内画质验收。独立深度边缘/高光分析命令仍可返回诊断性的 `INCOMPLETE`。
+
+当前玩家 RT RR 的 `DLSSDOptions.preExposure/exposureScale` 为 1，输入保持未曝光线性 HDR，
+曝光与 tone map 在后级执行一次。HDR 读回不等于手动/自动曝光对照；RR 官方指南明确忽略
+DLSS 的 `useAutoExposure` 选项，不能将该选项当作 RR 的曝光切换入口。
+玩家 RT DLSS-SR 也使用 `preExposure/exposureScale=1`，RR/SR 均提交引擎测光的曝光资源 tag。
+玩家 AUTO 是引擎生成显式倍率，SR 的 `useAutoExposure` 仍为 eFalse。
+旧入口无资源时，Streamline SR 插件会设置 AutoExposure flag，即使 `useAutoExposure=eFalse`。
+RR 插件读取可选曝光 tag 并交给 NGX，其创建 flags 未设置 AutoExposure；缺资源时 SDK 内部行为，代码中未明确。
+所带 NGX 头将曝光资源定义为包含最终曝光倍率的 1×1 纹理，适配时使用 `R32_FLOAT`。
+SR 的曝光 flag 在 feature 创建时确定，重建判断只有 mode、输出尺寸和 preset；
+改变 `useAutoExposure` 必须同时明确 feature 生命周期，不能用 setOptions 成功代替实际模式切换验证。
+
+ABI 23 的 `mcdr_dx12DlssdEvalExposure` / `mcdr_dx12RtSrEvalExposure` 通过独立两 float 参数段
+传入 `preExposure / exposureScale`，可在原八/四张纹理后追加一张 1×1 `R32_FLOAT` 曝光资源。
+标量范围为 `[2^-16,2^16]`，不改变 104-float 相机载荷。
+新旧入口共同检查纹理形状、尺寸、读写能力、别名与归属，完整预检后才接管。
+曝光 tag 使用 1×1 extent；SR 按资源有无明确设置 `useAutoExposure`，RR 仅提交可选资源与两个标量。
+同一模式内标量变化会刷新 SR options；RR 每次设置 options。
+
+每个 RT viewport 保存上次实际求值的 completion fence/value，SDK 返回错误也保留在途生命周期。
+曝光资源有无变化时，先等上次提交完成，再 `slFreeResources`、清尺寸/选项缓存并设置 pending reset。
+同一未提交列表内切换返回 0，诊断 `exposure: submit before switching modes`；其他未完成提交最多等 5 秒。
+reset 只在实际求值成功后消费；曝光纹理返回后回 `COMMON`，资源须存活至对应 fence 完成。
+玩家 RR/RT DLSS-SR 调用显式曝光入口，两个标量均为 1；1×1 R32_FLOAT 纹理由引擎测光生成。
+NeoForge 配置 `exposureMode / exposureEv / exposureSpeed` 控制引擎手动/自动测光，
+两种模式都保留资源，最终合光读取同一纹理并执行一次曝光；SDK 输入仍为未曝光线性 HDR。
+
+`rt_exposure_abi_check.py` 经真实产品 ABI 执行旧入口、新默认参数及四段资源模式切换，
+RR/SR 共 384 次求值与 344 次拒绝。旧/新默认输出逐帧逐位一致，切换组各段末八帧 MSE 小于 0.001；
+预曝光 .25/4 及段内翻倍时核验实际 HDR 输入，逐帧验证曝光纹理未被修改。
+父进程核验源码/SDK/运行库/输入哈希、模式序列，并重算二十四份分段末帧快照的曝光值与误差。
+接管/归还/恢复堆计数、拒绝原子性、后续 compute 读回及 D3D12 debug layer 同时检查。
+新增两个同队列跨 encoder 组各执行 164 次求值，检查另一 encoder 完成不能满足旧 encoder 的 fence。
+旧列表未提交和已提交但 GPU queue 被 fence 阻塞时，均须约五秒超时且保持两套资源状态/归属/计数不变；
+提交旧列表或解除阻塞后，同一新列表上的重试须成功。
+另外四次双向资源模式切换观察至少 0.25 秒阻塞等待，解除阻塞前调用不得返回或接管资源。
+每次恢复后再求值 31 帧，脚本对其 MSE 使用 0.001 诊断预算，重建 feature 后首帧使用 0.1；
+图像指标未达到预算不阻塞阶段，重试成功、输出有限与资源归还仍须通过。
+父进程复核新增二十四份完整快照、fence/时间/模式序列和两套 scope 计数。
+总计 712 次实际 SDK 求值、348 次原子拒绝，纳入 `rt_check_all.py --gpu`；
+`--cross-encoder` 只运行新增两组并复用已有 JVM 输入。
+独立 GPU queue 与同时求值不在本组覆盖内；世界内画质仍待确认，曝光错配敏感度保留为可选诊断。
+
+RR/RT DLSS SR 使用 [SDK 接管](../device/README.md#57-sdk-资源接管与归还)，返回后输入输出均回 `COMMON`。
+core 探针逐次查询状态与接管/归还/恢复堆计数，检查四种非法绑定原子拒绝，
+并要求 D3D12 debug layer 无 corruption/error、后续 compute 可读回。
+光栅 DLSS、FG、可选 mask、跨 encoder 共享归属不在该检查范围内。
+`rt_jitter_check.py` 独立执行 RR 原生尺寸与 RT DLSS SR 50% 放大的非零偏移对照。
+各后端正确、反号与零偏移组使用独立进程及相同 SDK 帧号；脚本诊断配置为正确 MSE 小于 0.001、
+两个错误组各大于正确值两倍，这些图像阈值不作阶段门。
+非法偏移在接管前拒绝，资源归还与 D3D12 debug layer 同时检查。
+全部历史失效原因、世界内切换与主观残影仍需分别验证。

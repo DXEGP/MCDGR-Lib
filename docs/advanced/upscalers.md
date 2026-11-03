@@ -64,8 +64,13 @@ IUpscaleProvider（mcdr.d3d12.device 模块内，签名只用 POD）
 | `bool evaluate(CommandContext*, const mcdr_sr_dispatch&)` | 提交一帧 | 是（每类失败最多一行日志） |
 | `void shutdown()` | 释放上下文；调用方负责先等 fence | 否 |
 
-`initialize` 收到的是「种子载荷」：`srCreateProvider` 用 `seedFromSizes()` 造，只有尺寸，
-资源指针为空。要在建上下文时就知道 HDR / 深度格式的后端，得让种子多带字段。
+`initialize` 收到的是种子载荷：`srCreateProvider` 用 `seedFromSizes()` 造，只有尺寸、资源指针为空；
+直接调用 `srEvaluateFrame` 时使用完整逐帧载荷懒建 provider，包含 HDR 与相机参数。
+FSR 每次求值核对 HDR 与 MV jitter 标志，XeSS 核对 MV jitter 约定。变化时重建上下文。
+内部重建通过 `SrContextCompletion` 保存的最后使用 fence 与目标值确认 GPU 已退役，不能用新 encoder 的已完成 fence 代替。
+本列表尚未提交时立即拒绝重建；其他未完成使用最多等待 5 秒，超时保留旧上下文。
+重建拒绝不接管输入资源；新上下文首次成功求值强制 reset，之后遵循载荷的 reset。
+该等待仅覆盖 provider 内部重建；注册表的 provider 热切与销毁仍走各自的等待入口。
 
 ## 3. ABI 契约
 
@@ -115,7 +120,7 @@ Kotlin 侧镜像在 `MCDR_Layout.kt` 的 `SR_DISPATCH`。约定（与 `mcdr_dlss
 | 56 | `reset` | 1 = 丢弃历史 |
 | 60 | `hdrInput` | 1 = 输入是 HDR 线性色 |
 | 64 | `backend` | 0 = 用 `SrPick` 记下的那个 |
-| 68 | `flags` | 保留，必须为 0 |
+| 68 | `flags` | `0` = MV 含 jitter；`MCDR_SR_FLAG_UNJITTERED_MV`（1）= 已移除 jitter，限 FSR/XeSS。未知位及通用 DLSS 的非零值在资源接管前返回 -1 |
 | 72 | `pColorInput` | 渲染尺寸颜色 |
 | 80 | `pColorOutput` | 显示尺寸颜色（UAV 写） |
 | 88 | `pDepth` | 渲染尺寸深度 |
@@ -150,9 +155,7 @@ Kotlin 侧镜像在 `MCDR_Layout.kt` 的 `SR_DISPATCH`。约定（与 `mcdr_dlss
 世界层画完、GUI 之前、命令列表已打开
   SrCreate(ctx, …)       幂等：同后端只更新尺寸
   SrEvaluate(ctx, &desc)  ├─ ensureProvider：需要时懒建 / 切后端
-                          ├─ BeginEvent("SR:<backend> <rw>x<rh>-><dw>x<dh>")
                           ├─ provider->evaluate
-                          ├─ EndEvent
                           └─ restoreDrawHeap(ctx)（无论成败）
 ```
 
@@ -162,6 +165,34 @@ Kotlin 侧镜像在 `MCDR_Layout.kt` 的 `SR_DISPATCH`。约定（与 `mcdr_dlss
   SrResize(ctx, …)  → provider->onResize（只记账）
   下一次 Evaluate 内部的 ensureContext 才真正重建（那时能等 fence）
 ```
+
+### 3.5 SDK 状态归属
+
+XeSS/FSR 的 `evaluate` 使用 [设备层 SDK 接管](../device/README.md#57-sdk-资源接管与归还)。
+颜色、深度、MV 与可选 mask 登记为 SRV，输出为 UAV；SDK 返回后先重新声明入口状态，
+再将输入归还到 `COMMON`、输出归还到 `RENDER_TARGET`。成功与失败都恢复 draw heap、清空 PSO 缓存。
+RT 独立 DLSS SR 走 `mcdr_dx12RtSrEval`，同样使用 scope，但输出归还到 `COMMON`。
+光栅 `DlssSrProvider` 经 `applyDlssToTexture` 接入同一 scope，
+在实际 SDK 求值处接管内部选择的四张裸资源，详情见 [DLSS](dlss.md#48-sdk-资源归属)。
+
+`SrEvaluate` 要求命令列表已打开且不在 render pass 内。
+不要以 metadata 0 直接向 `ID3D12GraphicsCommandList::BeginEvent` 传入文本；
+该格式会被 debug layer 拒绝，并造成后续 `EndEvent` 无配对。
+
+在工作区运行 `python _port/rt_sr_signal_check.py --backends` 验证 SDK 资源归还。
+三种后端均可用时执行 29 次求值，含 RT DLSS SR/XeSS/FSR 的 SDR/HDR、reset/继续历史与后端往返，
+另有四次光栅 DLSS SDR 求值；
+XeSS/FSR 各增加全零、棋盘、全一 R8_UNORM mask、移除、重新加入与再移除六帧。
+mask 尺寸为 640×360；每次返回后检查 mask 为 `COMMON`、输出为 `RENDER_TARGET`，
+累计接管/归还/恢复堆次数一致，归属残留及 violation 为零。
+后续 compute 逐像素验证八次 mask 输入保持原值，常量输出 RGB 采样误差小于 0.08，
+D3D12 debug layer 的 corruption/error 必须为空。
+mask 与颜色别名、mask 为 buffer、输出别名及缺 UAV 标志等非法绑定必须无副作用拒绝。
+报告写入工作区 `_tmp_s4_sr_backends.json`，包含逐帧参数、误差、资源计数和探针/运行库哈希。
+该检查不证明 mask 的画质效果；动态/OIT 输入及世界内画质仍需独立验证。
+光栅 DLSS 的 HDR 标记来自活跃 HDR surface，当前离线四帧仅覆盖 SDR；不能用通用载荷的 `hdrInput` 冒充 HDR surface。
+光栅测试使用 Performance 档、640×360 到 1280×720、独立 GUI 目标与 UAV handover，
+同时验证输入/输出别名、buffer 输出、handover 别名与缺 UAV 标志的无副作用拒绝。
 
 ## 4. 注册表、生命周期与诊断（`src\advanced\d3d12_sr.cpp`）
 
@@ -219,11 +250,12 @@ Kotlin 侧镜像在 `MCDR_Layout.kt` 的 `SR_DISPATCH`。约定（与 `mcdr_dlss
 `mcdr_dx12SrQuery` 输出一行：
 
 ```
-sr active=fsr picked=fsr eval=912/3 size=1280x720->1920x1080 caps[ok masks=1 jitter=8 max=7680x4320] why=… last=…
+sr active=fsr picked=fsr eval=912/3 size=1280x720->1920x1080 mvJitter=0 caps[ok masks=1 jitter=8 max=7680x4320] why=… last=…
 ```
 
 - `active` / `picked` 不一致 = 切换失败或被拒；
 - `eval=ok/fail` 逐帧计数：能区分「建起来了但每帧都失败」；
+- `mvJitter=1/0` 表示生效上下文是否按含 jitter 的 MV 处理；FSR/XeSS 读取各自的上下文标志，不直接回显本帧请求；
 - `caps[...]` 是**生效后端**自己的能力面（`masks` / `jitter` / `max`）；
 - `why=` 只在 `available=0` 或 note 不是 `off` 时出现（NONE 档的 `off` 是正常状态）；
 - `last=` 是最近一次降级原因。
@@ -326,13 +358,13 @@ ffxCreateContextDescUpscale   (type = ..._TYPE_UPSCALE, pNext = ↓)
        └─ ffxCreateBackendDX12Desc (type = ..._TYPE_BACKEND_DX12, device = ID3D12Device*)
 ```
 
-`upscaleDesc.flags` 在建 / 重建时算一次（每帧不变）：
+`upscaleDesc.flags` 在建 / 重建时设置，逐帧载荷的 HDR 或 MV jitter 约定变化时重建：
 
 | 位 | 何时置 | 理由 |
 | --- | --- | --- |
 | `FFX_UPSCALE_ENABLE_DEPTH_INVERTED` | 恒置 | 26.3 是 reverse-Z |
-| `FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION` | 恒置 | MV 由 jittered 投影算出，要让 FSR 把 jitter 差当相机抖动扣掉 |
-| `FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE` | `seed.hdrInput != 0` | 输入是 HDR 线性色 |
+| `FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION` | 仅 `MCDR_SR_FLAG_UNJITTERED_MV` 未置位时 | 光栅 MV 含 jitter；RT MV 已移除，禁止再次补偿 |
+| `FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE` | 当前 `dispatch.hdrInput != 0`，首次初始化取种子 | 输入是 HDR 线性色 |
 | `FFX_UPSCALE_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS` | **不置** | MV 是渲染分辨率的像素位移 |
 | `FFX_UPSCALE_ENABLE_DEPTH_INFINITE` | **不置** | 26.3 的远平面有限 |
 | `FFX_UPSCALE_ENABLE_AUTO_EXPOSURE` | **不置** | 曝光由 `preExposure` 标量给；纹理后续再接 |
@@ -416,7 +448,7 @@ QUALITY → BALANCED → ULTRA_QUALITY → PERFORMANCE → ULTRA_QUALITY_PLUS �
 | --- | --- |
 | `outputResolution` | `{displayW, displayH}` |
 | `qualitySetting` | §7.2 挑出的档 |
-| `initFlags` | `XESS_INIT_FLAG_INVERTED_DEPTH \| XESS_INIT_FLAG_JITTERED_MV`，掩码启用时再加 `XESS_INIT_FLAG_RESPONSIVE_PIXEL_MASK` |
+| `initFlags` | 恒置 `XESS_INIT_FLAG_INVERTED_DEPTH`；MV 含 jitter 时加 `XESS_INIT_FLAG_JITTERED_MV`；掩码启用时加 `XESS_INIT_FLAG_RESPONSIVE_PIXEL_MASK` |
 | `creationNodeMask` / `visibleNodeMask` | 0（单 GPU） |
 | `pTempBufferHeap` / `pTempTextureHeap` | 外部临时堆（见 §7.4），建堆失败时置空由 SDK 自建 |
 | `bufferHeapOffset` / `textureHeapOffset` | 0 |

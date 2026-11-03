@@ -17,6 +17,11 @@
 #include <d3d12.h>
 #include <wrl/client.h>
 
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <memory>
+#include <span>
 #include <vector>
 
 #include "NRD.h"
@@ -255,27 +260,51 @@ bool createPoolTexture(ID3D12Device* device, const nrd::TextureDesc& desc, uint3
     return true;
 }
 
+constexpr uint32_t kDispatchSlots = 8;
+constexpr uint32_t kConstantSlotsPerDispatch = 32;
+
+struct NrdDispatchSlot {
+    ComPtr<ID3D12Fence> fence;
+    uint64_t value = 0;
+
+    bool complete() const {
+        return !fence || fence->GetCompletedValue() >= value;
+    }
+};
+
 struct NrdContext {
     nrd::Instance* instance = nullptr;
     ComPtr<ID3D12RootSignature> rootSignature;
     std::vector<ComPtr<ID3D12PipelineState>> pipelines;
     std::vector<ComPtr<ID3D12Resource>> permanent;
     std::vector<ComPtr<ID3D12Resource>> transient;
+    /** 池纹理当前状态：同一张纹理既当 SRV 又当 UAV，状态必须自己记。 */
+    std::vector<D3D12_RESOURCE_STATES> permanentState;
+    std::vector<D3D12_RESOURCE_STATES> transientState;
     ComPtr<ID3D12DescriptorHeap> descriptors;
     ComPtr<ID3D12DescriptorHeap> samplers;
     ComPtr<ID3D12Resource> constants;
     uint8_t* constantMapped = nullptr;
     uint32_t constantStride = 0;
+    uint32_t descriptorsPerDispatch = 0;
+    std::array<NrdDispatchSlot, kDispatchSlots> slots;
     const nrd::InstanceDesc* desc = nullptr;
     ID3D12Device* device = nullptr;
     uint32_t width = 0;
     uint32_t height = 0;
     bool ready = false;
+    bool traced = false;
+
+    bool complete() const {
+        return std::ranges::all_of(slots, &NrdDispatchSlot::complete);
+    }
 
     void release() {
         pipelines.clear();
         permanent.clear();
         transient.clear();
+        permanentState.clear();
+        transientState.clear();
         if (constantMapped != nullptr && constants) {
             constants->Unmap(0, nullptr);
             constantMapped = nullptr;
@@ -284,6 +313,7 @@ struct NrdContext {
         samplers.Reset();
         descriptors.Reset();
         rootSignature.Reset();
+        slots = {};
         if (instance != nullptr) {
             nrd::DestroyInstance(*instance);
             instance = nullptr;
@@ -292,10 +322,30 @@ struct NrdContext {
         width = 0;
         height = 0;
         ready = false;
+        traced = false;
     }
 };
 
 NrdContext gNrd;
+std::vector<std::unique_ptr<NrdContext>> gRetiredContexts;
+
+void collectContexts() {
+    std::erase_if(gRetiredContexts, [](const auto& context) {
+        if (!context->complete()) return false;
+        context->release();
+        return true;
+    });
+}
+
+void retireContext() {
+    if (gNrd.complete()) {
+        gNrd.release();
+    } else {
+        gRetiredContexts.push_back(std::make_unique<NrdContext>(std::move(gNrd)));
+        gNrd = NrdContext{};
+    }
+    collectContexts();
+}
 
 } // namespace
 
@@ -307,15 +357,16 @@ extern "C" int32_t mcdr_nrd_context_init(void* device, int32_t width, int32_t he
     if (device == nullptr || width <= 0 || height <= 0) {
         return -1;
     }
+    collectContexts();
     if (gNrd.ready && gNrd.device == device && gNrd.width == static_cast<uint32_t>(width)
         && gNrd.height == static_cast<uint32_t>(height)) {
         return 1;
     }
-    gNrd.release();
+    retireContext();
 
     int32_t used = 0;
     const char* stage = "create instance";
-    const nrd::DenoiserDesc denoisers[1] = {{0, nrd::Denoiser::REBLUR_DIFFUSE}};
+    const nrd::DenoiserDesc denoisers[1] = {{0, nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR}};
     nrd::InstanceCreationDesc creation{};
     creation.denoisers = denoisers;
     creation.denoisersNum = 1;
@@ -388,7 +439,8 @@ extern "C" int32_t mcdr_nrd_context_init(void* device, int32_t width, int32_t he
                           + desc->descriptorPoolDesc.perSetStorageTexturesMaxNum;
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heapDesc.NumDescriptors = perSet * desc->descriptorPoolDesc.setsMaxNum;
+    gNrd.descriptorsPerDispatch = perSet * desc->descriptorPoolDesc.setsMaxNum;
+    heapDesc.NumDescriptors = gNrd.descriptorsPerDispatch * kDispatchSlots;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     stage = "create descriptor heap";
     if (FAILED(static_cast<ID3D12Device*>(device)->CreateDescriptorHeap(
@@ -431,7 +483,8 @@ extern "C" int32_t mcdr_nrd_context_init(void* device, int32_t width, int32_t he
     uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
     D3D12_RESOURCE_DESC ringDesc{};
     ringDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    ringDesc.Width = static_cast<uint64_t>(gNrd.constantStride) * 64ull;
+    ringDesc.Width = static_cast<uint64_t>(gNrd.constantStride) * kDispatchSlots
+                   * kConstantSlotsPerDispatch;
     ringDesc.Height = 1;
     ringDesc.DepthOrArraySize = 1;
     ringDesc.MipLevels = 1;
@@ -448,6 +501,10 @@ extern "C" int32_t mcdr_nrd_context_init(void* device, int32_t width, int32_t he
     }
 
     gNrd.device = static_cast<ID3D12Device*>(device);
+    // 池纹理跨 pass 既被当 SRV 读也被当 UAV 写：状态由派发循环逐次显式过渡，
+    // 这里只记初始值（见 docs/rt/README.md §23.4）。
+    gNrd.permanentState.assign(gNrd.permanent.size(), D3D12_RESOURCE_STATE_COMMON);
+    gNrd.transientState.assign(gNrd.transient.size(), D3D12_RESOURCE_STATE_COMMON);
     gNrd.ready = true;
     appendLine(outText, capacity, used, "nrd: context ready, psos=%u pool=%u/%u heap=%u\n",
                created, permanent, transient, heapDesc.NumDescriptors);
@@ -458,9 +515,6 @@ extern "C" int32_t mcdr_nrd_context_init(void* device, int32_t width, int32_t he
 
 // ---- 逐帧派发 ----
 //
-// 资源归属：IN_* 与 OUT_* 指向引擎传进来的五张纹理，PERMANENT/TRANSIENT 指向上下文里的池纹理。
-// 每帧把每个 pass 的 SRV/UAV 视图写进可见堆的两块之一（按帧号奇偶轮转），避免 CPU 改描述符
-// 时 GPU 还在读上一帧的那一块。
 namespace {
 
 ID3D12Resource* resolveResource(const nrd::ResourceDesc& desc, const mcdr_nrd_frame* frame) {
@@ -475,6 +529,12 @@ ID3D12Resource* resolveResource(const nrd::ResourceDesc& desc, const mcdr_nrd_fr
             return static_cast<ID3D12Resource*>(frame->radianceIn);
         case nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST:
             return static_cast<ID3D12Resource*>(frame->radianceOut);
+        case nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST:
+            return static_cast<ID3D12Resource*>(frame->specularIn);
+        case nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST:
+            return static_cast<ID3D12Resource*>(frame->specularOut);
+        case nrd::ResourceType::OUT_VALIDATION:
+            return static_cast<ID3D12Resource*>(frame->validationOutput);
         case nrd::ResourceType::PERMANENT_POOL: {
             const uint32_t index = desc.indexInPool;
             return index < gNrd.permanent.size() ? gNrd.permanent[index].Get() : nullptr;
@@ -515,12 +575,15 @@ extern "C" int32_t mcdr_nrd_dispatch(const mcdr_nrd_frame* frame, char* outText,
     if (outText != nullptr && capacity > 0) {
         outText[0] = '\0';
     }
-    if (!gNrd.ready || gNrd.desc == nullptr || frame == nullptr || frame->list == nullptr) {
+    collectContexts();
+    if (!gNrd.ready || gNrd.desc == nullptr || frame == nullptr || frame->list == nullptr
+        || frame->completionFence == nullptr || frame->completionValue == 0) {
         return -1;
     }
     ID3D12Device* device = gNrd.device;
     ID3D12GraphicsCommandList* list = static_cast<ID3D12GraphicsCommandList*>(frame->list);
     const nrd::InstanceDesc& desc = *gNrd.desc;
+    int32_t used = 0;
 
     nrd::CommonSettings common{};
     for (int i = 0; i < 16; ++i) {
@@ -531,7 +594,7 @@ extern "C" int32_t mcdr_nrd_dispatch(const mcdr_nrd_frame* frame, char* outText,
     }
     common.motionVectorScale[0] = 1.0f / static_cast<float>(gNrd.width);
     common.motionVectorScale[1] = 1.0f / static_cast<float>(gNrd.height);
-    common.motionVectorScale[2] = 1.0f;
+    common.motionVectorScale[2] = 0.0f;
     common.resourceSize[0] = static_cast<uint16_t>(gNrd.width);
     common.resourceSize[1] = static_cast<uint16_t>(gNrd.height);
     common.resourceSizePrev[0] = common.resourceSize[0];
@@ -540,21 +603,29 @@ extern "C" int32_t mcdr_nrd_dispatch(const mcdr_nrd_frame* frame, char* outText,
     common.rectSize[1] = common.resourceSize[1];
     common.rectSizePrev[0] = common.rectSize[0];
     common.rectSizePrev[1] = common.rectSize[1];
-    // 本渲染器不做时间抖动：显式写 0。哪天给追踪加了抖动，这里必须同时改，
-            // 否则 NRD 会按「抖过的投影」重投影，而我们给的 MV 没抖 → 整屏拖影。
-            common.cameraJitter[0] = 0.0f;
-            common.cameraJitter[1] = 0.0f;
-            common.cameraJitterPrev[0] = 0.0f;
-            common.cameraJitterPrev[1] = 0.0f;
-            common.viewZScale = 1.0f;
+    common.cameraJitter[0] = frame->cameraJitter[0];
+    common.cameraJitter[1] = frame->cameraJitter[1];
+    common.cameraJitterPrev[0] = frame->cameraJitterPrev[0];
+    common.cameraJitterPrev[1] = frame->cameraJitterPrev[1];
+    common.viewZScale = 1.0f;
     common.denoisingRange = 500000.0f;
     common.disocclusionThreshold = 0.01f;
+    // 备用阈值与三个材质 ID 必须显式给：留 0 会被库判成非法参数，函数返回
+    // INVALID_ARGUMENT 而设置照旧生效 —— 只看返回值不看内容根本发现不了。
+    common.disocclusionThresholdAlternate = 0.01f;
+    common.strandMaterialID = 999.0f;
+    common.cameraAttachedReflectionMaterialID = 999.0f;
+    common.historyFixAlternatePixelStrideMaterialID = 999.0f;
     common.frameIndex = frame->frameIndex;
+    common.enableValidation = frame->validationOutput != nullptr;
     // 历史只在需要时丢：每帧 CLEAR_AND_RESTART 等于关掉时间累积，噪点全靠空间模糊。
-            common.accumulationMode = frame->resetHistory ? nrd::AccumulationMode::CLEAR_AND_RESTART
-                                                         : nrd::AccumulationMode::CONTINUE;
+    common.accumulationMode = frame->resetHistory ? nrd::AccumulationMode::CLEAR_AND_RESTART
+                                                  : nrd::AccumulationMode::CONTINUE;
     common.isMotionVectorInWorldSpace = false;
-    nrd::SetCommonSettings(*gNrd.instance, common);
+    if (nrd::SetCommonSettings(*gNrd.instance, common) != nrd::Result::SUCCESS) {
+        appendLine(outText, capacity, used, "nrd: common settings rejected\n");
+        return -1;
+    }
 
     nrd::ReblurSettings settings{};
     settings.maxAccumulatedFrameNum = 30;
@@ -567,21 +638,64 @@ extern "C" int32_t mcdr_nrd_dispatch(const mcdr_nrd_frame* frame, char* outText,
     settings.planeDistanceSensitivity = 0.01f;
     settings.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::AREA_3X3;
     settings.maxStabilizedFrameNum = 0;
-    nrd::SetDenoiserSettings(*gNrd.instance, 0, &settings);
-
-    const nrd::DispatchDesc* dispatches = nullptr;
-    uint32_t dispatchCount = 0;
-    if (nrd::GetComputeDispatches(*gNrd.instance, nullptr, 0, dispatches, dispatchCount)
-            != nrd::Result::SUCCESS
-        || dispatches == nullptr) {
+    if (nrd::SetDenoiserSettings(*gNrd.instance, 0, &settings) != nrd::Result::SUCCESS) {
+        appendLine(outText, capacity, used, "nrd: denoiser settings rejected\n");
         return -1;
     }
 
-    const uint32_t perSet = desc.descriptorPoolDesc.perSetTexturesMaxNum
-                          + desc.descriptorPoolDesc.perSetStorageTexturesMaxNum;
-    const uint32_t blockSize = perSet * desc.descriptorPoolDesc.setsMaxNum / 2u;
-    const UINT blockBase = (frame->frameIndex & 1u) != 0u ? blockSize : 0u;
-    const uint32_t constantBase = (frame->frameIndex & 1u) != 0u ? 32u : 0u;
+    // identifier 表不能留空：空表时库回 SUCCESS + 0 条派发，看着成功、其实一个 pass 都没跑。
+    const nrd::Identifier identifiers[1] = {0};
+    const nrd::DispatchDesc* dispatches = nullptr;
+    uint32_t dispatchCount = 0;
+    const nrd::Result gathered =
+        nrd::GetComputeDispatches(*gNrd.instance, identifiers, 1, dispatches, dispatchCount);
+    if (gathered != nrd::Result::SUCCESS || dispatches == nullptr || dispatchCount == 0) {
+        appendLine(outText, capacity, used, "nrd: no dispatch (result=%d)\n",
+                   static_cast<int32_t>(gathered));
+        return -1;
+    }
+
+    uint32_t descriptorCount = 0;
+    uint32_t constantCount = 0;
+    for (const auto& dispatch : std::span(dispatches, dispatchCount)) {
+        if (dispatch.pipelineIndex >= gNrd.pipelines.size()
+            || dispatch.constantBufferDataSize > gNrd.constantStride) {
+            appendLine(outText, capacity, used, "nrd: invalid dispatch layout\n");
+            return -1;
+        }
+        const auto& pipeline = desc.pipelines[dispatch.pipelineIndex];
+        uint32_t resourceCount = 0;
+        for (const auto& range : std::span(pipeline.resourceRanges, pipeline.resourceRangesNum)) {
+            resourceCount += range.descriptorsNum;
+        }
+        if (resourceCount != dispatch.resourcesNum) {
+            appendLine(outText, capacity, used, "nrd: resource layout mismatch\n");
+            return -1;
+        }
+        for (const auto& resource : std::span(dispatch.resources, dispatch.resourcesNum)) {
+            if (resolveResource(resource, frame) == nullptr) {
+                appendLine(outText, capacity, used, "nrd: dispatch resource missing\n");
+                return -1;
+            }
+        }
+        descriptorCount += resourceCount;
+        constantCount += dispatch.constantBufferDataSize != 0;
+    }
+    if (descriptorCount > gNrd.descriptorsPerDispatch || constantCount > kConstantSlotsPerDispatch) {
+        appendLine(outText, capacity, used, "nrd: dispatch capacity exceeded\n");
+        return -1;
+    }
+    auto availableSlot = std::ranges::find_if(gNrd.slots, &NrdDispatchSlot::complete);
+    if (availableSlot == gNrd.slots.end()) {
+        appendLine(outText, capacity, used, "nrd: GPU dispatch slots busy\n");
+        return -1;
+    }
+    const auto slotIndex = static_cast<uint32_t>(availableSlot - gNrd.slots.begin());
+    availableSlot->fence = static_cast<ID3D12Fence*>(frame->completionFence);
+    availableSlot->value = frame->completionValue;
+    const uint32_t blockSize = gNrd.descriptorsPerDispatch;
+    const UINT blockBase = slotIndex * blockSize;
+    const uint32_t constantBase = slotIndex * kConstantSlotsPerDispatch;
 
     ID3D12DescriptorHeap* heaps[2] = {gNrd.descriptors.Get(), gNrd.samplers.Get()};
     list->SetComputeRootSignature(gNrd.rootSignature.Get());
@@ -594,7 +708,9 @@ extern "C" int32_t mcdr_nrd_dispatch(const mcdr_nrd_frame* frame, char* outText,
     uint32_t slotCursor = blockBase;
     uint32_t constantCursor = constantBase;
     uint32_t missing = 0;
-
+    // 首帧把每个 pass 的管线、线程组、描述符数量报一次：线程组与描述符数量对不上时派发链照跑不报错，
+    // 只有挂死这一种症状，这一行表是唯一线索（见 docs/rt/README.md §23.3）。
+    const bool trace = !gNrd.traced;
     for (uint32_t i = 0; i < dispatchCount; ++i) {
         const nrd::DispatchDesc& dispatchDesc = dispatches[i];
         if (dispatchDesc.pipelineIndex >= gNrd.pipelines.size()) {
@@ -637,20 +753,40 @@ extern "C" int32_t mcdr_nrd_dispatch(const mcdr_nrd_frame* frame, char* outText,
                     ++(storage ? uavCursor : srvCursor);
                     continue;
                 }
-                DXGI_FORMAT format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-                if (resourceDesc.type == nrd::ResourceType::PERMANENT_POOL) {
-                    format = toDxgi(desc.permanentPool[resourceDesc.indexInPool].format);
-                } else if (resourceDesc.type == nrd::ResourceType::TRANSIENT_POOL) {
-                    format = toDxgi(desc.transientPool[resourceDesc.indexInPool].format);
-                } else if (resourceDesc.type == nrd::ResourceType::IN_VIEWZ) {
-                    format = DXGI_FORMAT_R32_FLOAT;
+                // 池纹理在同一帧里会被不同 pass 当 SRV 读、当 UAV 写：状态逐次显式切换。
+                // 只靠 COMMON 的隐式提升时，同一张纹理在同一个命令列表里换身份访问就是未定义行为，
+                // 表现是 GPU 偶发挂死而调试层一声不响。
+                D3D12_RESOURCE_STATES* poolState = nullptr;
+                if (resourceDesc.type == nrd::ResourceType::PERMANENT_POOL &&
+                    resourceDesc.indexInPool < gNrd.permanentState.size()) {
+                    poolState = &gNrd.permanentState[resourceDesc.indexInPool];
+                } else if (resourceDesc.type == nrd::ResourceType::TRANSIENT_POOL &&
+                           resourceDesc.indexInPool < gNrd.transientState.size()) {
+                    poolState = &gNrd.transientState[resourceDesc.indexInPool];
                 }
+                if (poolState != nullptr) {
+                    const D3D12_RESOURCE_STATES want = storage
+                        ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                        : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                    if (*poolState != want) {
+                        const D3D12_RESOURCE_BARRIER transition = {
+                            D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                            D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                            {{resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, *poolState, want}}};
+                        list->ResourceBarrier(1, &transition);
+                        *poolState = want;
+                    }
+                }
+                // 视图格式必须与资源一致：类型化格式不符时调试层拒建视图、描述符留空，
+                // 该 pass 读到垃圾而不报错。池纹理与输入纹理都按自己的描述给。
+                const DXGI_FORMAT format = resource->GetDesc().Format;
                 writeView(device, gNrd.descriptors.Get(), storage ? uavCursor++ : srvCursor++,
                           resource, format, storage);
             }
         }
 
-        if (dispatchDesc.constantBufferDataSize > 0 && constantCursor < 64u) {
+        if (dispatchDesc.constantBufferDataSize > 0
+            && constantCursor < constantBase + kConstantSlotsPerDispatch) {
             const uint64_t offset = static_cast<uint64_t>(constantCursor) * gNrd.constantStride;
             std::memcpy(gNrd.constantMapped + offset, dispatchDesc.constantBufferData,
                         dispatchDesc.constantBufferDataSize);
@@ -667,16 +803,50 @@ extern "C" int32_t mcdr_nrd_dispatch(const mcdr_nrd_frame* frame, char* outText,
         list->SetComputeRootDescriptorTable(2, uavHandle);
         list->SetPipelineState(gNrd.pipelines[dispatchDesc.pipelineIndex].Get());
         list->Dispatch(dispatchDesc.gridWidth, dispatchDesc.gridHeight, 1);
+        if (trace) {
+            appendLine(outText, capacity, used, "nrd: p%u %s pipe=%u grid=%ux%u srv=%u uav=%u\n", i,
+                       dispatchDesc.name != nullptr ? dispatchDesc.name : "-",
+                       static_cast<uint32_t>(dispatchDesc.pipelineIndex), dispatchDesc.gridWidth,
+                       dispatchDesc.gridHeight, srvCount, uavCount);
+        }
+        // 同一帧里连续派发、纹理状态不变，D3D12 不会自动给 UAV 之间排序：
+        // 少了这道全局屏障，后一个 pass 可能读到前一个 pass 写之前的像素。
+        const D3D12_RESOURCE_BARRIER hazard = {
+            D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {}};
+        list->ResourceBarrier(1, &hazard);
     }
 
-    int32_t used = 0;
-    appendLine(outText, capacity, used, "nrd: dispatched %u pass(es) missing=%u\n", dispatchCount,
+    if (trace) {
+
+        struct Named {
+            const char* name;
+            void* handle;
+        };
+        const Named inputs[7] = {{"mv", frame->motion},
+                                 {"nr", frame->normalRoughness},
+                                 {"viewz", frame->viewZ},
+                                 {"in", frame->radianceIn},
+                                 {"out", frame->radianceOut},
+                                 {"spec-in", frame->specularIn},
+                                 {"spec-out", frame->specularOut}};
+        for (const Named& input : inputs) {
+            const D3D12_RESOURCE_DESC texture =
+                static_cast<ID3D12Resource*>(input.handle)->GetDesc();
+            appendLine(outText, capacity, used, "nrd: %s %llux%llu fmt=%u\n", input.name,
+                       static_cast<unsigned long long>(texture.Width),
+                       static_cast<unsigned long long>(texture.Height),
+                       static_cast<uint32_t>(texture.Format));
+        }
+        gNrd.traced = true;
+    }
+
+    appendLine(outText, capacity, used, "nrd: dispatch passes=%u missing=%u\n", dispatchCount,
                missing);
-    return static_cast<int32_t>(dispatchCount);
+    return missing == 0 ? static_cast<int32_t>(dispatchCount) : -1;
 }
 
 extern "C" int32_t mcdr_nrd_context_shutdown(void) {
-    gNrd.release();
+    retireContext();
     return 1;
 }
 

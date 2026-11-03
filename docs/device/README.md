@@ -446,7 +446,7 @@ regionBaseSlot = frameSlot * sectionSize + reservedPerSection + worker * slotsPe
 | 异步渲染帧 | `gSubmittedFrames` / `gPresentedFrames` | 无固定深度 | 渲染线程 |
 | JVM 瞬态内存帧 | `FRAMES_IN_FLIGHT = 2` | 2 | `D3D12TransientMemory` 的 frame 队列 |
 
-**GPU 是否用完某个槽位，只有一个判据：全局队列 fence 的已完成值。**
+**GPU 是否用完某个槽位，须检查该槽位所属 encoder 的实际完成 fence/value。**
 `beginCommandList` 在 Reset 之前只等该槽位上一次的 per-list fence（三路 ring 的全部意义），
 而 `drawHeap` 的帧段重用依赖"上一轮的同一帧段已完成"，由 4 段 × 提交节奏共同保证。
 
@@ -591,8 +591,8 @@ mcdr::Result<void> transitionTo(CommandContext* ctx, ID3D12Resource* res,
 
 本层**不做**的（也是不能依赖的）：
 
-- **没有 barrier 批处理**：每次状态变化就是一次 `ResourceBarrier`，没有数组合并，
-  也没有按资源去重（`Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES`，所以是整资源粒度）。
+- 常规 `transitionTo` 每次状态变化调用一次 `ResourceBarrier`；SDK 接管/归还使用 §5.7 的批量屏障。
+  两条路径均使用整资源粒度，SDK 接管前拒绝重复绑定。
 - **没有 split barrier**：不存在"Begin 现在发、End 后面发"的写法。
 - **没有 enhanced barrier**：`OPTIONS12` 的 `enhancedBarriers` 只上报，不使用。
 
@@ -608,9 +608,75 @@ mcdr::Result<void> transitionTo(CommandContext* ctx, ID3D12Resource* res,
 `RENDER_TARGET` / `DEPTH_WRITE` 是**非可提升状态**，不会隐式 decay。不回切会让下一条 list 的
 barrier `Before` 与实际状态错配 → 每帧一条验证错误 → 最终 TDR。
 
-`COMMON` 是唯一可提升的状态：从 `COMMON` 隐式 decay 到"任何只读状态"是合法的，
-所以采样前的 `transitionTextureTo(PIXEL_SHADER_RESOURCE)` 在多数路径上会被吸收；
-但**从 `COMMON` 采样（不发 barrier）是未定义行为**，NVIDIA 驱动会静默返回黑色。
+`transitionTo` 在前后状态不同时显式转态，不依赖隐式提升。
+列表结束时显式回切，下一列表才能从创建时的初始状态继续跟踪。
+
+### 5.7 SDK 资源接管与归还
+
+在已打开、没有活跃 render pass 的列表中使用 `SdkResourceScope`。
+传入每张纹理的 SDK 入口/返回状态 `sdkState` 与引擎后续状态 `engineState`。
+NRD、RT Ray Reconstruction、RT 独立 DLSS SR、光栅 DLSS、XeSS 和 FSR 使用该机制。
+包装纹理使用 `SdkResourceAccess`；光栅 DLSS 的普通 TU 经 `DlssSdkResourceOps` 传递实际裸资源，
+由设备模块以 `SdkRawResourceAccess` 创建同一 scope，覆盖 SDK 内部选定的深度快照、MV 中间纹理和输出。
+
+1. 完整校验全部绑定后再录制屏障。纹理必须非空、互不别名、单 mip、单层、单采样；
+   UAV 输出必须有 `ALLOW_UNORDERED_ACCESS`，SRV 输入不得有 `DENY_SHADER_RESOURCE`。
+   非法绑定直接拒绝，不改变先前绑定的跟踪状态。
+2. 从 `CommandContext.resourceState` 推导入口屏障，批量提交。
+   同态 UAV 加 UAV 屏障；接管集合登记到 `externalResources`，并记录 SDK owner。
+3. SDK 返回后按适配层约定重新声明 `sdkState`，移除归属，再批量转到 `engineState`。
+   NRD/RR/RT DLSS SR 输入输出回 `COMMON`，XeSS/FSR 输入回 `COMMON`、输出回 `RENDER_TARGET`。
+   光栅 DLSS 在 scope 归还时将实际输入保持为 `NON_PIXEL_SHADER_RESOURCE`、实际输出保持为 UAV，
+   再由已归还的宿主路径执行拷回及 FG tagging；调用方 GUI 目标最终为 `RENDER_TARGET`。
+4. 显式 `reclaim()` 与析构共用收尾，重复调用不重复处理。
+   恢复 draw heap，并清空 `cachedPso`，让后续绘制重新绑定 SDK 改掉的 PSO。
+   SDK 返回失败也执行相同收尾。
+
+`transitionTo` 和显式 barrier 入口拒绝修改已接管资源；`beginCommandList` / `endCommandList`
+拒绝存在残留归属的上下文，并累计 violation。资源须保持有效直到本次提交的 fence 完成。
+这里的接管表示命令录制期间的归属，不延长或替代 GPU fence 生命周期。
+
+诊断入口为 `mcdr_dx12QuerySdkResourceState(ctx, texture, values, 8)`，成功返回 1，
+参数或纹理类型无效返回 0。调用者提供 8 个 `uint64_t`，与该 encoder 的录制同步调用。
+
+| 索引 | 数值 |
+| --- | --- |
+| 0 | 当前跟踪的 `D3D12_RESOURCE_STATES`；未跟踪纹理为 `COMMON` |
+| 1 | owner：0 引擎、1 NRD、2 RR、3 DLSS SR（RT/光栅）、4 XeSS、5 FSR |
+| 2 / 3 | encoder 生命周期内累计接管 / 归还次数 |
+| 4 | 接管校验拒绝次数，包含光栅 DLSS 的包装句柄/别名预检；其他入口的参数拒绝不一定计入 |
+| 5 | 当前尚未归还的资源数 |
+| 6 | 归属冲突或列表边界残留的 violation 次数 |
+| 7 | scope 归还时恢复 draw heap 的次数 |
+
+正常返回要求 owner、未归还资源数及 violation 均为 0，累计接管、归还和恢复堆次数相等。
+这些数值记录引擎跟踪状态；真实 GPU 状态还须通过 D3D12 debug layer 与后续访问验证。
+光栅 DLSS 的 create 返回后也恢复 draw heap 并清空 PSO 缓存；必须先结束 render pass 再 create/evaluate。
+`SdkResourceScope` 不覆盖 FG、NRC，不替代完整子资源/Split 跟踪或跨 encoder/队列同步。
+
+### 5.8 录制时的上传快照
+
+`buildTlas` 将 UPLOAD 堆实例表的有效 `instanceCount × 64` 字节复制到当前 encoder 的独立上传切片，
+GPU 构建读取该切片。调用返回后可以重新填写原实例表；同一命令列表中的多次构建也各自保留录制时内容。
+DEFAULT 堆实例表仍按命令顺序在 GPU 读取，调用者负责其写入与屏障。
+
+`dispatchComputeEx` 与 `dispatchRays` 共用的 `bindComputeStyle` 对 UPLOAD 堆 b0 常量执行相同快照。
+要求偏移按 256 字节对齐且小于源缓冲长度；复制偏移之后至多 65536 字节。
+DEFAULT 堆常量保留原 GPU 地址语义。
+
+`pushDescriptors` 对所有普通光栅与 mesh 通用 CBV 使用同一套上传快照。先验证整组 CBV，
+偏移必须非负、256 字节对齐且位于缓冲内；长度不得为负、超过 65536 或超出剩余范围。
+正长度按绑定切片复制，零长度取偏移后至多 65536 字节。非法范围在修改根绑定前拒绝。
+`drawMeshlets` 的独立 b8 入口也复制 UPLOAD 常量：偏移须对齐，至少剩余 32 字节，最多复制 256 字节，
+包含 RT 重放的相机偏移。DEFAULT 堆 CBV 保持 GPU 命令顺序语义，上传 SRV 与 SBT 不在覆盖范围内。
+
+`CommandContext.frameUploadPages[3]` 与 allocator/list 槽位共同归属 encoder。每页至少 64 KiB，
+大载荷按 256 字节对齐扩容，页内游标只增；同帧不会覆盖已分配切片。
+`beginCommandListWithWait` 等当前槽位的实际完成 fence 后，才将该槽位的页游标归零。
+页面保持映射并存活到 encoder 销毁；不根据 JVM 帧号或固定延迟猜测 GPU 是否读完。
+
+上传快照仅保证上述 CPU 输入的录制时版本，不代表完整 RT sub-frame 已迁到 native。
+几何、材质、AS 与降噪资源的同帧版本发布仍须由调用链共同维护。
 
 ---
 
@@ -711,55 +777,59 @@ DXC 侧另有一层**磁盘**缓存（不是内存缓存）：键 =
 native 侧**没有** `TransientMemory` / `PipelineCache` 类。`grep` 整个 `src\` 与 `include\`
 只命中一处注释，所以"瞬态内存"在 native 就是"256 对齐 + 缓冲池 + Map"。
 
-### 7.2 JVM 侧的环与块
+### 7.2 JVM 侧的上传块
 
-`D3D12TransientMemory.kt`（456 行）的常量就是这一层的参数表：
+`D3D12TransientMemory.kt` 使用分块上传与完成 fence 管理缓冲：
 
 | 常量 | 值 | 作用 |
 | --- | --- | --- |
-| `FRAMES_IN_FLIGHT` | 2 | 帧队列深度：帧内 bump 分配的资源保持 2 帧存活 |
-| `UBO_RING_COUNT` | 3 | `allocateGpuMapped` 的常驻 UPLOAD ring 路数 |
-| `UBO_RING_BLOCK_SIZE` | 4096 | 每路 ring 的字节数 |
+| `FRAMES_IN_FLIGHT` | 2 | 帧队列最少保留两次轮转；资源释放还必须等待所属 fence 完成 |
 | `STAGING_BLOCK_SIZE` | 512 KiB | staging 上传的块基准大小（对齐官方 `TransientBlockAllocator`） |
 | `MIN_BLOCK_ALIGNMENT` | 512 | 块内子分配的最小对齐 |
-| `STAGING_POOL_COUNT` | 3 | staging 块池的路数（3 > `FRAMES_IN_FLIGHT=2`） |
+| `STAGING_POOL_COUNT` | 3 | 上传块池的路数；复用依赖完成 fence，不依赖轮转次数 |
 | `MAX_POOL_BYTES_PER_POOL` | 4 MiB | 单路池常驻字节上限 |
 | `MAX_POOLED_BLOCK_SIZE` | 8 MiB | 超过该大小的单次上传块不入池，走帧延迟释放 |
 | `MAX_STAGING_MAP_RETRIES` | 1 | 映射失败最多再换 1 块 |
 
-**上传 ring 的 block 对齐是 512，不是 256。** 纹理上传以
+**上传块的最小对齐为 512 B。** 纹理上传以
 `PLACED_FOOTPRINT.Offset = srcOffset` 直接 `CopyTextureRegion`，偏移只有 256 对齐会让校验失败
 或内容错乱 —— `MIN_BLOCK_ALIGNMENT` 必须等于 `D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT`（512）。
 
-两条上传路径的归属不同，不能混：
+映射常量与 staging 上传共用分块分配器：
 
 | 路径 | 分配方式 | 释放 |
 | --- | --- | --- |
-| `uploadStaging(payload, align, usage)` | 512 KiB 块分配器，一次上传只切一块，返回块内切片；调用方只做一次 `CopyBufferRegion` | 块随帧 `rotate()` 归还本路池（`P[N % 3]`），最早帧 N+3 才再被取用 |
-| `allocateGpuMapped(size, align)` | 3 路常驻 UPLOAD ring 的当前路内 bump；`size > 剩余` 就切下一路 | **只由 `close()` 销毁**，绝不进 frame 队列 —— 归 `uboRing` 所有的缓冲如果也登记进 frame，第 3 次 `rotate()` 整体 close 之后会 map 到已销毁的对象 |
+| `uploadStaging(payload, align, usage)` | 512 KiB 起的上传块，返回块内切片；调用方录制拷贝 | `rotate()` 归还池并保存目标 fence；完成后才允许覆写 |
+| `allocateGpuMapped(size, align)` | 与 staging 共用上传块；按请求对齐，放不下则换块，支持大于 4 KiB 的映射 | 与 staging 相同；超大块或池满时进入 frame 列表，完成 fence 后释放 |
+
+分配先通过 `ensureListOpen` 结算异步提交，取该 encoder 当前 fence 加一作为目标值；
+`D3D12WaitForFence(ctx, target, 0)` 只检查完成状态，未完成时另分配，不等待复用。
+即使同一列表反复 `rotate()`，旧切片也必须保留至实际执行完成。不得把三次轮转等同于 GPU 完成。
 
 映射失败不抛异常：打一行 WARN、`discardStagingBlock`（不入池、不登记 frame）、换块重试；
 连续失败 `MAX_STAGING_MAP_RETRIES` 次才抛。
 
 ### 7.3 回读的完成回调
 
-回读**不是** fence 回调，是"下一次 submit 之后"的延迟列表：
+回读回调保存在录制拷贝的 JVM 编码器上，必须等到本次提交的 GPU fence 完成：
 
 ```
 copyTextureToBuffer(src, dst, offset, callback, ...)
-   → native：过渡到 COPY_SOURCE / COPY_DEST，录 CopyTextureRegion
+   → native：过渡到 COPY_SOURCE / COPY_DEST，录纹理拷贝与必要的紧凑行拷贝
    → pendingCallbacks.add(callback)
    → 帧 encoder：返回，不 submit
-   → 下一次 submit()：transientMemory.rotate() 之后依次 run()
+   → 下一次 submit()：等待本次提交完成与 GPU fence，再依次 run()
 ```
 
-**一次性 encoder 必须在这里立刻 `submit()` 并同步跑回调。**
-`Screenshot.takeScreenshot` 用的那种 encoder `device == null`、从不 submit；
-不立刻提交的话，每秒一次的自动截图都会留下一个 1.6 MB 的 READBACK 缓冲
-（vanilla 回调里的 `buffer.close()` 永不执行）。
+**一次性 encoder（`device == null`）立即 `submit()` 并等待完成后执行回调。**
+原版截图调用的设备入口返回共享帧编码器，截图本身不调用 submit，回调由正常帧提交执行。
+不得使用设备级全局回调列表；其他编码器可能先提交，但不能证明本次拷贝已完成。
 
-回调抛出的异常必须打出来（`"post-submit callback failed: <t>"`），
-否则外层的截图缓冲不会 close。
+回调异常输出 `readback: callback failed (<类型>)`。没有回调的提交不增加 GPU 等待。
+
+`copyTextureToBuffer` 输出自顶向下的紧凑行。目标偏移须符合 512 B、行距须符合 256 B 的纹理拷贝对齐；
+不满足时使用对齐的 DEFAULT 中转缓冲，再通过逐行 `CopyBufferRegion` 写入目标偏移。
+中转资源属于当前列表槽，等槽位 fence 完成后才释放。源区域与目标容量在录制前检查。
 
 ### 7.4 为什么必须设备级全局队列
 
@@ -931,7 +1001,7 @@ JVM 侧对应位置（相对仓库根）：
 | `Illusion\src\main\kotlin\dev\nts\expdxr\d3d12\extern\MCDR_ABI.kt` | FFM downcall 绑定与 `MCDR_Layout` |
 | `Illusion\src\main\kotlin\dev\nts\expdxr\d3d12\render\adapter\D3D12Device.kt` | 设备封装、`pipelineCache`、`close()` 顺序 |
 | `Illusion\src\main\kotlin\dev\nts\expdxr\d3d12\backend\D3D12CommandEncoderBackend.kt` | encoder 封装、`submit()` 的同步/异步分支、回读回调 |
-| `Illusion\src\main\kotlin\dev\nts\expdxr\d3d12\render\core\D3D12TransientMemory.kt` | 上传 ring、staging 块池、帧队列 |
+| `Illusion\src\main\kotlin\dev\nts\expdxr\d3d12\render\core\D3D12TransientMemory.kt` | 上传块、按 fence 回收的块池与帧队列 |
 
 ---
 

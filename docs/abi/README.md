@@ -6,11 +6,11 @@
 
 | 事实 | 值 | 出处 |
 | --- | --- | --- |
-| 契约文件 | `include\mcdr_abi.h`，1182 行 | — |
-| 导出函数 | 205 个 `MCDR_API ... MCDR_CALL` 声明 | 头文件全文 |
+| 契约文件 | `include\mcdr_abi.h` | — |
+| 导出函数 | 225 个 `MCDR_API ... MCDR_CALL` 声明 | 头文件全文 |
 | 跨语言 aggregate | 19 个（另有 9 个句柄 typedef，共 28 个 `typedef struct mcdr_*`） | 头文件全文 |
 | 调用约定 | `__cdecl` + C 链接（`MCDR_CALL` / `extern "C"`） | `include\mcdr_abi.h:23`、`:44-46` |
-| ABI 版本 | `MCDR_ABI_VERSION 7u` | `include\mcdr_abi.h:36` |
+| ABI 版本 | `MCDR_ABI_VERSION 23u` | `include\mcdr_abi.h` |
 | 布局自检记录 | 17 个结构体 / 206 条字段 | `src\c_abi\abi_meta.cpp` 的 `layoutTable()` |
 | 错误通道 | `int32_t` 返回值 + `mcdrLastError()` | `src\c_abi\abi_common.cpp`（错误槽）+ `src\c_abi\abi_meta.cpp`（导出） |
 | 唯一的 upcall 类型 | `mcdr_fence_callback_fn` | `include\mcdr_abi.h:1102` |
@@ -127,6 +127,7 @@ Java 侧不用 `Layout` 猜大小，镜像里每个字段都是显式类型。�
 | `mcdr_dx12SetDlssEnabled` | 调用后处于禁用状态（返回的是归一化状态，不是成败） |
 | `mcdrSetAntiAliasing` | 接受了但未实现（`DLAA` 降级为 OFF） |
 | `mcdrSetShadingRate` | 设备无法兑现该 rate（tier 0，或缺 additional rates） |
+| `mcdr_dx12NrdDenoiseTemporal` | 纹理/矩阵/偏移参数无效；非法偏移在接管前拒绝 |
 | `mcdrSetPixCapture` | 没有请求捕获（请求了才会返回 `1` / `-1`） |
 
 另外四种返回值形态同样属于契约：
@@ -218,12 +219,65 @@ typedef 直接指真实类（`d3d12_mc::Dx12Object` 等），所以 native 侧 `
 
 两个出口，同一个值：
 
-- 编译期宏 `MCDR_ABI_VERSION`（`include\mcdr_abi.h:36`，当前 `4u`）；
+- 编译期宏 `MCDR_ABI_VERSION`（`include\mcdr_abi.h`，当前 `23u`）；
 - 运行期 `uint32_t mcdrABIVersion(void)`，返回同一常量。
 
-JVM 侧常量 `MCDR_ABI_VERSION = 4`（`MCDR_ABI.kt:463`）。加载期比对，不等就抛
-`IllegalStateException("MCDR ABI version mismatch: java=4, native=X")`，装进 `LOAD_FAILURE`，
+JVM 侧常量 `MCDR_ABI_VERSION = 23`（`MCDR_ABI.kt`）。加载期比对，不等就抛
+`IllegalStateException("MCDR ABI version mismatch: java=23, native=X")`，装进 `LOAD_FAILURE`，
 后端彻底不可用——在首次绘制之前失败，而不是画到一半才发现结构体错位。
+
+`mcdr_dx12DlssdEval` 固定八张纹理：带噪线性颜色、输出、正 viewZ、像素 MV、原始 normal/roughness、
+diffuse albedo、specular albedo、世界单位 specular hit distance。第八张为 `R32_FLOAT`，
+反射打空写 `1e9`，无效距离写 0，标签为 `kBufferTypeSpecularHitDistance`。
+禁止传入 NRD 的归一化距离或八面体编码法线。相机载荷为 104 floats：
+四个行主序重投影矩阵、near/far/FOV/aspect、当前/上一帧屏幕内容偏移 xy、worldToView 与 viewToWorld。
+偏移位于 68–71，单位为 render 像素；当前 68/69 写入 `sl::Constants.jitterOffset`。
+四分量须有限且位于 `[-0.5,0.5]`，RR/RT SR 均在接管资源前拒绝非法值。所有 SDK 矩阵不含 jitter。
+调用方必须提供完整长度；此入口没有独立的相机数组长度参数，旧载荷与新 DLL 不兼容。
+
+`mcdr_dx12RtSrEval` 固定四张纹理：render 尺寸线性 HDR 颜色、display 尺寸 RGBA16F 输出、
+render 尺寸 R32_FLOAT 设备深度、render 尺寸像素 MV。深度使用 `kBufferTypeDepth`，
+禁止直接传入 RR 的正 viewZ。相机复用上述 104-float 载荷，矩阵与帧号的语义相同。
+返回值大于 0 表示已接受求值，0 表示不可用或输入不完整，负数表示参数/命令列表/SDK 失败；
+`outText` 接收容量受限的 NUL 结尾诊断。指针仅在调用期间有效。
+
+`mcdr_dx12DlssdEvalExposure` / `mcdr_dx12RtSrEvalExposure` 在 `constants` 与 `outText` 之间
+增加独立非空 `const float* exposure`，依次为 `preExposure / exposureScale` 两个 float。
+相机载荷仍为 104 floats，不得在旧数组尾部读取曝光参数。两个分量须有限且在闭区间
+`[2^-16,2^16]`。JVM 使用 `MCDRLayout.RT_EXPOSURE_FLOAT_COUNT=2`，检查相机段至少 416 B。
+RR 接收八或九张纹理，RT SR 接收四或五张；额外最后一张必须是 1×1 `R32_FLOAT` 曝光倍率。
+所有纹理须为单 mip、单层、单采样 2D 资源，尺寸符合各自标签；输出须可作 UAV，
+输入须可作 SRV，禁止别名或已由 SDK 接管的资源。非法输入在资源接管前返回 0。
+旧入口保持八/四纹理签名，曝光参数默认 1；两种入口共用同一 feature 生命周期。
+
+曝光资源的有无改变时，先等待该 viewport 上次求值的 completion fence，再调用 `slFreeResources`
+释放 feature 并失效选项缓存；下一次成功求值消耗 pending reset。同一未提交命令列表内切换模式
+返回 0，诊断为 `exposure: submit before switching modes`，不接管纹理；其他未完成提交最多等待 5 秒。
+跨 encoder 也必须等待旧 encoder 自己的 fence；另一 encoder 的完成值即使更大，也不能提前满足它。
+旧列表尚未提交或 GPU queue 被阻塞时，超时返回 0，诊断 `exposure: previous frame still in flight`；
+该拒绝保持资源状态/归属/计数不变。提交旧列表或解除 GPU 阻塞后，可以在原新列表上重试。
+曝光纹理按 NPSR 接管，SDK 返回后与其余纹理一起归还 `COMMON`。
+资源必须存活至提交 fence 完成；函数返回仅表示录制结束。native 不读取纹理内倍率，
+调用方须保证有限正值。玩家 RR/RT DLSS-SR 调用显式入口，两个标量均为 1，
+曝光纹理由引擎手动/自动测光生成，最终合光读取相同倍率。
+
+`mcdr_dx12NrdDenoise` 严格接收七张纹理：像素 MV、packed normal/roughness、正 viewZ、
+diffuse-in、diffuse-out、specular-in、specular-out。两路辐亮度均为 RGBA16F YCoCg，
+alpha 为各自归一化命中距离；实际实例为 `REBLUR_DIFFUSE_SPECULAR`。
+零基索引 4/6 转 UAV，其余转 NPSR，执行完成后回 COMMON。
+四个列主序矩阵依次为当前/上一帧投影与当前/上一帧 worldToView，共 64 floats。
+拒绝五纹理输入；此入口的函数形参类型与 FFM descriptor 固定，当前/上一帧 jitter 均为零。
+
+`mcdr_dx12NrdDenoiseTemporal` 使用同样的七张纹理与 64-float 无 jitter 矩阵，
+另以非空 `jitter` 指针传入四个 float，顺序为当前 x/y、上一帧 x/y。
+数值直接写入 NRD `cameraJitter` / `cameraJitterPrev`，单位为渲染像素，
+对应 SDK 的 `sampleUv = pixelUv + cameraJitter / rectSize`；不在 native 转符号或缩放。
+每个分量必须有限且在闭区间 `[-0.5,0.5]`，空指针或非法值返回 0，拒绝发生在资源接管前。
+原始 C 指针不携带长度，调用方须保证矩阵至少 64 floats、偏移至少 4 floats，生命周期覆盖整个调用。
+JVM 的 `D3D12NrdDenoiseTemporal` 包装检查 256 B 矩阵与 16 B 偏移长度，
+偏移个数登记为 `MCDRLayout.NRD_JITTER_FLOAT_COUNT=4`。实际 RT 帧使用显式入口，
+JVM 将共享 Halton `(Jx,Jy)` 转为 NRD 采样偏移 `(-Jx,+Jy)`；RR/SR 使用 `(Jx,-Jy)`。
+成功、SDK 失败与无打开命令列表的返回值沿用原入口，资源收尾见 [NRD 后端](../advanced/nrd.md)。
 
 **什么情况下必须 +1**（满足任一条）：
 
@@ -388,6 +442,7 @@ C 侧大小只写在结构体注释里（例如 `include\mcdr_abi.h` 的 `sizeof
 | `mcdr_pipeline_binding_desc.type` | `0` = CBV，`1` = SRV + static sampler，`2` = SRV |
 | `mcdr_partition_draw.indexType` | `0` = `SHORT`（R16_UINT），`1` = `INT`（R32_UINT） |
 | `mcdr_color_target_desc.format` | `GpuFormat` 序号；`-1` = 该槽位不用 |
+| `mcdr_sr_dispatch.flags` | `0` = MV 含 jitter；`MCDR_SR_FLAG_UNJITTERED_MV`（1）= 已移除 jitter，限通用 FSR/XeSS；未知位与通用 DLSS 的非零 flags 返回 -1。布局仍为 136 B |
 | `mcdr_input_element_desc.stepRate` | `0` = per-vertex，`1` = per-instance |
 | `mcdr_input_element_desc.semanticName` | `NULL` 或 `""` 时按 `"TEXCOORD"` 处理 |
 | `mcdrSetAntiAliasing(mode)` | `0` = OFF，`1` = SMAA，`2` = TAA，`3` = DLAA（当前降级为 OFF） |
@@ -447,6 +502,11 @@ C 侧大小只写在结构体注释里（例如 `include\mcdr_abi.h` 的 `sizeof
 ## 8. 失败处理总则
 
 失败**从不**以异常形式跨越边界：没有 C++ 异常、没有 `longjmp`，只有返回值 + 错误串。
+
+`mcdr_dx12NrdDenoiseTemporal` 返回正数表示已记录的 NRD pass 数，0 表示输入被拒绝，
+`-1` 表示实例未就绪、派发槽位占满或 SDK 失败，`-2` 表示没有打开的命令列表。
+空偏移指针与非法偏移返回 0，`outText` 在有效容量下清空；该早期拒绝不写 TLS 错误槽。
+诊断为空时保留返回码，不把旧的 `mcdrLastError()` 当成本次失败原因。
 装配规则固定为：
 
 1. 校验失败 → `failWith(what, msg)`：写本线程错误槽，`stderr` 打一行 ERROR，返回 `0`；
@@ -484,11 +544,18 @@ C 侧大小只写在结构体注释里（例如 `include\mcdr_abi.h` 的 `sizeof
 - 成功路径是否应该清空错误槽：`src\c_abi\abi_common.cpp` 里没有任何清空调用点，也没写这条约定。
 - 错误槽是否在线程/设备销毁时重置：没有相关代码。
 
+### 8.4 SDK 归属诊断
+
+`mcdr_dx12QuerySdkResourceState(ctx, texture, values, count)` 读取指定 encoder 的纹理状态与 SDK 归属。
+传入有效纹理和 8 个 `uint64_t` 的缓冲区，`count` 固定为 8。成功返回 1，参数无效返回 0。
+字段顺序、owner 数值及适用范围见 [设备层 §5.7](../device/README.md#57-sdk-资源接管与归还)。
+此入口只读取诊断信息，不等待 GPU，也不发屏障。JVM 包装为 `MCDR_ABI.D3D12QuerySdkResourceState`。
+
 ## 文件导航
 
 | 路径（相对 `MCDR\`） | 负责什么 |
 | --- | --- |
-| `include\mcdr_abi.h` | 唯一契约：类型映射注释、9 个句柄、19 个 aggregate、205 个导出、`MCDR_ABI_VERSION` |
+| `include\mcdr_abi.h` | 唯一契约：类型映射注释、9 个句柄、19 个 aggregate、225 个导出、`MCDR_ABI_VERSION` |
 | `src\module\c_abi\mcdr_abi_common.cppm` | `mcdr.abi.common` 接口单元：声明 `lastErrorText` / `setLastError` / `setLastErrorf` / `failWith` / `failVoid` / `writeString` |
 | `src\c_abi\abi_common.cpp` | 上述 6 个函数的唯一实现：线程局部错误槽、两阶段字符串写出、ERROR 行格式 |
 | `src\c_abi\abi_meta.cpp` | `mcdrABIVersion` / `mcdrABILayout` / `layoutTable()`（177 条记录）、`mcdrLastError`、日志级别与镜像文件入口、PIX/AA/DLSS 开关转发 |
@@ -510,7 +577,7 @@ C 侧大小只写在结构体注释里（例如 `include\mcdr_abi.h` 的 `sizeof
    三处一致：先改结构，再改镜像，最后改本文。
 3. 新增 aggregate 时，每个命名字段（含 `_padN`）都要登记进 `layoutTable()`；漏登记只会以
    `missing from the native layout report` 的形式在设备创建时炸掉。
-4. 新增导出 → 更新 §1 的计数（`MCDR_API ... MCDR_CALL` 声明数，当前 205）、§2.1 / §8 的返回值
+4. 新增导出 → 更新 §1 的计数（`MCDR_API ... MCDR_CALL` 声明数，当前 225）、§2.1 / §8 的返回值
    形态表，以及需要的 §3 句柄表。
 5. 本文只写当下：不写工单号、会话号，不引用仓库外的文件；指路只指 `docs\` 下真实存在的文档，
    并与 `docs\overview.md` 的文档地图保持一致。

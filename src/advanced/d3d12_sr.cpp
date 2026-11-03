@@ -11,13 +11,36 @@ module;
 #include "mcdr_abi.h"
 
 #include <cstdio>
-#include <cwchar>
 #include <string_view>
 
 module mcdr.d3d12.device;
 
 namespace d3d12_mc {
 void releaseProviderWithWait(CommandContext* ctx);
+
+bool SrContextCompletion::ready(CommandContext* ctx) const {
+    if (fence_ == nullptr) return true;
+    const UINT64 completed = fence_->GetCompletedValue();
+    if (completed == UINT64_MAX) return false;
+    if (completed >= value_) return true;
+    if (ctx != nullptr && fence_.Get() == ctx->fence.Get() && value_ == ctx->fenceValue + 1) return false;
+    const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (event == nullptr) return false;
+    const HRESULT result = fence_->SetEventOnCompletion(value_, event);
+    const bool completedInTime = SUCCEEDED(result) && WaitForSingleObject(event, 5000) == WAIT_OBJECT_0;
+    CloseHandle(event);
+    return completedInTime;
+}
+
+void SrContextCompletion::record(CommandContext* ctx) {
+    fence_ = ctx->fence;
+    value_ = ctx->fenceValue + 1;
+}
+
+void SrContextCompletion::clear() {
+    fence_.Reset();
+    value_ = 0;
+}
 
 namespace {
 
@@ -314,7 +337,7 @@ int32_t srResizeProvider(int32_t renderWidth, int32_t renderHeight, int32_t disp
 }
 
 int32_t srEvaluateFrame(CommandContext* ctx, const mcdr_sr_dispatch& desc) {
-    if (ctx == nullptr) {
+    if (ctx == nullptr || ctx->commandList == nullptr || !ctx->listOpen || ctx->inRenderPass) {
         return -1;
     }
     int32_t backendId = static_cast<int32_t>(desc.backend);
@@ -327,16 +350,12 @@ int32_t srEvaluateFrame(CommandContext* ctx, const mcdr_sr_dispatch& desc) {
     if (backendId == MCDR_SR_BACKEND_NONE) {
         return 0;
     }
+    if ((desc.flags & ~MCDR_SR_FLAG_UNJITTERED_MV) != 0 ||
+        (backendId == MCDR_SR_BACKEND_DLSS && desc.flags != 0)) return -1;
     if (!ensureProvider(ctx, backendId, desc)) {
         return 0;  // 不可用 / 未实现：由 SrQuery / SrQueryCaps 报原因
     }
-    // PIX / RenderDoc 区间名：BeginEvent / EndEvent 只在抓帧工具附加时有开销。
-    wchar_t eventName[96] = {};
-    swprintf_s(eventName, L"SR:%hs %dx%d->%dx%d", nameOf(backendId), desc.renderWidth,
-               desc.renderHeight, desc.displayWidth, desc.displayHeight);
-    ctx->commandList->BeginEvent(0, eventName, static_cast<UINT>(wcslen(eventName)));
     const bool ok = gSrProvider->evaluate(ctx, desc);
-    ctx->commandList->EndEvent();
     gSrLastRenderWidth = desc.renderWidth;
     gSrLastRenderHeight = desc.renderHeight;
     gSrLastDisplayWidth = desc.displayWidth;
@@ -444,6 +463,10 @@ std::string srStatusText(void) {
         text += std::to_string(gSrLastDisplayWidth);
         text += "x";
         text += std::to_string(gSrLastDisplayHeight);
+    }
+    if (gSrProvider != nullptr) {
+        text += " mvJitter=";
+        text += gSrProvider->motionVectorsJittered() ? "1" : "0";
     }
     mcdr_sr_caps caps{};
     srFillCaps(gSrActive, caps);
