@@ -8,7 +8,7 @@
 //                            顶层窗口上）。
 //
 // 为什么单拎一个普通 TU：surface 是模块单元，模块 purview 里的定义无法被普通 TU（ABI
-// 层）链接，故状态放在一个普通翻译单元（src\core\d3d12_surface_opts_state.cpp）里，经这
+// 层）链接，故状态放在 src/render/presentation/d3d12_surface_opts_state.cpp，经这
 // 组 C 链接函数共享（与 mcdr_hdr_state.h 同一套路）。
 #pragma once
 

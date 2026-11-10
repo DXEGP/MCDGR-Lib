@@ -51,6 +51,10 @@
     <OutDir>target\$(Platform)_$(Configuration)\</OutDir>
     <IntDir>build\$(Platform)_$(Configuration)\</IntDir>
   </PropertyGroup>
+  <PropertyGroup>
+    <MCDRDependencyRoot Condition="'$(MCDRDependencyRoot)'==''">$(ProjectDir)</MCDRDependencyRoot>
+    <MCDRDependencyDirectory>$([MSBuild]::EnsureTrailingSlash($([MSBuild]::NormalizePath('$(ProjectDir)', '$(MCDRDependencyRoot)'))))</MCDRDependencyDirectory>
+  </PropertyGroup>
   <PropertyGroup Label="Vcpkg">
     <VcpkgEnableManifest>true</VcpkgEnableManifest>
   </PropertyGroup>
@@ -109,12 +113,12 @@
            its runtime (NRC_D3D12.dll + the CUDA 13 DLLs, ~113 MB) plus Tensor
            Cores is a user-supplied install, so MCDR.dll must keep loading
            without it. The first change that actually calls nrc::d3d12::* adds
-             <AdditionalLibraryDirectories>$(ProjectDir)external\nrc\Lib\x64</...>
+             <AdditionalLibraryDirectories>$(MCDRDependencyDirectory)external\nrc\Lib\x64</...>
              <AdditionalDependencies>NRC_D3D12.lib</...>
              <DelayLoadDLLs>NRC_D3D12.dll</DelayLoadDLLs>  (+ delayimp.lib)
            so the import becomes lazy and a missing DLL surfaces as a
            feature-unavailable error instead of MCDR.dll failing to load. -->
-      <AdditionalIncludeDirectories>$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include;$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include\directx-dxc;$(ProjectDir)include;$(ProjectDir)src\c_abi;$(ProjectDir)src\core;$(ProjectDir)src\advanced;$(ProjectDir)external\dlss\include;$(ProjectDir)external\nrd\Include;$(ProjectDir)external\xess\inc;$(ProjectDir)external\xess\inc\xess;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\api\include;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\api\include\dx12;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\framegeneration\include;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\framegeneration\include\dx12;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\upscalers\include;$(ProjectDir)external\fidelityfx\include;$(ProjectDir)external\streamline\include;$(ProjectDir)external\nrc\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(MCDRDependencyDirectory)vcpkg_installed\$(VcpkgTriplet)\include;$(MCDRDependencyDirectory)vcpkg_installed\$(VcpkgTriplet)\include\directx-dxc;$(ProjectDir)include;$(ProjectDir)src\c_abi;$(MCDRDependencyDirectory)external\dlss\include;$(MCDRDependencyDirectory)external\nrd\Include;$(MCDRDependencyDirectory)external\xess\inc;$(MCDRDependencyDirectory)external\xess\inc\xess;$(MCDRDependencyDirectory)external\fidelityfx\Kits\FidelityFX\api\include;$(MCDRDependencyDirectory)external\fidelityfx\Kits\FidelityFX\api\include\dx12;$(MCDRDependencyDirectory)external\fidelityfx\Kits\FidelityFX\framegeneration\include;$(MCDRDependencyDirectory)external\fidelityfx\Kits\FidelityFX\framegeneration\include\dx12;$(MCDRDependencyDirectory)external\fidelityfx\Kits\FidelityFX\upscalers\include;$(MCDRDependencyDirectory)external\fidelityfx\include;$(MCDRDependencyDirectory)external\streamline\include;$(MCDRDependencyDirectory)external\nrc\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <!-- These sources have Chinese comments; without /utf-8 the compiler
            reads them under the active code page and mangles them. -->
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
@@ -198,13 +202,13 @@
        ========================================================================== -->
   <ItemDefinitionGroup Condition="'$(Platform)'=='x64' And '$(Configuration)'!='Debug'">
     <Link>
-      <AdditionalLibraryDirectories>$(ProjectDir)lib\streamline\lib\x64;$(ProjectDir)external\dlss\lib\Windows_x86_64\x64;$(ProjectDir)external\nrd\Lib\x64\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(MCDRDependencyDirectory)lib\streamline\lib\x64;$(MCDRDependencyDirectory)external\dlss\lib\Windows_x86_64\x64;$(MCDRDependencyDirectory)external\nrd\Lib\x64\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>nvsdk_ngx_d.lib;NRD.lib;ShaderMakeBlob.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Platform)'=='x64' And '$(Configuration)'=='Debug'">
     <Link>
-      <AdditionalLibraryDirectories>$(ProjectDir)lib\streamline\lib\x64;$(ProjectDir)external\dlss\lib\Windows_x86_64\x64;$(ProjectDir)external\nrd\Lib\x64\Debug;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(MCDRDependencyDirectory)lib\streamline\lib\x64;$(MCDRDependencyDirectory)external\dlss\lib\Windows_x86_64\x64;$(MCDRDependencyDirectory)external\nrd\Lib\x64\Debug;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <!-- _dbg variants: same API, built against the debug CRT (/MDd). -->
       <AdditionalDependencies>nvsdk_ngx_d_dbg.lib;NRD.lib;ShaderMakeBlob.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
@@ -232,17 +236,17 @@
          (ScanSourceForModuleDependencies is on, so the src\c_abi\*.cpp below
          are likewise detected as implementation units of mcdr.abi.common even
          though they keep the .cpp extension.) -->
-    <ClCompile Include="src\advanced\smaa_luts.cpp" />
+    <ClCompile Include="src\render\antialiasing\smaa_luts.cpp" />
     <ClCompile Include="src\module\c_abi\mcdr_abi_common.cppm" />
     <!-- 叶子模块：Error / Result<T>，不 import 任何 mcdr.* 模块 -->
-    <ClCompile Include="src\module\core\mcdr_error.cppm" />
-    <ClCompile Include="src\module\core\d3d12_descriptor_allocator.cppm" />
-    <ClCompile Include="src\module\core\d3d12_async_descriptor.cppm" />
-    <ClCompile Include="src\module\core\d3d12_async_fence.cppm" />
-    <ClCompile Include="src\module\core\d3d12_async_executor.cppm" />
-    <ClCompile Include="src\module\core\d3d12_async_bundle.cppm" />
-    <ClCompile Include="src\module\core\mcdr_device.cppm" />
-    <ClCompile Include="src\module\advanced\d3d12_mesh.cppm" />
+    <ClCompile Include="src\module\diagnostics\mcdr_error.cppm" />
+    <ClCompile Include="src\module\backend\memory\d3d12_descriptor_allocator.cppm" />
+    <ClCompile Include="src\module\backend\memory\d3d12_async_descriptor.cppm" />
+    <ClCompile Include="src\module\backend\command\d3d12_async_fence.cppm" />
+    <ClCompile Include="src\module\backend\command\d3d12_async_executor.cppm" />
+    <ClCompile Include="src\module\backend\command\d3d12_async_bundle.cppm" />
+    <ClCompile Include="src\module\backend\device\mcdr_device.cppm" />
+    <ClCompile Include="src\module\render\terrain\d3d12_mesh.cppm" />
   </ItemGroup>
   <ItemGroup>
     <!-- C ABI 适配单元，按**功能**命名与排列（不再按移植阶段 pX）。单元之间的
@@ -264,33 +268,37 @@
     <ClCompile Include="src\c_abi\abi_sr.cpp" />
     <ClCompile Include="src\c_abi\abi_framegen.cpp" />
     <!-- DLL 入口点：普通 TU（不属于任何命名模块），见文件内注释 -->
-    <ClCompile Include="src\core\dllmain.cpp" />
-    <ClCompile Include="src\core\d3d12_descriptor_allocator.cpp" />
-    <ClCompile Include="src\core\d3d12_device.cpp" />
-    <ClCompile Include="src\core\d3d12_surface.cpp" />
+    <ClCompile Include="src\platform\dllmain.cpp" />
+    <ClCompile Include="src\backend\memory\d3d12_descriptor_allocator.cpp" />
+    <ClCompile Include="src\diagnostics\d3d12_diagnostics.cpp"></ClCompile>
+    <ClCompile Include="src\diagnostics\d3d12_pix.cpp"></ClCompile>
+    <ClCompile Include="src\backend\shader\d3d12_shader.cpp"></ClCompile>
+    <ClCompile Include="src\render\antialiasing\d3d12_postprocess.cpp"></ClCompile>
+    <ClCompile Include="src\backend\device\d3d12_device.cpp" />
+    <ClCompile Include="src\render\presentation\d3d12_surface.cpp" />
     <!-- P272：超分 Provider 接口层（能力表 + DLSS provider + 注册表）。与 d3d12_device.cpp
          同属模块 mcdr.d3d12.device 的实现单元，所以不需要额外设置。 -->
-    <ClCompile Include="src\advanced\d3d12_sr.cpp" />
-    <ClCompile Include="src\advanced\d3d12_framegen.cpp" />
-    <ClCompile Include="src\advanced\d3d12_fsr.cpp" />
-    <ClCompile Include="src\advanced\d3d12_xess.cpp" />
-    <ClCompile Include="src\advanced\d3d12_xessfg.cpp" />
-    <ClCompile Include="src\advanced\d3d12_fsffg.cpp" />
+    <ClCompile Include="src\render\reconstruction\d3d12_sr.cpp" />
+    <ClCompile Include="src\render\presentation\d3d12_framegen.cpp" />
+    <ClCompile Include="src\render\reconstruction\d3d12_fsr.cpp" />
+    <ClCompile Include="src\render\reconstruction\d3d12_xess.cpp" />
+    <ClCompile Include="src\render\presentation\d3d12_xessfg.cpp" />
+    <ClCompile Include="src\render\presentation\d3d12_fsffg.cpp" />
     <!-- P267：SeamlessWindowHost（呈现子窗口 + GL 隔离），普通 TU -->
-    <ClCompile Include="src\core\d3d12_window_host.cpp" />
+    <ClCompile Include="src\platform\d3d12_window_host.cpp" />
     <!-- P197：HDR 状态单元。普通 TU（surface 是模块单元、DLSS 是普通 TU，
          模块 purview 里的定义无法被普通 TU 链接，故状态单拎出来）。 -->
-    <ClCompile Include="src\advanced\d3d12_hdr_state.cpp" />
-    <ClCompile Include="src\advanced\d3d12_rt_state.cpp" />
+    <ClCompile Include="src\render\presentation\d3d12_hdr_state.cpp" />
+    <ClCompile Include="src\render\config\d3d12_rt_state.cpp" />
     <!-- P251：交换链建链选项（allowTearing / presentChild）状态单元，同为普通 TU。 -->
-    <ClCompile Include="src\core\d3d12_surface_opts_state.cpp" />
-    <ClCompile Include="src\core\d3d12_async_descriptor.cpp" />
-    <ClCompile Include="src\core\d3d12_async_fence.cpp" />
-    <ClCompile Include="src\advanced\d3d12_rtx_probe.cpp" />
+    <ClCompile Include="src\render\presentation\d3d12_surface_opts_state.cpp" />
+    <ClCompile Include="src\backend\memory\d3d12_async_descriptor.cpp" />
+    <ClCompile Include="src\backend\command\d3d12_async_fence.cpp" />
+    <ClCompile Include="src\diagnostics\d3d12_rtx_probe.cpp" />
     <!-- P108：DLSS 超分实现单元。普通 TU（与 rtx_probe 同理）：只有它 #include
          nvsdk_ngx*.h，设备模块永远不碰 NGX 类型，许可面因此收在一个文件里。 -->
-    <ClCompile Include="src\advanced\d3d12_dlss.cpp" />
-    <ClCompile Include="src\advanced\d3d12_mesh_base.cpp" />
+    <ClCompile Include="src\render\reconstruction\d3d12_dlss.cpp" />
+    <ClCompile Include="src\render\terrain\d3d12_mesh_base.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include=".clang-format" />

@@ -14,7 +14,7 @@
 // 所以「可用」在这四家里含义不同，各自的字段注释里写清楚了是哪一种。
 //
 // 为什么是普通头文件而不是模块：
-//   设备模块（mcdr.d3d12.device）与探测实现单元（src\core\d3d12_rtx_probe.cpp）
+//   设备模块（mcdr.d3d12.device）与 src/diagnostics/d3d12_rtx_probe.cpp
 //   都要读它。放进模块就意味着探测实现必须 import 设备模块、设备模块又 import
 //   探测模块 —— 循环。所以这里与 mcdr_abi.h 用同一套办法：一个纯数据结构体
 //   加几个自由函数，实现留在探测单元里，谁都能调。

@@ -1686,3 +1686,20 @@ std::string enumerateAdaptersJson();
 // DXCore 不可用时这些字段回落为 ""/false，其余字段全部来自 DXGI。
 std::string adapterInfoJson();
 }  // namespace d3d12_mc
+
+namespace d3d12_mc {
+void installCrashHandlerOnce();
+void dumpPendingDeleteCrashContext();
+void dumpDeviceMessages();
+void registerDebugMessageCallback(ID3D12InfoQueue1* queue);
+int nativeLogLevel();
+int loadPixCapturer();
+std::string formatBackendResult(HRESULT result);
+std::string backendWideToUtf8(const std::wstring& text);
+void recordPipelineCreation();
+UINT syncDrawDescriptorCapacity();
+std::string graphicsShaderModelProfile();
+std::string sm69RequirementText();
+std::string firstLine(const std::string& text);
+std::string errorMessage(const mcdr::Error& error);
+}
