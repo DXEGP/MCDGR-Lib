@@ -7,14 +7,46 @@
 | 事实 | 值 | 出处 |
 | --- | --- | --- |
 | 契约文件 | `include\mcdr_abi.h` | — |
-| 导出函数 | 225 个 `MCDR_API ... MCDR_CALL` 声明 | 头文件全文 |
-| 跨语言 aggregate | 19 个（另有 9 个句柄 typedef，共 28 个 `typedef struct mcdr_*`） | 头文件全文 |
+| 导出函数 | 268 个 `MCDR_API ... MCDR_CALL` 声明 | 头文件全文 |
+| 跨语言 aggregate | 43 个（另有 9 个句柄 typedef，共 52 个 `typedef struct mcdr_*`） | 头文件全文 |
 | 调用约定 | `__cdecl` + C 链接（`MCDR_CALL` / `extern "C"`） | `include\mcdr_abi.h:23`、`:44-46` |
-| ABI 版本 | `MCDR_ABI_VERSION 23u` | `include\mcdr_abi.h` |
-| 布局自检记录 | 17 个结构体 / 206 条字段 | `src\c_abi\abi_meta.cpp` 的 `layoutTable()` |
+| ABI 版本 | `MCDR_ABI_VERSION 47u` | `include\mcdr_abi.h` |
+| 布局自检记录 | 41 个结构体 / 459 条字段 | `src\c_abi\abi_meta.cpp` 的 `layoutTable()` |
 | 错误通道 | `int32_t` 返回值 + `mcdrLastError()` | `src\c_abi\abi_common.cpp`（错误槽）+ `src\c_abi\abi_meta.cpp`（导出） |
 | 唯一的 upcall 类型 | `mcdr_fence_callback_fn` | `include\mcdr_abi.h:1102` |
-| JVM 对端 | `MCDR_ABI.kt`（绑定）、`MCDR_Layout.kt`（布局镜像） | `Illusion\src\main\kotlin\dev\nts\expdxr\d3d12\extern\` |
+| JVM 对端 | `MCDR_ABI.kt`（绑定）、`MCDR_Layout.kt`（布局镜像） | `Illusion\src\main\kotlin\io\github\dxegp\d3d12\extern\` |
+
+ABI 47 的 RT 生产入口为 `mcdr_dx12RtFrameTransactionLighting`，以 248 B 描述和独立的有界内容事件载荷
+连续录制同帧空间、追踪、降噪/SR 与最终合光，成功返回 288 B 整组输出。
+事件载荷为 64 B 头部加每来源 64 B，最多 256 来源；完整 schema、预检与取消/提交游标规则见
+[内容事件](../advanced/rt-frame.md#24-内容事件与当前查询影响)。既有 `mcdr_dx12RtFrameTransaction` 保持无事件调用与原布局。
+新生产调用必须配套含该导出的 DLL；缺失时明确拒绝，不静默丢弃事件。
+`mcdr_dx12CreateRtWorkGraphFrame(const mcdr_rt_frame_program*)` 新增实验 WG 帧创建，
+与 DXR 创建共用 144 B 程序描述和 `uint64_t` 上下文编号；`rayDxil` 槽改为 WG `lib_6_9` 节点库，末尾 environmentDxil/environmentBytes 为共享环境 compute。
+八对 DXIL 指针/长度、已有布局表和全部帧调用布局不变；两种创建共享 `MCDR_Layout.RT_FRAME_CREATE` descriptor。
+WG 无 SBT，backing、初始化、取消与提交寿命见 [RT 帧创建](../advanced/rt-frame.md#1-创建与释放)。
+RT 消费方还必须支持程序化 AABB 失效体积、`RtInvalidIntersection` 导出与无界 unknown 标记。
+空间 setter 接受 flags bit 1 表达调用方尚未闭合的来源义务，native 与 scene 的无界要求按位或；其它未知位拒绝。
+scene 描述携带完整当前输出支持清单，允许待编译整段要求携带经过认证的有限来源支持界；
+它不提供实际几何或空空间资格。JVM、DLL 与 shader 必须配套，禁止混用旧契约或跳过程序化候选。
+
+AS 分配预算追加只读可选导出 `mcdr_dx12GetRtAccelerationBudget(uint64_t*, int32_t)`，
+数量固定为 4，返回在用与预留字节、512 MiB 上限、拒绝累计次数和含预留的峰值。
+它不改变既有布局；内存所有权与错误行为见 [RT 帧链路](../advanced/rt-frame.md#13-场景候选发布与局部失效)。
+
+可选导出 `mcdr_dx12SetRtManagedMemoryBudget(uint64_t)` 设置 RT 受管分配的共享上限，
+`mcdr_dx12GetRtManagedMemoryBudget(uint64_t*, int32_t)` 要求 24 个 uint64，
+返回 total、geometry GPU、geometry UPLOAD、AS、frame GPU、frame host 六组当前/上限/拒绝/峰值。
+默认总上限 2048 MiB；几何两域与 AS 各限 512 MiB，帧域的上限 0 表示只受共享总上限约束。
+两个入口不改既有布局，查询不回收资源、不等待 GPU；覆盖范围见 [RT 受管分配总账](../advanced/rt-frame.md#17-native-rt-受管分配总账)。
+
+场景工作预算由可选导出 `mcdr_dx12SetRtSceneWorkBudget` 设置，CPU/GPU 参数为微秒，三角形单独计数。
+`mcdr_dx12GetRtSceneWorkBudget` 只读 24 个 uint64，不消费 GPU 反馈或等待完成。
+JVM 生产调用要求设置成功后才准备场景；计费、取消与软预算例外见 [场景增量工作准入](../advanced/rt-frame.md#14-场景增量工作准入)。
+
+可选导出 `mcdr_dx12GetRtSceneCaptureDemands` 非阻塞收集已完成的有限 unknown 来源需求，并消费有界提示队列。
+输出为 `4+2×capacity` 个 uint64，capacity 为 1–64；包含 world/live/scene 帧、数量及 node/需求帧对。
+JVM 只为当前缺失捕获提高优先级；该接口不提供几何或空间证明，详见 [有限缺口的捕获需求](../advanced/rt-frame.md#16-有限缺口的捕获需求)。
 
 ## 1. 这层是什么、谁在调用
 
@@ -148,9 +180,9 @@ typedef 直接指真实类（`d3d12_mc::Dx12Object` 等），所以 native 侧 `
 
 | typedef | 真实类 | 产生 | 释放 |
 | --- | --- | --- | --- |
-| `mcdr_object*` | `d3d12_mc::Dx12Object` | `mcdr_dx12CreateTexture` / `CreateBuffer` / `CreateSampler` / `CreateTextureView` | `mcdr_dx12DestroyResource` |
+| `mcdr_object*` | `d3d12_mc::Dx12Object` | `mcdr_dx12CreateTexture` / `CreateBuffer` / `CreateSampler` / `CreateTextureView` / `CreateComputePipeline` / `CreateComputePipelineEx` | `mcdr_dx12DestroyResource` |
 | `mcdr_command_ctx*` | `d3d12_mc::CommandContext` | `MCDR_D3D12_create_command_encoder` | `mcdr_dx12DestroyCommandEncoder` |
-| `mcdr_pipeline*` | `d3d12_mc::Dx12Pipeline` | `mcdr_dx12CreateGraphicsPipeline` / `CreateMeshPipeline` / `CreateComputePipeline` | `mcdr_dx12DestroyPipeline` |
+| `mcdr_pipeline*` | `d3d12_mc::Dx12Pipeline` | `mcdr_dx12CreateGraphicsPipeline` / `CreateMeshPipeline` | `mcdr_dx12DestroyPipeline` |
 | `mcdr_surface*` | `d3d12_mc::Dx12Surface` | `mcdr_dx12CreateSurface` | `mcdr_dx12DestroySurface` |
 | `mcdr_query_pool*` | `d3d12_mc::QueryPool` | `mcdr_dx12CreateQueryPool` | `mcdr_dx12DestroyQueryPool` |
 | `mcdr_desc_alloc*` | `d3d12_mc::PartitionedDescriptorAllocator` | `mcdr_dx12AsyncDescriptorCreate` | `mcdr_dx12AsyncDescriptorDestroy` |
@@ -160,6 +192,32 @@ typedef 直接指真实类（`d3d12_mc::Dx12Object` 等），所以 native 侧 `
 
 `0` / `NULL` 表示"缺失"：出参里为 0 就是没创建出来；入参里传 0 的语义按各函数头注释（例如
 `mcdr_dx12SetDlssOutput(NULL)` 是撤销输出）。**不要**用 0 表示"成功"，也不要缓存已释放的句柄。
+
+#### 时间戳快照
+
+ABI 38 兼容追加两个 query 入口，结构布局不变。实时统计使用以下非阻塞协议；
+`mcdr_dx12ReadQueryValues` 保留阻塞语义，不作为实时统计的缺功能回退。
+
+| 入口 | 返回与约束 |
+| --- | --- |
+| `mcdr_dx12QueueQueryValues(ctx, pool, start, count)` | `1` 已录制、`0` 拒绝；要求打开的列表且位于 render pass 外，只录制 `ResolveQueryData`，不提交、不等待 |
+| `mcdr_dx12TryReadQueryValues(pool, start, count, out)` | `1` 已复制并消费、`0` GPU 未完成、`-1` 参数/状态/设备错误；只有 `1` 改写输出 |
+
+每池最多一份未消费快照，重复入队即使 GPU 已完成也拒绝。轮询范围必须与入队范围完全相同；
+消费后再次读取报错，`0` 不消费；请求不匹配或设备错误保留 pending，录制已取消则返回 `-1` 并释放 pending。
+JVM 包装同样仅在 `1` 时复制输出数组。
+每个被 resolve 的槽必须写过；同 encoder 的写入与 resolve 由列表顺序保证，
+其它 encoder 的生产者 fence 必须已经完成，否则拒绝入队，由调用方稍后重试。
+其它 encoder 的未完成 resolve 覆盖某槽时，向该槽写 timestamp 也拒绝，
+通过 `mcdr_dx12WriteTimestamp` 的现有 `mcdrLastError` 通道报告；不能以逆提交顺序覆盖待读数据。
+同 encoder 顺序写入及 resolve 已完成后的覆写允许，消费时仍读取独立快照。
+
+快照持有独立 READBACK 资源和 resolve 所属提交的 fence/value。后续同列表覆盖 query 槽不能改变已录制快照；
+未提交且未取消的列表保持待定。producer 与快照同时绑定录制世代；未提交列表被重新 Begin 或销毁时取消该世代，
+后续无关提交达到相同 fence 数值也不能使旧数据变成 ready；已取消 producer 必须重新写入。
+命令列表槽强持 query heap 和快照到退休，
+因此提前销毁池只取消调用方的查询资格，不释放 GPU 仍会访问的资源；销毁后不得再传旧池句柄。
+这些接口与池的写入、释放由调用方串行使用。
 
 ### 3.2 用整数传的原生对象
 
@@ -219,11 +277,11 @@ typedef 直接指真实类（`d3d12_mc::Dx12Object` 等），所以 native 侧 `
 
 两个出口，同一个值：
 
-- 编译期宏 `MCDR_ABI_VERSION`（`include\mcdr_abi.h`，当前 `23u`）；
+- 编译期宏 `MCDR_ABI_VERSION`（`include\mcdr_abi.h`，当前 `45u`）；
 - 运行期 `uint32_t mcdrABIVersion(void)`，返回同一常量。
 
-JVM 侧常量 `MCDR_ABI_VERSION = 23`（`MCDR_ABI.kt`）。加载期比对，不等就抛
-`IllegalStateException("MCDR ABI version mismatch: java=23, native=X")`，装进 `LOAD_FAILURE`，
+JVM 侧常量 `MCDR_ABI_VERSION = 45`（`MCDR_ABI.kt`）。加载期比对，不等就抛
+`IllegalStateException("MCDR ABI version mismatch: java=45, native=X")`，装进 `LOAD_FAILURE`，
 后端彻底不可用——在首次绘制之前失败，而不是画到一半才发现结构体错位。
 
 `mcdr_dx12DlssdEval` 固定八张纹理：带噪线性颜色、输出、正 viewZ、像素 MV、原始 normal/roughness、
@@ -261,14 +319,33 @@ RR 接收八或九张纹理，RT SR 接收四或五张；额外最后一张必�
 调用方须保证有限正值。玩家 RR/RT DLSS-SR 调用显式入口，两个标量均为 1，
 曝光纹理由引擎手动/自动测光生成，最终合光读取相同倍率。
 
-`mcdr_dx12NrdDenoise` 严格接收七张纹理：像素 MV、packed normal/roughness、正 viewZ、
+`mcdr_dx12NrdDenoise` 接收七张必需纹理：像素 MV、packed normal/roughness、正 viewZ、
 diffuse-in、diffuse-out、specular-in、specular-out。两路辐亮度均为 RGBA16F YCoCg，
-alpha 为各自归一化命中距离；实际实例为 `REBLUR_DIFFUSE_SPECULAR`。
+alpha 为各自归一化命中距离；同一 SDK instance 注册 `REBLUR_DIFFUSE` / `REBLUR_SPECULAR`。
+允许末尾增加第八张独立镜面 viewZ；七纹理调用仍共用索引 2 的深度。
+十纹理调用在八纹理后增加 diffuse/specular history confidence，对应索引 8、9，必须成对提供。
+confidence 为同当前深度尺寸的单层、单 mip、单采样 `R8_UNORM` / `R16_FLOAT` / `R32_FLOAT` SRV，
+数值范围 `[0,1]`，按当前时刻对上一帧图像的可信度生成，不能当作当前缺样本掩码或严格局部 reset。
+七/八/九纹理关闭该可选 confidence 输入。
+九纹理在八纹理后追加整数历史撤销 mask；十一纹理在十纹理后追加该 mask。
+mask 为同当前深度尺寸的单层、单 mip、单采样 `R8_UINT` / `R32_UINT` SRV，按上一帧历史图像坐标生成；
+bit 0 撤销 diffuse，bit 1 撤销 specular，其它位忽略。它清除指定历史 texel 的旧辐射与资格，
+不改变当前输入资格；调用者仍须覆盖真实累积依赖与空间传播，不能只传当前编辑矩形。
+仅接受 7–11 张纹理；空指针、尺寸/格式不符和资源别名在接管前拒绝。
+全部资源保持到实际录制完成，SDK 返回后归还 `COMMON`，详见 [历史 confidence](../advanced/nrd.md#历史-confidence)。
+严格 texel 撤销与空间反馈边界见 [逐 texel 历史撤销](../advanced/nrd.md#逐-texel-历史撤销)。
+生产 RT 帧使用八纹理，索引 2 为 diffuse 当前深度，第八张为 specular 当前深度；原始主表面深度另行保留。
+携带内容事件与路径支持的统一事务经 native 内部参数生成累积 NRD 历史 mask，不增加公开纹理或 FFM 字段。
+生产依赖传播与适用范围见 [NRD 累积内容依赖](../advanced/nrd.md#累积内容依赖)。
+缺样本对应深度写范围外值，消费端拒读该区输出；RR/SR 的当前全色降级见 [RT 帧输入](../advanced/rt-frame.md#5-运动与降噪-guide)。
+这些内部资源不增加公开输出字段，既有函数签名与 FFM descriptor 保持。
+八纹理调用的两张深度必须是同尺寸的单层、单 mip、单采样 `R32_FLOAT` SRV，
+格式/尺寸不合法时在接管前返回 0，全部资源仍禁止别名。
 零基索引 4/6 转 UAV，其余转 NPSR，执行完成后回 COMMON。
 四个列主序矩阵依次为当前/上一帧投影与当前/上一帧 worldToView，共 64 floats。
 拒绝五纹理输入；此入口的函数形参类型与 FFM descriptor 固定，当前/上一帧 jitter 均为零。
 
-`mcdr_dx12NrdDenoiseTemporal` 使用同样的七张纹理与 64-float 无 jitter 矩阵，
+`mcdr_dx12NrdDenoiseTemporal` 使用同样的 7–11 张纹理与 64-float 无 jitter 矩阵，
 另以非空 `jitter` 指针传入四个 float，顺序为当前 x/y、上一帧 x/y。
 数值直接写入 NRD `cameraJitter` / `cameraJitterPrev`，单位为渲染像素，
 对应 SDK 的 `sampleUv = pixelUv + cameraJitter / rectSize`；不在 native 转符号或缩放。
@@ -330,7 +407,7 @@ void MCDR_CALL mcdrABILayout(const mcdr_abi_field** fields, int32_t* count);
 
 ### 5.2 发布范围
 
-| 已发布（14 个结构体 / 177 条记录） | 记录数 |
+| 已发布（38 个结构体 / 425 条记录） | 记录数 |
 | --- | --- |
 | `mcdr_binding_slot` | 6 |
 | `mcdr_partition_draw` | 10 |
@@ -346,14 +423,36 @@ void MCDR_CALL mcdrABILayout(const mcdr_abi_field** fields, int32_t* count);
 | `mcdr_fg_caps` | 14 |
 | `mcdr_fg_dispatch` | 15 |
 | `mcdr_fg_constants` | 8 |
+| `mcdr_rt_caps` | 15 |
+| `mcdr_rt_track_stats` | 8 |
+| `mcdr_rt_hit_group` | 4 |
+| `mcdr_rt_frame_program` | 18 |
+| `mcdr_rt_frame_desc` | 23 |
+| `mcdr_rt_geometry_desc` | 15 |
+| `mcdr_rt_geometry_output` | 7 |
+| `mcdr_rt_geometry_content` | 9 |
+| `mcdr_rt_geometry_delta_desc` | 15 |
+| `mcdr_rt_geometry_delta_output` | 9 |
+| `mcdr_rt_geometry_memory` | 2 |
+| `mcdr_rt_acceleration_output` | 12 |
+| `mcdr_rt_section_version` | 3 |
+| `mcdr_rt_output_support` | 11 |
+| `mcdr_rt_scene_desc` | 10 |
+| `mcdr_rt_scene_output` | 11 |
+| `mcdr_rt_frame_output` | 16 |
+| `mcdr_rt_gbuffer_output` | 12 |
+| `mcdr_rt_gbuffer_program` | 9 |
+| `mcdr_rt_gbuffer_batch` | 14 |
+| `mcdr_rt_gbuffer_replay` | 9 |
+| `mcdr_rt_denoise_desc` | 10 |
+| `mcdr_rt_denoise_output` | 7 |
+| `mcdr_rt_transaction_desc` | 11 |
+| `mcdr_rt_transaction_output` | 8 |
+| `mcdr_rt_geometry` | 9 |
+| `mcdr_barrier_desc` | 7 |
 
-`mcdr_dlss_constants`、记录类型 `mcdr_abi_field` 自身，以及 ABI 4 之后追加的 `mcdr_rt_caps` /
-`mcdr_rt_track_stats` / `mcdr_barrier_desc` **没有**逐字段发布：它们的偏移不进这张自检表，只有 §6 的
-`sizeof` / `align` 由 Java 侧 `EXPECTED_C_SIZES` 兜住。
-
-> **缺陷**：`mcdr_barrier_desc`、`mcdr_rt_caps`、`mcdr_rt_track_stats` 的字段偏移没有任何自动校验——
-> 这三张结构一旦字段顺序被改，`mcdr_dx12Barrier` 会按错位的 `kind` / `before` / `after` 下发屏障，
-> 而两侧的自检都仍然通过（Java 只比大小）。改这三个结构时手工核对 §6 的偏移列。
+`mcdr_dlss_constants` 与记录类型 `mcdr_abi_field` 自身没有逐字段发布，JVM 的 `EXPECTED_C_SIZES`
+只检查这两个镜像的大小。其余 41 个结构体逐字段校验偏移与大小；新增字段必须登记进 `layoutTable()`。
 
 ### 5.3 Java 侧的比对算法
 
@@ -362,7 +461,7 @@ MCDR_ABI.<init>
  ├ SymbolLookup.libraryLookup(dllPath, ARENA)
  ├ 绑定全部导出（skip / skipOptional）
  └ verifyABI()
-    ├ v = mcdrABIVersion()                    v != 4 → 抛版本不匹配
+    ├ v = mcdrABIVersion()                    v != 45 → 抛版本不匹配
     ├ mcdrABILayout(&fields, &count)          count <= 0 或 fields == NULL → 抛
     ├ fields.reinterpret(24 * count)
     ├ 逐条读 name / offset / size → nativeFields[name] = [offset, size]
@@ -375,7 +474,7 @@ MCDR_ABI.<init>
           IllegalStateException("MCDR ABI layout mismatch (N field(s)); ...")
 ```
 
-另有 `MCDRLayout` 的 `init` 块做**总大小**校验：`EXPECTED_C_SIZES` 里 19 行
+另有 `MCDRLayout` 的 `init` 块做**总大小**校验：`EXPECTED_C_SIZES` 里 32 行
 （结构体名 / Java 布局 / C 侧 `sizeof`），`byteSize()` 不等就抛
 `MCDR ABI struct size mismatch for <name>: java=<a> c=<b>`。头文件里**没有** `static_assert`，
 C 侧大小只写在结构体注释里（例如 `include\mcdr_abi.h` 的 `sizeof = 112`），由这张表兜住。
@@ -401,7 +500,7 @@ C 侧大小只写在结构体注释里（例如 `include\mcdr_abi.h` 的 `sizeof
 
 ## 6. 结构体镜像清单
 
-19 个 aggregate 全部在此。`sizeof` / `align` 与 `MCDR_Layout.kt` 的 `EXPECTED_C_SIZES` 以及头文件
+下表列出 ABI aggregate。`sizeof` / `align` 与 `MCDR_Layout.kt` 的 `EXPECTED_C_SIZES` 以及头文件
 注释一致（MSVC x64：`int32`/`float` = 4，`int64`/指针 = 8，`uint8` = 1）。
 
 | 结构体 | sizeof | align | 用途 | 关键字段（字节偏移） |
@@ -422,8 +521,25 @@ C 侧大小只写在结构体注释里（例如 `include\mcdr_abi.h` 的 `sizeof
 | `mcdr_fg_dispatch` | 96 | 8 | 帧生成的"设期望值"载荷 | `displayWidth`0 `backend`8 `mode`12 `numFrames`16 `reset`20 `appFrameId`24 `backendFrameId`32 `presentId`40 `pBackbuffer`48 `pHudlessColor`56 `pDepth`64 `pMotionVectors`72 `pUiColor`80 `_pad2`88 |
 | `mcdr_fg_constants` | 152 | 4 | 帧生成自己的帧常量 | `view`0（`float[16]`）`projection`64（`float[16]`）`jitterX`128 `mvScaleX`136 `resetHistory`144 `frameRenderTime`148 |
 | `mcdr_abi_field` | 24 | 8 | 布局自检的一条记录（§5.1） | `name`0 `offset`8 `size`16 |
+| `mcdr_rt_frame_program` | 144 | 8 | native RT 程序 | `rayDxil`0 `rayBytes`8 `guideDxil`16 `guideBytes`24 `exposureDxil`32 `exposureBytes`40 `motionDxil`48 `motionBytes`56 `packDxil`64 `packBytes`72 `signalDxil`80 `signalBytes`88 `remodulateDxil`96 `remodulateBytes`104 `compositeDxil`112 `compositeBytes`120 `environmentDxil`128 `environmentBytes`136 |
+| `mcdr_rt_frame_desc` | 128 | 8 | native RT 帧输入 | `frameId`0 `worldEpoch`8 `sceneRevision`16 `materialRevision`24 `snapshotId`32 `width`40 `height`44 `accelerationId`48 `gbufferRevision`56 `constants`64 `constantBytes`72 `depthScale`76 `frameNanos`80 `exposureMode`88 `exposureEv`92 `exposureSpeed`96 `resetExposure`100 `signalEncoding`104 `jitterDeltaX`108 `jitterDeltaY`112 `denoisingRange`116 `contentJitterX`120 `contentJitterY`124 |
+| `mcdr_rt_acceleration_output` | 80 | 8 | native 加速结构输出 | `snapshotId`0 `acceleration`8 `instances`16 `byteCount`24 `instanceCount`32 `blasCount`36 `buildCount`40 `ready`44 `blasMicros`48 `peakBuildMicros`56 `tlasMicros`64 `scratchBytes`72 |
+| `mcdr_rt_section_version` | 16 | 8 | 当前 section 版本 | `node`0 `layer`8 `version`12 |
+| `mcdr_rt_output_support` | 48 | 8 | 当前输出支持 | `node`0 `layer`8 `version`12 `flags`16 `reserved`20 `minimumX`24 `minimumY`28 `minimumZ`32 `maximumX`36 `maximumY`40 `maximumZ`44 |
+| `mcdr_rt_scene_desc` | 64 | 8 | native 场景更新输入 | `worldEpoch`0 `snapshotId`8 `liveRevision`16 `sections`24 `sectionCount`32 `reserved`36 `frameId`40 `outputs`48 `outputCount`56 `outputMode`60 |
+| `mcdr_rt_scene_output` | 232 | 8 | 场景发布与构建输出 | `snapshotId`0 `accelerationId`8 `pendingSnapshotId`16 `pendingAccelerationId`24 `sceneRevision`32 `geometryRevision`40 `materialRevision`48 `byteCount`56 `active`64 `candidate`144 `coverageFlags`224 |
+| `mcdr_rt_geometry_desc` | 120 | 8 | native 几何注册输入 | `worldEpoch`0 `geometryRevision`8 `materialRevision`16 `reuseGeometry`24 `reuseMaterials`32 `records`40 `recordBytes`48 `vertices`56 `vertexBytes`64 `indices`72 `indexBytes`80 `materials`88 `materialBytes`96 `quads`104 `quadBytes`112 |
+| `mcdr_rt_geometry_output` | 56 | 8 | native 几何快照与借用缓冲 | `snapshotId`0 `records`8 `vertices`16 `indices`24 `materials`32 `quads`40 `byteCount`48 |
+| `mcdr_rt_gbuffer_output` | 88 | 8 | native G-Buffer 借用附件 | `revision`0 `resourceRevision`8 `frameNanos`16 `width`24 `height`28 `albedo`32 `specular`40 `normalRoughness`48 `emissive`56 `linearDepth`64 `depth`72 `byteCount`80 |
+| `mcdr_rt_gbuffer_batch` | 96 | 8 | G-Buffer 批次 | `pipeline`0 `vertices`8 `vertexOffset`16 `sections`24 `sectionsOffset`32 `sectionsLength`40 `meshlets`48 `meshletsOffset`56 `meshletsLength`64 `meshletCount`72 `bindingCount`76 `bindings`80 `projectionBinding`88 `_pad0`92 |
+| `mcdr_rt_gbuffer_replay` | 48 | 8 | G-Buffer 整组提交 | `revision`0 `batches`8 `batchCount`16 `projectionFloatCount`20 `projection`24 `cameraOffsetX`32 `cameraOffsetY`36 `cameraOffsetZ`40 `_pad0`44 |
+| `mcdr_rt_frame_output` | 128 | 8 | native RT 借用输出 | `frameId`0 `snapshotId`8 `direct`16 `indirect`24 `aux`32 `specular`40 `specularGrazing`48 `constants`56 `byteCount`64 `exposure`72 `motion`80 `packedNormalRoughness`88 `viewZ`96 `diffuseSignal`104 `specularSignal`112 `specularHitDistance`120 |
+| `mcdr_rt_denoise_desc` | 64 | 8 | native 降噪请求 | `frameId`0 `historyGeneration`8 `historyFrame`16 `planRevision`24 `outputWidth`32 `outputHeight`36 `nrdMatrices`40 `nrdFloatCount`48 `slFloatCount`52 `slConstants`56 |
+| `mcdr_rt_denoise_output` | 48 | 8 | native 降噪借用输出 | `frameId`0 `snapshotId`8 `diffuse`16 `specular`24 `byteCount`32 `encoding`40 `dispatchCount`44 |
+| `mcdr_rt_transaction_desc` | 248 | 8 | 同帧统一录制输入 | `trace`0 `denoise`128 `liveRevision`192 `spatial`200 `spatialBytes`208 `source`216 `upscaler`224 `debugMode`228 `timestamps`232 `firstTimestamp`240 `reserved`244 |
+| `mcdr_rt_transaction_output` | 288 | 8 | 整组借用输出 | `trace`0 `denoise`128 `upscale`176 `composite`224 `fallbackFlags`272 `recorded`276 `timestampMask`280 `reserved`284 |
 | `mcdr_rt_caps` | 80 | 4 | 光追 / mesh shader / work graphs / 着色率 / 采样器反馈的能力面（字段是否有效由 `options21Queried` / `options22Queried` 位决定） | `raytracingTier`0 `meshShaderTier`4 `workGraphsTier`8 `shadingRateTier`12 `shaderModel`16 `samplerFeedbackTier`20 `options21Queried`24 `options22Queried`28 `serActuallyReorders`32 `enhancedBarriers`36 `dxcAvailable`40 `max1DDispatchSize`44 `max1DDispatchMeshSize`48 `reserved`52 `note`56（`char[24]`） |
-| `mcdr_rt_track_stats` | 88 | 4 | 光追状态跟踪的累计统计快照 | `transitions`0 `mismatches`4 `firstUse`8 `uavBarriers`12 `tracked`16 `reserved`20 `note`24（`char[64]`） |
+| `mcdr_rt_track_stats` | 92 | 4 | 光追状态跟踪的累计统计快照 | `transitions`0 `mismatches`4 `promotions`8 `widened`12 `firstUse`16 `uavBarriers`20 `tracked`24 `note`28（`char[64]`） |
 | `mcdr_barrier_desc` | 40 | 8 | 一次显式屏障，`mcdr_dx12Barrier` 的数组元素 | `resource`0 `resourceAfter`8 `kind`16 `flags`20 `before`24 `after`28 `subresource`32 |
 
 ### 6.1 改结构体时必须守的规则
@@ -555,10 +671,10 @@ C 侧大小只写在结构体注释里（例如 `include\mcdr_abi.h` 的 `sizeof
 
 | 路径（相对 `MCDR\`） | 负责什么 |
 | --- | --- |
-| `include\mcdr_abi.h` | 唯一契约：类型映射注释、9 个句柄、19 个 aggregate、225 个导出、`MCDR_ABI_VERSION` |
+| `include\mcdr_abi.h` | 唯一契约：类型映射、句柄、aggregate、导出与 `MCDR_ABI_VERSION` |
 | `src\module\c_abi\mcdr_abi_common.cppm` | `mcdr.abi.common` 接口单元：声明 `lastErrorText` / `setLastError` / `setLastErrorf` / `failWith` / `failVoid` / `writeString` |
 | `src\c_abi\abi_common.cpp` | 上述 6 个函数的唯一实现：线程局部错误槽、两阶段字符串写出、ERROR 行格式 |
-| `src\c_abi\abi_meta.cpp` | `mcdrABIVersion` / `mcdrABILayout` / `layoutTable()`（177 条记录）、`mcdrLastError`、日志级别与镜像文件入口、PIX/AA/DLSS 开关转发 |
+| `src\c_abi\abi_meta.cpp` | `mcdrABIVersion` / `mcdrABILayout` / `layoutTable()`（459 条记录）、`mcdrLastError`、日志级别与镜像文件入口、PIX/AA/DLSS 开关转发 |
 | `src\core\d3d12_device.cpp` | 日志实现端：`gLogLevel`、`formatLogPrefix()`、`emitLogLine()`、`mirrorLogToFile()`、`setLogFile()`、`setLogLevel()` |
 | `docs\overview.md` | 文档地图；本文是其中的 ABI 契约入口 |
 
@@ -566,18 +682,18 @@ C 侧大小只写在结构体注释里（例如 `include\mcdr_abi.h` 的 `sizeof
 
 | 路径 | 负责什么 |
 | --- | --- |
-| `Illusion\src\main\kotlin\dev\nts\expdxr\d3d12\extern\MCDR_ABI.kt` | 全部导出的 FFM 绑定、`verifyABI()`、错误串读取、`SCRATCH` 槽位 |
-| `Illusion\src\main\kotlin\dev\nts\expdxr\d3d12\extern\MCDR_Layout.kt` | `EXPECTED_C_SIZES`（19 行大小校验）、17 个结构体的 `MemoryLayout` 字段镜像（`mcdr_dlss_constants` 与 `mcdr_abi_field` 只查大小）、`verify()` |
+| `Illusion\src\main\kotlin\io\github\dxegp\d3d12\extern\MCDR_ABI.kt` | 全部导出的 FFM 绑定、`verifyABI()`、错误串读取、`SCRATCH` 槽位 |
+| `Illusion\src\main\kotlin\io\github\dxegp\d3d12\extern\MCDR_Layout.kt` | `EXPECTED_C_SIZES`（36 行大小校验）、34 个结构体的字段镜像校验（`mcdr_dlss_constants` 与 `mcdr_abi_field` 只查大小）、`verify()` |
 
 ## 文档维护
 
 1. 改 `include\mcdr_abi.h` 的结构体或签名 → 同一次改动里改齐 §4.1 的五处，并把 `MCDR_ABI_VERSION`
    +1；纯追加也要 +1。
-2. §6 的 `sizeof` / `align` 必须与 `MCDR_Layout.kt` 的 `EXPECTED_C_SIZES`（19 行）和头文件注释
+2. §6 的 `sizeof` / `align` 必须与 `MCDR_Layout.kt` 的 `EXPECTED_C_SIZES`（29 行）和头文件注释
    三处一致：先改结构，再改镜像，最后改本文。
 3. 新增 aggregate 时，每个命名字段（含 `_padN`）都要登记进 `layoutTable()`；漏登记只会以
    `missing from the native layout report` 的形式在设备创建时炸掉。
-4. 新增导出 → 更新 §1 的计数（`MCDR_API ... MCDR_CALL` 声明数，当前 225）、§2.1 / §8 的返回值
+4. 新增导出 → 更新开头的计数（`MCDR_API ... MCDR_CALL` 声明数，当前 257）、§2.1 / §8 的返回值
    形态表，以及需要的 §3 句柄表。
 5. 本文只写当下：不写工单号、会话号，不引用仓库外的文件；指路只指 `docs\` 下真实存在的文档，
    并与 `docs\overview.md` 的文档地图保持一致。

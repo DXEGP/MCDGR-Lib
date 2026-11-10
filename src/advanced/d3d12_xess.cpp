@@ -282,20 +282,24 @@ public:
             return false;
         }
         const bool unjittered = (dispatch.flags & MCDR_SR_FLAG_UNJITTERED_MV) != 0;
+        if (!completion_.prepare(ctx, resetPending_, needsRecreate_)) {
+            problem_ = "previous evaluation pending";
+            return false;
+        }
         if (motionUnjittered_ != unjittered) {
-            if (handle_ != nullptr && !completion_.ready(ctx)) {
+            if (handle_ != nullptr && !completion_.ready()) {
                 problem_ = "previous evaluation pending";
                 return false;
             }
             motionUnjittered_ = unjittered;
             needsRecreate_ = true;
         }
-        if (mask == nullptr && maskExpected_) {
-            // 掩码是 init 期开关（RESPONSIVE_PIXEL_MASK）：这一帧缺席就重建一次。
-            maskExpected_ = false;
-            needsRecreate_ = true;
-        } else if (mask != nullptr && !maskExpected_) {
-            maskExpected_ = true;
+        if (maskExpected_ != (mask != nullptr)) {
+            if (handle_ != nullptr && !completion_.ready()) {
+                problem_ = "previous evaluation pending";
+                return false;
+            }
+            maskExpected_ = mask != nullptr;
             needsRecreate_ = true;
         }
         adoptSizes(dispatch.renderWidth, dispatch.renderHeight, dispatch.displayWidth,
@@ -330,6 +334,7 @@ public:
         params.inputHeight = static_cast<uint32_t>(renderH_);
         params.pDescriptorHeap = nullptr;            // 堆通过 init 的 pTempBufferHeap/pTempTextureHeap 给
 
+        resetPending_ = true;
         completion_.record(ctx);
         const xess_result_t rc = runtime().api.execute(handle_, ctx->commandList, &params);
         resources.reclaim();
@@ -352,6 +357,8 @@ public:
         problem_.clear();
         logged_ = false;
     }
+
+    bool readyToRelease() const override { return completion_.ready(); }
 
 private:
     void adoptSizes(int32_t renderWidth, int32_t renderHeight, int32_t displayWidth,
@@ -441,8 +448,7 @@ private:
             return true;
         }
         if (handle_ != nullptr) {
-            // 旧上下文的内部资源可能还在飞：先等 GPU 追平最后一次提交再销毁。只在首次建 / 换显示尺寸 / 越界 / 掩码开关变化时发生。
-            if (!completion_.ready(ctx)) { problem_ = "previous evaluation pending"; return false; }
+            if (!completion_.ready()) { problem_ = "previous evaluation pending"; return false; }
             destroyContext();
         }
 

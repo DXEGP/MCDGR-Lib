@@ -10,36 +10,76 @@ module;
 // .cppm 全局模块片段里的声明不会传给实现单元，各实现单元要自己再 include 一次（guard 幂等）。
 #include "mcdr_abi.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <string_view>
 
 module mcdr.d3d12.device;
 
 namespace d3d12_mc {
-void releaseProviderWithWait(CommandContext* ctx);
+bool releaseProviderWithWait();
 
-bool SrContextCompletion::ready(CommandContext* ctx) const {
-    if (fence_ == nullptr) return true;
-    const UINT64 completed = fence_->GetCompletedValue();
-    if (completed == UINT64_MAX) return false;
-    if (completed >= value_) return true;
-    if (ctx != nullptr && fence_.Get() == ctx->fence.Get() && value_ == ctx->fenceValue + 1) return false;
-    const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (event == nullptr) return false;
-    const HRESULT result = fence_->SetEventOnCompletion(value_, event);
-    const bool completedInTime = SUCCEEDED(result) && WaitForSingleObject(event, 5000) == WAIT_OBJECT_0;
-    CloseHandle(event);
-    return completedInTime;
+bool SrContextCompletion::prepare(CommandContext* ctx, bool& resetPending, bool& recreatePending) {
+    if (ctx == nullptr || !ctx->listOpen) return false;
+    const auto current = currentCommandRecording(ctx);
+    for (auto use = uses_.begin(); use != uses_.end();) {
+        const auto& recording = *use->recording;
+        if (recording.cancelled && !recording.submitted) {
+            resetPending = true;
+            recreatePending = true;
+            use = uses_.erase(use);
+            continue;
+        }
+        if (!recording.submitted) {
+            if (use->recording != current) return false;
+            ++use;
+            continue;
+        }
+        if (recording.cancelled && !use->submissionFailureObserved) {
+            resetPending = true;
+            use->submissionFailureObserved = true;
+        }
+        const auto completed = recording.fence->GetCompletedValue();
+        if (completed == UINT64_MAX) return false;
+        if (completed >= recording.fenceValue) use = uses_.erase(use);
+        else ++use;
+    }
+    return true;
+}
+
+bool SrContextCompletion::ready() const {
+    if (std::ranges::any_of(uses_, [](const auto& use) {
+        return !use.recording->submitted && !use.recording->cancelled;
+    })) return false;
+    const auto started = GetTickCount64();
+    for (const auto& use : uses_) {
+        const auto& recording = *use.recording;
+        if (!recording.submitted) continue;
+        const auto completed = recording.fence->GetCompletedValue();
+        if (completed == UINT64_MAX) return false;
+        if (completed >= recording.fenceValue) continue;
+        const auto elapsed = GetTickCount64() - started;
+        if (elapsed >= 5000) return false;
+        const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (event == nullptr) return false;
+        const HRESULT result = recording.fence->SetEventOnCompletion(recording.fenceValue, event);
+        const bool completedInTime = SUCCEEDED(result) &&
+            WaitForSingleObject(event, static_cast<DWORD>(5000 - elapsed)) == WAIT_OBJECT_0;
+        CloseHandle(event);
+        if (!completedInTime) return false;
+    }
+    return true;
 }
 
 void SrContextCompletion::record(CommandContext* ctx) {
-    fence_ = ctx->fence;
-    value_ = ctx->fenceValue + 1;
+    const auto recording = currentCommandRecording(ctx);
+    if (std::ranges::none_of(uses_, [&](const auto& use) { return use.recording == recording; })) {
+        uses_.push_back({recording});
+    }
 }
 
 void SrContextCompletion::clear() {
-    fence_.Reset();
-    value_ = 0;
+    uses_.clear();
 }
 
 namespace {
@@ -195,6 +235,8 @@ public:
         return applyDlssToTexture(ctx, toDlssInput(desc));
     }
 
+    bool readyToRelease() const override { return true; }
+
     void shutdown() override {
         // **空操作是刻意的**：mcdr_dlss_shutdown 会清掉实现单元的全局状态，连带把还没切到
         // SR 路径的老 DLSS 调用一起关掉（hand-off 会丢输出纹理）。真正的释放在设备销毁时做。
@@ -229,7 +271,7 @@ bool ensureProvider(CommandContext* ctx, int32_t backendId, const mcdr_sr_dispat
     }
     if (gSrProvider != nullptr) {
         const int32_t previous = gSrActive;
-        releaseProviderWithWait(ctx);
+        if (!releaseProviderWithWait()) return false;
         dbgLogInfo("SR provider switch %s -> %s", nameOf(previous), nameOf(backendId));
     }
     std::unique_ptr<IUpscaleProvider> provider = makeProvider(toId(backendId));
@@ -310,9 +352,7 @@ int32_t srCreateProvider(CommandContext* ctx, int32_t backendId, int32_t maxRend
         return -1;
     }
     if (backendId == MCDR_SR_BACKEND_NONE) {
-        srReleaseProvider();
-        gSrActive = MCDR_SR_BACKEND_NONE;
-        return 1;
+        return releaseProviderWithWait() ? 1 : 0;
     }
     const mcdr_sr_dispatch seed =
         seedFromSizes(maxRenderWidth, maxRenderHeight, displayWidth, displayHeight);
@@ -410,37 +450,19 @@ int32_t srJitterPhaseCount(int32_t backendId, int32_t renderWidth, int32_t displ
 }
 
 void srReleaseProvider(void) {
-    if (gSrProvider != nullptr) {
-        // 没有命令上下文可等（mcdr_dx12SrDestroy 就这么调），改用队列级栅栏等此刻已提交的全部工作退役。
-        const UINT64 queueValue = currentQueueFenceValue();
-        if (queueValue > 0) {
-            const auto waited = waitForQueueFenceValue(queueValue, 5'000'000'000ULL);
-            if (!waited.has_value()) {
-                dbgLogWarn("queue wait timed out, releasing the SR provider");
-            }
-        }
-        gSrProvider->shutdown();
-        gSrProvider.reset();
-    }
-    gSrActive = MCDR_SR_BACKEND_NONE;
+    (void)releaseProviderWithWait();
 }
 
-// 销毁 provider 前必须等上一帧的提交落地：ffxDestroyContext / xessDestroyContext 会整块释放
-// 上下文持有的 GPU 资源，而那些资源可能还在已提交、未执行完的命令列表里；不等会设备移除或整帧变黑。
-// 只等 ctx->fenceValue、不等 +1：切换在帧内发生，本帧还没提交，等 +1 会走满超时。
-void releaseProviderWithWait(CommandContext* ctx) {
-    if (gSrProvider == nullptr) {
-        return;
-    }
-    if (ctx != nullptr && ctx->fenceValue > 0) {
-        const auto waited = waitForFenceValue(ctx, ctx->fenceValue, 5'000'000'000ULL);
-        if (!waited.has_value()) {
-            dbgLogWarn("frame wait timed out, releasing the SR provider");
-        }
+bool releaseProviderWithWait() {
+    if (gSrProvider == nullptr) return true;
+    if (!gSrProvider->readyToRelease()) {
+        gSrNote = "previous evaluation pending";
+        return false;
     }
     gSrProvider->shutdown();
     gSrProvider.reset();
     gSrActive = MCDR_SR_BACKEND_NONE;
+    return true;
 }
 
 // 一行诊断文本：picked/active 是否一致、逐帧 ok/fail 计数、生效后端的 caps、最近一次降级原因。

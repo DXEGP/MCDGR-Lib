@@ -21,7 +21,7 @@ MCDR 是 Minecraft 模组 DXRMC 的 **native 渲染库**：一个 C++23 动态�
   `TreatWarningAsError=true`，工程 `MCDR\MCDR.vcxproj`，配置 `Release|x64`。
 - **能力范围**：设备与资源管理、交换链与 HDR、异步录制（描述符分区 / bundle / fence）、
   mesh shader 管线、SMAA 查找表、超分（DLSS / FSR / XeSS）、帧生成（DLSS-G / FSR-FG / XeSS-FG）、
-  NVIDIA Reflex、PIX 抓帧、光线追踪**能力探测**（尚未做光追渲染）。
+  NVIDIA Reflex、PIX 抓帧、DXR 光追、native 几何快照及 G-Buffer/降噪/超分/合光帧资源。
 
 ## 文档地图
 
@@ -37,6 +37,7 @@ MCDR 是 Minecraft 模组 DXRMC 的 **native 渲染库**：一个 C++23 动态�
 | [`advanced/upscalers.md`](advanced/upscalers.md) | 超分抽象层与 FSR / XeSS 后端 | 加超分后端、对不齐抖动 |
 | [`advanced/mesh.md`](advanced/mesh.md) | mesh shader（meshlet）管线与 HLSL→DXIL | 地形管线、mesh PSO |
 | [`advanced/rt-probe.md`](advanced/rt-probe.md) | 光线追踪能力探测与状态上报 | 光追开关、能力上报 |
+| [`advanced/rt-frame.md`](advanced/rt-frame.md) | native 几何快照、场景发布、BLAS/TLAS、G-Buffer、追踪、曝光、降噪、独立 SR 与合光 | 候选续建、版本表、局部失效、几何/AS 共享、生产者 fence、SDK 历史、借用输出与退休 |
 | [`advanced/nrd.md`](advanced/nrd.md) | NRD diffuse/specular 双通道与 SDK validation | 资源映射、诊断输出、在途槽位验证 |
 | [`misc/build-and-modules.md`](misc/build-and-modules.md) | 构建配置、C++23 模块规则、依赖与 SMAA 查找表 | 模块编译报错、加模块、换依赖 |
 | [`misc/debug-and-logging.md`](misc/debug-and-logging.md) | 日志通道与级别、FATAL 旁路、PIX 抓帧、诊断层 | 看日志、抓帧、排查崩溃 |

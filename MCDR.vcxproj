@@ -114,7 +114,7 @@
              <DelayLoadDLLs>NRC_D3D12.dll</DelayLoadDLLs>  (+ delayimp.lib)
            so the import becomes lazy and a missing DLL surfaces as a
            feature-unavailable error instead of MCDR.dll failing to load. -->
-      <AdditionalIncludeDirectories>$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include;$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include\directx-dxc;$(ProjectDir)include;$(ProjectDir)src\c_abi;$(ProjectDir)src\core;$(ProjectDir)src\advanced;$(ProjectDir)external\dlss\include;$(ProjectDir)external\nrd\Include;$(ProjectDir)external\xess\inc;$(ProjectDir)external\xess\inc\xess;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\api\include;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\api\include\dx12;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\framegeneration\include;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\framegeneration\include\dx12;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\upscalers\include;$(ProjectDir)external\fidelityfx\include;$(ProjectDir)external\streamline\include;$(ProjectDir)external\nrc\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include;$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include\directx-dxc;$(ProjectDir)include;$(ProjectDir)include\advanced;$(ProjectDir)src\c_abi;$(ProjectDir)src\core;$(ProjectDir)src\advanced;$(ProjectDir)external\dlss\include;$(ProjectDir)external\nrd\Include;$(ProjectDir)external\xess\inc;$(ProjectDir)external\xess\inc\xess;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\api\include;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\api\include\dx12;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\framegeneration\include;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\framegeneration\include\dx12;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\upscalers\include;$(ProjectDir)external\fidelityfx\include;$(ProjectDir)external\streamline\include;$(ProjectDir)external\nrc\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <!-- These sources have Chinese comments; without /utf-8 the compiler
            reads them under the active code page and mangles them. -->
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
@@ -214,11 +214,11 @@
          plain C header on purpose: language-linkage (extern "C") entities cannot be
          exported from a C++ module, and the Kotlin side must keep including it. -->
     <ClInclude Include="include\mcdr_abi.h" />
-    <ClInclude Include="include\mcdr_dlss_impl.h" />
-    <ClInclude Include="include\mcdr_hdr_state.h" />
-    <ClInclude Include="include\mcdr_rtx_support.h" />
-    <ClInclude Include="include\mcdr_rt_state.h" />
-    <ClInclude Include="include\mcdr_rt_tracker.h" />
+    <ClInclude Include="include\advanced\mcdr_dlss_impl.h" />
+    <ClInclude Include="include\advanced\mcdr_hdr_state.h" />
+    <ClInclude Include="include\advanced\mcdr_rtx_support.h" />
+    <ClInclude Include="include\advanced\mcdr_rt_state.h" />
+    <ClInclude Include="include\advanced\mcdr_rt_tracker.h" />
     <ClInclude Include="include\mcdr_smaa_luts.h" />
     <ClInclude Include="include\mcdr_surface_opts_state.h" />
     <ClInclude Include="include\mcdr_window_host.h" />
@@ -227,6 +227,8 @@
          this in its global module fragment (NOMINMAX + windows/d3d12/dxgi/dcomp +
          STL + the DBG_LOG_DEBUG macro). -->
     <ClInclude Include="resources\resource.h" />
+    <ClInclude Include="include\advanced\mcdr_dlssd_impl.h" />
+    <ClInclude Include="include\advanced\mcdr_nrd_impl.h" />
   </ItemGroup>
   <ItemGroup>
     <!-- Module interface units. A .cppm under /std:c++latest is picked up as
@@ -283,6 +285,7 @@
          模块 purview 里的定义无法被普通 TU 链接，故状态单拎出来）。 -->
     <ClCompile Include="src\advanced\d3d12_hdr_state.cpp" />
     <ClCompile Include="src\advanced\d3d12_rt_state.cpp" />
+    <ClCompile Include="src\core\d3d12_rt_frame.cpp" />
     <!-- 交换链建链选项（allowTearing / presentChild）状态单元，同为普通 TU。 -->
     <ClCompile Include="src\core\d3d12_surface_opts_state.cpp" />
     <ClCompile Include="src\core\d3d12_async_descriptor.cpp" />
@@ -323,13 +326,20 @@
     <None Include="README.md" />
     <None Include="docs\README_ZH.MD" />
     <None Include="scripts\sync-external.ps1" />
+    <None Include="include\shaders\nrd_dependencies.hlsli" />
     <None Include="vcpkg-configuration.json" />
     <None Include="vcpkg.json" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="resources\MCDR.rc" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include="include\shaders\nrd_dependency_update.hlsl" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="BuildNrdDependencies" BeforeTargets="ClCompile" Condition="'$(Platform)' == 'x64'">
+    <Exec Command="python -B &quot;$(ProjectDir)scripts\build-nrd-dependencies.py&quot;" />
+  </Target>
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
 </Project>

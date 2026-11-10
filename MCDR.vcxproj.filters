@@ -157,6 +157,7 @@
     <None Include="resources\MCDR.APS">
       <Filter>资源文件</Filter>
     </None>
+    <None Include="include\shaders\nrd_dependencies.hlsli" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\mcdr_abi.h">
@@ -165,19 +166,19 @@
     <ClInclude Include="include\_d3d12_module_prelude.h">
       <Filter>头文件</Filter>
     </ClInclude>
-    <ClInclude Include="include\mcdr_rtx_support.h">
+    <ClInclude Include="include\advanced\mcdr_rtx_support.h">
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="include\mcdr_smaa_luts.h">
       <Filter>头文件</Filter>
     </ClInclude>
-    <ClInclude Include="include\mcdr_dlss_impl.h">
+    <ClInclude Include="include\advanced\mcdr_dlss_impl.h">
       <Filter>头文件</Filter>
     </ClInclude>
-    <ClInclude Include="include\mcdr_hdr_state.h">
+    <ClInclude Include="include\advanced\mcdr_hdr_state.h">
       <Filter>头文件</Filter>
     </ClInclude>
-    <ClInclude Include="include\mcdr_rt_state.h">
+    <ClInclude Include="include\advanced\mcdr_rt_state.h">
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="include\mcdr_surface_opts_state.h">
@@ -186,10 +187,16 @@
     <ClInclude Include="include\mcdr_window_host.h">
       <Filter>头文件</Filter>
     </ClInclude>
-    <ClInclude Include="include\mcdr_rt_tracker.h">
+    <ClInclude Include="include\advanced\mcdr_rt_tracker.h">
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="resources\resource.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="include\advanced\mcdr_dlssd_impl.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="include\advanced\mcdr_nrd_impl.h">
       <Filter>头文件</Filter>
     </ClInclude>
   </ItemGroup>
@@ -314,10 +321,19 @@
     <ClCompile Include="src\core\d3d12_window_host.cpp">
       <Filter>源文件\Core</Filter>
     </ClCompile>
+    <ClCompile Include="src\core\d3d12_rt_frame.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\advanced\d3d12_nrd.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="resources\MCDR.rc">
       <Filter>资源文件</Filter>
     </ResourceCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="include\shaders\nrd_dependency_update.hlsl" />
   </ItemGroup>
 </Project>

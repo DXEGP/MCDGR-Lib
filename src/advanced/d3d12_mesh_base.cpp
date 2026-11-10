@@ -140,14 +140,18 @@ bool meshPipelineSupported(std::string* why) {
 struct MeshRootSigInfo {
     UINT segmentParam = 0;
     UINT geometryParam = 0;
+    std::vector<uint8_t> bindingTypes;
 };
 
 std::mutex gMeshRootSigMutex;
 std::unordered_map<uint64_t, MeshRootSigInfo> gMeshRootSigs;
 
-void recordMeshRootSig(uint64_t handle, UINT segmentParam, UINT geometryParam) {
+void recordMeshRootSig(uint64_t handle, UINT segmentParam, UINT geometryParam,
+    const std::vector<PipelineDesc::Binding>& bindings) {
+    MeshRootSigInfo info{segmentParam, geometryParam, {}};
+    for (const auto& binding : bindings) info.bindingTypes.push_back(binding.type);
     std::lock_guard<std::mutex> lock(gMeshRootSigMutex);
-    gMeshRootSigs[handle] = MeshRootSigInfo{segmentParam, geometryParam};
+    gMeshRootSigs[handle] = std::move(info);
 }
 
 MeshRootSigInfo lookupMeshRootSig(uint64_t handle) {
@@ -443,6 +447,18 @@ mcdr::Result<void*> createMeshPipelineImpl(const MeshPipelineDesc& desc, uint64_
         if (!r) return std::unexpected(r.error());
     }
 
+    pipeline->hasAmplification = !desc.asDxil.empty();
+    pipeline->reverseDepthWrite = desc.hasDepth && desc.depthWrite &&
+        toDxgiFormat(desc.depthFormat) == DXGI_FORMAT_D32_FLOAT &&
+        toCompare(desc.depthCompareOp) == D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+    if (externalRootSignature != 0) {
+        pipeline->bindingTypes = lookupMeshRootSig(externalRootSignature).bindingTypes;
+    } else {
+        for (const auto& binding : desc.bindings) pipeline->bindingTypes.push_back(binding.type);
+    }
+    for (UINT index = 0; index < sRtv.payload.NumRenderTargets; ++index) {
+        pipeline->colorFormats.push_back(sRtv.payload.RTFormats[index]);
+    }
     return static_cast<void*>(pipeline.release());
 }
 
@@ -589,7 +605,7 @@ mcdr::Result<uint64_t> createMeshRootSignature(const std::vector<PipelineDesc::B
 
     auto raw = rootSig.Detach();
     const auto handle = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(raw));
-    if (meshExtras) recordMeshRootSig(handle, segmentParam, geometryParam);
+    if (meshExtras) recordMeshRootSig(handle, segmentParam, geometryParam, bindings);
     return handle;
 }
 

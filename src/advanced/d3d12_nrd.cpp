@@ -22,12 +22,19 @@
 #include <cstring>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include "NRD.h"
 #include "mcdr_nrd_impl.h"
+#include "../../build/nrd-dependencies.h"
 
 namespace {
+
+constexpr std::array<nrd::DenoiserDesc, 2> kDenoisers{{
+    {0, nrd::Denoiser::REBLUR_DIFFUSE},
+    {1, nrd::Denoiser::REBLUR_SPECULAR},
+}};
 
 // 追加一行；写满就停，绝不越界（capacity 由调用方给）。
 void appendLine(char* out, int32_t capacity, int32_t& used, const char* fmt, ...) {
@@ -53,12 +60,9 @@ extern "C" int32_t MCDR_CALL mcdr_dx12NrdInspect(char* outText, int32_t capacity
     }
     outText[0] = '\0';
 
-    const nrd::DenoiserDesc denoisers[1] = {
-        {0, nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR},
-    };
     nrd::InstanceCreationDesc creation = {};
-    creation.denoisers = denoisers;
-    creation.denoisersNum = 1;
+    creation.denoisers = kDenoisers.data();
+    creation.denoisersNum = static_cast<uint32_t>(kDenoisers.size());
 
     nrd::Instance* instance = nullptr;
     const nrd::Result created = nrd::CreateInstance(creation, instance);
@@ -198,7 +202,7 @@ bool createRootSignature(ID3D12Device* device, const nrd::InstanceDesc& desc,
     smp.RegisterSpace = desc.constantBufferAndSamplersSpaceIndex;
     smp.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-    D3D12_ROOT_PARAMETER params[4]{};
+    D3D12_ROOT_PARAMETER params[7]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = desc.constantBufferRegisterIndex;
     params[0].Descriptor.RegisterSpace = desc.constantBufferAndSamplersSpaceIndex;
@@ -215,9 +219,15 @@ bool createRootSignature(ID3D12Device* device, const nrd::InstanceDesc& desc,
     params[3].DescriptorTable.NumDescriptorRanges = 1;
     params[3].DescriptorTable.pDescriptorRanges = &smp;
     params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[4].Descriptor = {0, 3};
+    params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[5].Descriptor = {0, 3};
+    params[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[6].Descriptor = {0, 3};
 
     D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-    rsDesc.NumParameters = 4;
+    rsDesc.NumParameters = 7;
     rsDesc.pParameters = params;
     rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
 
@@ -236,8 +246,14 @@ bool createRootSignature(ID3D12Device* device, const nrd::InstanceDesc& desc,
     return true;
 }
 
-bool createPoolTexture(ID3D12Device* device, const nrd::TextureDesc& desc, uint32_t width,
-                       uint32_t height, ID3D12Resource** out, const char** stage) {
+struct NrdResource {
+    std::shared_ptr<void> allocationCharge;
+    ComPtr<ID3D12Resource> resource;
+};
+
+int32_t createPoolTexture(ID3D12Device* device, const nrd::TextureDesc& desc, uint32_t width,
+                       uint32_t height, McdrNrdReserveMemory reserveMemory, NrdResource& output,
+                       const char** stage) {
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
 
@@ -251,39 +267,91 @@ bool createPoolTexture(ID3D12Device* device, const nrd::TextureDesc& desc, uint3
     resource.SampleDesc.Count = 1;
     // 池里的纹理在两个方向都要能读写：同一张图这帧是输入、下帧是输出。
     resource.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (resource.Width == 0 || resource.Height == 0 || resource.Format == DXGI_FORMAT_UNKNOWN) {
+        *stage = "invalid pool texture";
+        return -1;
+    }
+    output.allocationCharge = reserveMemory(&resource, false);
+    if (!output.allocationCharge) {
+        *stage = "managed memory budget exhausted";
+        return MCDR_NRD_MEMORY_PRESSURE;
+    }
     if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &resource,
                                                D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                               IID_PPV_ARGS(out)))) {
+                                               IID_PPV_ARGS(&output.resource)))) {
         *stage = "create pool texture";
-        return false;
+        return -1;
     }
-    return true;
+    return 1;
 }
 
 constexpr uint32_t kDispatchSlots = 8;
-constexpr uint32_t kConstantSlotsPerDispatch = 32;
+constexpr uint32_t kConstantSlotsPerDispatch = 64;
+constexpr uint32_t kHistoryRejectionDescriptors = 7;
+constexpr uint32_t kDependencyConstantBytes = 512;
+using NrdDependencyBinding = std::array<uint32_t, 4>;
 
 struct NrdDispatchSlot {
     ComPtr<ID3D12Fence> fence;
     uint64_t value = 0;
+    std::shared_ptr<void> recording;
+    McdrNrdRecordingState (*recordingState)(const void*) = nullptr;
+
+    bool cancelled() const {
+        if (!recording || !recordingState) return false;
+        const auto state = recordingState(recording.get());
+        return state == McdrNrdRecordingState::Cancelled || state == McdrNrdRecordingState::SubmissionFailed;
+    }
 
     bool complete() const {
-        return !fence || fence->GetCompletedValue() >= value;
+        if (recording) {
+            if (!recordingState) return false;
+            const auto state = recordingState(recording.get());
+            if (state == McdrNrdRecordingState::Cancelled) return true;
+            if (state != McdrNrdRecordingState::Submitted && state != McdrNrdRecordingState::SubmissionFailed) return false;
+        }
+        if (!fence) return !recording;
+        const auto completed = fence->GetCompletedValue();
+        return completed != UINT64_MAX && completed >= value;
     }
 };
 
 struct NrdContext {
     nrd::Instance* instance = nullptr;
     ComPtr<ID3D12RootSignature> rootSignature;
+    ComPtr<ID3D12RootSignature> historyRejectionRoot;
+    ComPtr<ID3D12PipelineState> historyRejectionPipeline;
+    ComPtr<ID3D12RootSignature> dependencyRoot;
+    ComPtr<ID3D12PipelineState> dependencyUpdate;
+    std::vector<ComPtr<ID3D12PipelineState>> dependencyPipelines;
+    NrdResource dependencyRead;
+    NrdResource dependencyWrite;
+    NrdResource dependencyMask;
+    NrdResource dependencyConstants;
+    uint8_t* dependencyMapped = nullptr;
+    std::vector<NrdDependencyBinding> permanentDependencies;
+    std::vector<NrdDependencyBinding> transientDependencies;
+    std::array<NrdDependencyBinding, 2> outputDependencies{};
+    std::array<NrdDependencyBinding, 3> rawDependencies{};
+    McdrNrdReserveMemory reserveMemory = nullptr;
+    uint32_t dependencyEntries = 0;
+    uint32_t dependencyMaskOffset = 0;
+    uint32_t dependencyTiles = 0;
+    uint32_t dependencyDispatches = 0;
+    uint64_t dependencyEpoch = 0;
+    bool dependencyActive = false;
+    D3D12_RESOURCE_STATES dependencyReadState = D3D12_RESOURCE_STATE_COMMON;
+    D3D12_RESOURCE_STATES dependencyWriteState = D3D12_RESOURCE_STATE_COMMON;
+    D3D12_RESOURCE_STATES dependencyMaskState = D3D12_RESOURCE_STATE_COMMON;
     std::vector<ComPtr<ID3D12PipelineState>> pipelines;
-    std::vector<ComPtr<ID3D12Resource>> permanent;
-    std::vector<ComPtr<ID3D12Resource>> transient;
+    std::vector<NrdResource> permanent;
+    std::vector<NrdResource> transient;
     /** 池纹理当前状态：同一张纹理既当 SRV 又当 UAV，状态必须自己记。 */
     std::vector<D3D12_RESOURCE_STATES> permanentState;
     std::vector<D3D12_RESOURCE_STATES> transientState;
     ComPtr<ID3D12DescriptorHeap> descriptors;
     ComPtr<ID3D12DescriptorHeap> samplers;
-    ComPtr<ID3D12Resource> constants;
+    NrdResource constants;
     uint8_t* constantMapped = nullptr;
     uint32_t constantStride = 0;
     uint32_t descriptorsPerDispatch = 0;
@@ -294,25 +362,53 @@ struct NrdContext {
     uint32_t height = 0;
     bool ready = false;
     bool traced = false;
+    bool resetPending = true;
 
     bool complete() const {
         return std::ranges::all_of(slots, &NrdDispatchSlot::complete);
     }
 
+    bool cancelled() const {
+        return std::ranges::any_of(slots, &NrdDispatchSlot::cancelled);
+    }
+
     void release() {
+        dependencyPipelines.clear();
+        dependencyUpdate.Reset();
+        dependencyRoot.Reset();
+        dependencyRead = {};
+        dependencyWrite = {};
+        dependencyMask = {};
+        if (dependencyMapped && dependencyConstants.resource) dependencyConstants.resource->Unmap(0, nullptr);
+        dependencyMapped = nullptr;
+        dependencyConstants = {};
+        permanentDependencies.clear();
+        transientDependencies.clear();
+        dependencyActive = false;
+        dependencyEpoch = 0;
+        dependencyEntries = 0;
+        dependencyMaskOffset = 0;
+        dependencyTiles = 0;
+        dependencyReadState = D3D12_RESOURCE_STATE_COMMON;
+        dependencyWriteState = D3D12_RESOURCE_STATE_COMMON;
+        dependencyMaskState = D3D12_RESOURCE_STATE_COMMON;
+        reserveMemory = nullptr;
         pipelines.clear();
         permanent.clear();
         transient.clear();
         permanentState.clear();
         transientState.clear();
-        if (constantMapped != nullptr && constants) {
-            constants->Unmap(0, nullptr);
+        if (constantMapped != nullptr && constants.resource) {
+            constants.resource->Unmap(0, nullptr);
             constantMapped = nullptr;
         }
-        constants.Reset();
+        constants.resource.Reset();
+        constants.allocationCharge.reset();
         samplers.Reset();
         descriptors.Reset();
         rootSignature.Reset();
+        historyRejectionPipeline.Reset();
+        historyRejectionRoot.Reset();
         slots = {};
         if (instance != nullptr) {
             nrd::DestroyInstance(*instance);
@@ -323,6 +419,7 @@ struct NrdContext {
         height = 0;
         ready = false;
         traced = false;
+        resetPending = true;
     }
 };
 
@@ -350,14 +447,15 @@ void retireContext() {
 } // namespace
 
 extern "C" int32_t mcdr_nrd_context_init(void* device, int32_t width, int32_t height,
-                                         char* outText, int32_t capacity) {
+                                         McdrNrdReserveMemory reserveMemory, char* outText, int32_t capacity) {
     if (outText != nullptr && capacity > 0) {
         outText[0] = '\0';
     }
-    if (device == nullptr || width <= 0 || height <= 0) {
+    if (device == nullptr || width <= 0 || height <= 0 || reserveMemory == nullptr) {
         return -1;
     }
     collectContexts();
+    if (gNrd.cancelled()) retireContext();
     if (gNrd.ready && gNrd.device == device && gNrd.width == static_cast<uint32_t>(width)
         && gNrd.height == static_cast<uint32_t>(height)) {
         return 1;
@@ -366,10 +464,9 @@ extern "C" int32_t mcdr_nrd_context_init(void* device, int32_t width, int32_t he
 
     int32_t used = 0;
     const char* stage = "create instance";
-    const nrd::DenoiserDesc denoisers[1] = {{0, nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR}};
     nrd::InstanceCreationDesc creation{};
-    creation.denoisers = denoisers;
-    creation.denoisersNum = 1;
+    creation.denoisers = kDenoisers.data();
+    creation.denoisersNum = static_cast<uint32_t>(kDenoisers.size());
     if (nrd::CreateInstance(creation, gNrd.instance) != nrd::Result::SUCCESS
         || gNrd.instance == nullptr) {
         gNrd.release();
@@ -384,53 +481,30 @@ extern "C" int32_t mcdr_nrd_context_init(void* device, int32_t width, int32_t he
         return -1;
     }
 
-    ID3D12RootSignature* root = nullptr;
-    if (!createRootSignature(static_cast<ID3D12Device*>(device), *desc, &root, &stage)) {
-        gNrd.release();
-        appendLine(outText, capacity, used, "nrd: context failed, %s\n", stage);
-        return -1;
-    }
-    gNrd.rootSignature.Attach(root);
-
-    gNrd.pipelines.resize(desc->pipelinesNum);
-    uint32_t created = 0;
-    for (uint32_t i = 0; i < desc->pipelinesNum; ++i) {
-        D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
-        pso.pRootSignature = gNrd.rootSignature.Get();
-        pso.CS.pShaderBytecode = desc->pipelines[i].computeShaderDXIL.bytecode;
-        pso.CS.BytecodeLength = desc->pipelines[i].computeShaderDXIL.size;
-        pso.NodeMask = 0;
-        if (FAILED(static_cast<ID3D12Device*>(device)->CreateComputePipelineState(
-                &pso, IID_PPV_ARGS(&gNrd.pipelines[i])))) {
-            stage = "create pipeline state";
-            appendLine(outText, capacity, used, "nrd: context failed, %s %u\n", stage, i);
-            gNrd.release();
-            return -1;
-        }
-        ++created;
-    }
-
     gNrd.width = static_cast<uint32_t>(width);
     gNrd.height = static_cast<uint32_t>(height);
+    gNrd.reserveMemory = reserveMemory;
     gNrd.permanent.resize(desc->permanentPoolSize);
     uint32_t permanent = 0;
     for (uint32_t i = 0; i < desc->permanentPoolSize; ++i) {
-        if (!createPoolTexture(static_cast<ID3D12Device*>(device), desc->permanentPool[i],
-                               gNrd.width, gNrd.height, &gNrd.permanent[i], &stage)) {
+        const auto result = createPoolTexture(static_cast<ID3D12Device*>(device), desc->permanentPool[i],
+                               gNrd.width, gNrd.height, reserveMemory, gNrd.permanent[i], &stage);
+        if (result <= 0) {
             appendLine(outText, capacity, used, "nrd: context failed, %s %u\n", stage, i);
             gNrd.release();
-            return -1;
+            return result;
         }
         ++permanent;
     }
     gNrd.transient.resize(desc->transientPoolSize);
     uint32_t transient = 0;
     for (uint32_t i = 0; i < desc->transientPoolSize; ++i) {
-        if (!createPoolTexture(static_cast<ID3D12Device*>(device), desc->transientPool[i],
-                               gNrd.width, gNrd.height, &gNrd.transient[i], &stage)) {
+        const auto result = createPoolTexture(static_cast<ID3D12Device*>(device), desc->transientPool[i],
+                               gNrd.width, gNrd.height, reserveMemory, gNrd.transient[i], &stage);
+        if (result <= 0) {
             appendLine(outText, capacity, used, "nrd: context failed, %s %u\n", stage, i);
             gNrd.release();
-            return -1;
+            return result;
         }
         ++transient;
     }
@@ -439,7 +513,8 @@ extern "C" int32_t mcdr_nrd_context_init(void* device, int32_t width, int32_t he
                           + desc->descriptorPoolDesc.perSetStorageTexturesMaxNum;
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    gNrd.descriptorsPerDispatch = perSet * desc->descriptorPoolDesc.setsMaxNum;
+    gNrd.descriptorsPerDispatch = perSet * desc->descriptorPoolDesc.setsMaxNum
+        + kHistoryRejectionDescriptors * static_cast<uint32_t>(kDenoisers.size()) + 1;
     heapDesc.NumDescriptors = gNrd.descriptorsPerDispatch * kDispatchSlots;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     stage = "create descriptor heap";
@@ -491,13 +566,42 @@ extern "C" int32_t mcdr_nrd_context_init(void* device, int32_t width, int32_t he
     ringDesc.SampleDesc.Count = 1;
     ringDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     stage = "create constant ring";
+    gNrd.constants.allocationCharge = reserveMemory(&ringDesc, true);
+    if (!gNrd.constants.allocationCharge) {
+        appendLine(outText, capacity, used, "nrd: context failed, managed memory budget exhausted\n");
+        gNrd.release();
+        return MCDR_NRD_MEMORY_PRESSURE;
+    }
     if (FAILED(static_cast<ID3D12Device*>(device)->CreateCommittedResource(
             &uploadHeap, D3D12_HEAP_FLAG_NONE, &ringDesc, D3D12_RESOURCE_STATE_GENERIC_READ,
-            nullptr, IID_PPV_ARGS(&gNrd.constants)))
-        || FAILED(gNrd.constants->Map(0, nullptr, reinterpret_cast<void**>(&gNrd.constantMapped)))) {
+            nullptr, IID_PPV_ARGS(&gNrd.constants.resource)))
+        || FAILED(gNrd.constants.resource->Map(0, nullptr, reinterpret_cast<void**>(&gNrd.constantMapped)))) {
         appendLine(outText, capacity, used, "nrd: context failed, %s\n", stage);
         gNrd.release();
         return -1;
+    }
+
+    ID3D12RootSignature* root = nullptr;
+    if (!createRootSignature(static_cast<ID3D12Device*>(device), *desc, &root, &stage)) {
+        gNrd.release();
+        appendLine(outText, capacity, used, "nrd: context failed, %s\n", stage);
+        return -1;
+    }
+    gNrd.rootSignature.Attach(root);
+    gNrd.pipelines.resize(desc->pipelinesNum);
+    uint32_t created = 0;
+    for (uint32_t pipelineIndex = 0; pipelineIndex < desc->pipelinesNum; ++pipelineIndex) {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline{};
+        pipeline.pRootSignature = gNrd.rootSignature.Get();
+        pipeline.CS.pShaderBytecode = desc->pipelines[pipelineIndex].computeShaderDXIL.bytecode;
+        pipeline.CS.BytecodeLength = desc->pipelines[pipelineIndex].computeShaderDXIL.size;
+        if (FAILED(static_cast<ID3D12Device*>(device)->CreateComputePipelineState(
+                &pipeline, IID_PPV_ARGS(&gNrd.pipelines[pipelineIndex])))) {
+            appendLine(outText, capacity, used, "nrd: context failed, create pipeline state %u\n", pipelineIndex);
+            gNrd.release();
+            return -1;
+        }
+        ++created;
     }
 
     gNrd.device = static_cast<ID3D12Device*>(device);
@@ -517,14 +621,20 @@ extern "C" int32_t mcdr_nrd_context_init(void* device, int32_t width, int32_t he
 //
 namespace {
 
-ID3D12Resource* resolveResource(const nrd::ResourceDesc& desc, const mcdr_nrd_frame* frame) {
+ID3D12Resource* resolveResource(const nrd::ResourceDesc& desc, const mcdr_nrd_frame* frame,
+                               nrd::Identifier identifier) {
     switch (desc.type) {
         case nrd::ResourceType::IN_MV:
             return static_cast<ID3D12Resource*>(frame->motion);
         case nrd::ResourceType::IN_NORMAL_ROUGHNESS:
             return static_cast<ID3D12Resource*>(frame->normalRoughness);
         case nrd::ResourceType::IN_VIEWZ:
-            return static_cast<ID3D12Resource*>(frame->viewZ);
+            return static_cast<ID3D12Resource*>(identifier == 1 && frame->specularViewZ
+                ? frame->specularViewZ : frame->viewZ);
+        case nrd::ResourceType::IN_DIFF_CONFIDENCE:
+            return static_cast<ID3D12Resource*>(frame->diffuseConfidence);
+        case nrd::ResourceType::IN_SPEC_CONFIDENCE:
+            return static_cast<ID3D12Resource*>(frame->specularConfidence);
         case nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST:
             return static_cast<ID3D12Resource*>(frame->radianceIn);
         case nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST:
@@ -537,11 +647,11 @@ ID3D12Resource* resolveResource(const nrd::ResourceDesc& desc, const mcdr_nrd_fr
             return static_cast<ID3D12Resource*>(frame->validationOutput);
         case nrd::ResourceType::PERMANENT_POOL: {
             const uint32_t index = desc.indexInPool;
-            return index < gNrd.permanent.size() ? gNrd.permanent[index].Get() : nullptr;
+            return index < gNrd.permanent.size() ? gNrd.permanent[index].resource.Get() : nullptr;
         }
         case nrd::ResourceType::TRANSIENT_POOL: {
             const uint32_t index = desc.indexInPool;
-            return index < gNrd.transient.size() ? gNrd.transient[index].Get() : nullptr;
+            return index < gNrd.transient.size() ? gNrd.transient[index].resource.Get() : nullptr;
         }
         default:
             return nullptr;
@@ -569,6 +679,366 @@ void writeView(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT slot, ID3D
     }
 }
 
+constexpr auto kHistoryRejectionShader = R"hlsl(
+Texture2D<uint> rejection : register(t0);
+RWTexture2D<float> previousDepth : register(u0);
+RWTexture2D<uint> previousInternal : register(u1);
+RWTexture2D<float4> previousHistory : register(u2);
+RWTexture2D<float> previousFastHistory : register(u3);
+RWTexture2D<float> previousTracking : register(u4);
+RWTexture2D<float> previousTrackingAlternate : register(u5);
+cbuffer Parameters : register(b0) {
+    uint width;
+    uint height;
+    uint lobeBit;
+};
+[numthreads(8, 8, 1)]
+void RejectHistory(uint3 pixel : SV_DispatchThreadID) {
+    if (pixel.x >= width || pixel.y >= height) return;
+    uint mask = 0u;
+    for (int offsetY = -2; offsetY <= 2; ++offsetY) {
+        for (int offsetX = -2; offsetX <= 2; ++offsetX) {
+            int2 source = int2(pixel.xy) + int2(offsetX, offsetY);
+            if (all(source >= 0) && all(source < int2(width, height)))
+                mask |= rejection.Load(int3(source, 0));
+        }
+    }
+    if ((mask & lobeBit) == 0u) return;
+    previousDepth[pixel.xy] = 1000000.0;
+    previousInternal[pixel.xy] = 0u;
+    previousHistory[pixel.xy] = 0.0;
+    previousFastHistory[pixel.xy] = 0.0;
+    if (lobeBit == 2u) {
+        previousTracking[pixel.xy] = 0.0;
+        previousTrackingAlternate[pixel.xy] = 0.0;
+    }
+}
+)hlsl";
+
+bool prepareHistoryRejection(const mcdr_nrd_frame& frame) {
+    if (gNrd.historyRejectionPipeline) return true;
+    if (!frame.createHistoryRejectionPipeline) return false;
+    std::array<D3D12_DESCRIPTOR_RANGE, 2> ranges{};
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[0].NumDescriptors = 1;
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    ranges[1].NumDescriptors = 6;
+    std::array<D3D12_ROOT_PARAMETER, 3> parameters{};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants.Num32BitValues = 3;
+    for (uint32_t index = 0; index < ranges.size(); ++index) {
+        parameters[index + 1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        parameters[index + 1].DescriptorTable = {1, &ranges[index]};
+    }
+    D3D12_ROOT_SIGNATURE_DESC description{};
+    description.NumParameters = static_cast<uint32_t>(parameters.size());
+    description.pParameters = parameters.data();
+    ComPtr<ID3DBlob> bytecode;
+    ComPtr<ID3DBlob> errors;
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> pipeline;
+    if (FAILED(D3D12SerializeRootSignature(&description, D3D_ROOT_SIGNATURE_VERSION_1,
+        &bytecode, &errors)) || FAILED(gNrd.device->CreateRootSignature(0,
+            bytecode->GetBufferPointer(), bytecode->GetBufferSize(), IID_PPV_ARGS(&root))) ||
+        !frame.createHistoryRejectionPipeline(kHistoryRejectionShader, root.Get(),
+            reinterpret_cast<void**>(pipeline.GetAddressOf())) || !pipeline) return false;
+    gNrd.historyRejectionRoot = std::move(root);
+    gNrd.historyRejectionPipeline = std::move(pipeline);
+    return true;
+}
+
+bool isTemporalAccumulation(const nrd::PipelineDesc& pipeline) {
+    return std::string_view(pipeline.shaderIdentifier).find("REBLUR_TemporalAccumulation") != std::string_view::npos;
+}
+
+bool historyRejectionLayout(const nrd::DispatchDesc& dispatch) {
+    if (dispatch.identifier > 1 || dispatch.resourcesNum != (dispatch.identifier == 1 ? 19u : 16u) ||
+        dispatch.constantBufferDataSize == 0) return false;
+    for (const auto index : {4u, 6u, 10u, 11u}) {
+        const auto& resource = dispatch.resources[index];
+        if (resource.type != nrd::ResourceType::PERMANENT_POOL ||
+            resource.descriptorType != nrd::DescriptorType::TEXTURE ||
+            resource.indexInPool >= gNrd.permanent.size()) return false;
+    }
+    if (dispatch.identifier == 1 && (dispatch.resources[12].type != nrd::ResourceType::PERMANENT_POOL ||
+        dispatch.resources[12].descriptorType != nrd::DescriptorType::TEXTURE ||
+        dispatch.resources[12].indexInPool >= gNrd.permanent.size() ||
+        dispatch.resources[17].type != nrd::ResourceType::PERMANENT_POOL ||
+        dispatch.resources[17].descriptorType != nrd::DescriptorType::STORAGE_TEXTURE ||
+        dispatch.resources[17].indexInPool >= gNrd.permanent.size())) return false;
+    return gNrd.permanent[dispatch.resources[4].indexInPool].resource->GetDesc().Format == DXGI_FORMAT_R32_FLOAT &&
+        gNrd.permanent[dispatch.resources[6].indexInPool].resource->GetDesc().Format == DXGI_FORMAT_R16_UINT &&
+        gNrd.permanent[dispatch.resources[10].indexInPool].resource->GetDesc().Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+        gNrd.permanent[dispatch.resources[11].indexInPool].resource->GetDesc().Format == DXGI_FORMAT_R16_FLOAT &&
+        (dispatch.identifier == 0 || (
+            gNrd.permanent[dispatch.resources[12].indexInPool].resource->GetDesc().Format == DXGI_FORMAT_R16_FLOAT &&
+            gNrd.permanent[dispatch.resources[17].indexInPool].resource->GetDesc().Format == DXGI_FORMAT_R16_FLOAT));
+}
+
+void rejectHistory(const mcdr_nrd_frame& frame, const nrd::DispatchDesc& dispatch, UINT descriptorBase) {
+    auto* list = static_cast<ID3D12GraphicsCommandList*>(frame.list);
+    writeView(gNrd.device, gNrd.descriptors.Get(), descriptorBase,
+        static_cast<ID3D12Resource*>(frame.historyRejection),
+        static_cast<ID3D12Resource*>(frame.historyRejection)->GetDesc().Format, false);
+    const std::array<uint32_t, 6> indices{4, 6, 10, 11, 12, 17};
+    for (uint32_t index = 0; index < indices.size(); ++index) {
+        if (index >= 4 && dispatch.identifier == 0) {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC description{};
+            description.Format = DXGI_FORMAT_R16_FLOAT;
+            description.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            auto handle = gNrd.descriptors->GetCPUDescriptorHandleForHeapStart();
+            handle.ptr += static_cast<SIZE_T>(descriptorBase + index + 1) *
+                gNrd.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            gNrd.device->CreateUnorderedAccessView(nullptr, nullptr, &description, handle);
+            continue;
+        }
+        const auto poolIndex = dispatch.resources[indices[index]].indexInPool;
+        auto* resource = gNrd.permanent[poolIndex].resource.Get();
+        auto& state = gNrd.permanentState[poolIndex];
+        if (state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+            const D3D12_RESOURCE_BARRIER barrier{D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                {{resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS}}};
+            list->ResourceBarrier(1, &barrier);
+            state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        }
+        writeView(gNrd.device, gNrd.descriptors.Get(), descriptorBase + index + 1,
+            resource, resource->GetDesc().Format, true);
+    }
+    list->SetComputeRootSignature(gNrd.historyRejectionRoot.Get());
+    list->SetPipelineState(gNrd.historyRejectionPipeline.Get());
+    const std::array<uint32_t, 3> constants{gNrd.width, gNrd.height, 1u << dispatch.identifier};
+    list->SetComputeRoot32BitConstants(0, static_cast<uint32_t>(constants.size()), constants.data(), 0);
+    const auto increment = gNrd.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto handle = gNrd.descriptors->GetGPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<uint64_t>(descriptorBase) * increment;
+    list->SetComputeRootDescriptorTable(1, handle);
+    handle.ptr += increment;
+    list->SetComputeRootDescriptorTable(2, handle);
+    list->Dispatch((gNrd.width + 7) / 8, (gNrd.height + 7) / 8, 1);
+    const D3D12_RESOURCE_BARRIER barrier{D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        D3D12_RESOURCE_BARRIER_FLAG_NONE, {}};
+    list->ResourceBarrier(1, &barrier);
+    list->SetComputeRootSignature(gNrd.rootSignature.Get());
+    list->SetComputeRootDescriptorTable(3, gNrd.samplers->GetGPUDescriptorHandleForHeapStart());
+}
+
+NrdDependencyBinding dependencyBinding(const nrd::ResourceDesc& resource) {
+    if (resource.type == nrd::ResourceType::PERMANENT_POOL) return gNrd.permanentDependencies[resource.indexInPool];
+    if (resource.type == nrd::ResourceType::TRANSIENT_POOL) return gNrd.transientDependencies[resource.indexInPool];
+    if (resource.type == nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST) return gNrd.outputDependencies[0];
+    if (resource.type == nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST) return gNrd.outputDependencies[1];
+    if (resource.type == nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST) return gNrd.rawDependencies[0];
+    if (resource.type == nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST) return gNrd.rawDependencies[1];
+    return gNrd.rawDependencies[2];
+}
+
+int32_t prepareDependencies() {
+    if (gNrd.dependencyWrite.resource) return 1;
+    const auto* library = nrd::GetLibraryDesc();
+    if (!library || library->versionMajor != 4 || library->versionMinor != 18 ||
+        library->normalEncoding != nrd::NormalEncoding::R10_G10_B10_A2_UNORM ||
+        library->roughnessEncoding != nrd::RoughnessEncoding::LINEAR) return -1;
+    uint64_t bytes = 0;
+    const auto binding = [&bytes](ID3D12Resource* resource, uint32_t factor) {
+        const auto description = resource->GetDesc();
+        const auto tileSize = std::max(1u, 64u / std::max(1u, factor));
+        NrdDependencyBinding result{static_cast<uint32_t>(bytes), static_cast<uint32_t>(description.Width),
+            description.Height, tileSize};
+        bytes += uint64_t{(result[1] + tileSize - 1u) / tileSize} * ((result[2] + tileSize - 1u) / tileSize) * 32u;
+        return result;
+    };
+    gNrd.permanentDependencies.clear();
+    gNrd.transientDependencies.clear();
+    for (uint32_t index = 0; index < gNrd.permanent.size(); ++index)
+        gNrd.permanentDependencies.push_back(binding(gNrd.permanent[index].resource.Get(), gNrd.desc->permanentPool[index].downsampleFactor));
+    for (uint32_t index = 0; index < gNrd.transient.size(); ++index)
+        gNrd.transientDependencies.push_back(binding(gNrd.transient[index].resource.Get(), gNrd.desc->transientPool[index].downsampleFactor));
+    for (auto& output : gNrd.outputDependencies) output = binding(gNrd.permanent[0].resource.Get(), 1);
+    for (auto& raw : gNrd.rawDependencies) raw = binding(gNrd.permanent[0].resource.Get(), 1);
+    if (bytes > UINT32_MAX / 2) return -1;
+    gNrd.dependencyEntries = static_cast<uint32_t>(bytes / 32u);
+    gNrd.dependencyMaskOffset = static_cast<uint32_t>(bytes);
+    gNrd.dependencyTiles = ((gNrd.width + 63u) / 64u) * ((gNrd.height + 63u) / 64u);
+    bytes += uint64_t{gNrd.dependencyTiles} * 4u;
+    std::array<NrdResource, 3> buffers;
+    for (uint32_t index = 0; index < buffers.size(); ++index) {
+        D3D12_RESOURCE_DESC description{};
+        description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        description.Width = index == 2 ? uint64_t{kDependencyConstantBytes} * kConstantSlotsPerDispatch * kDispatchSlots : bytes;
+        description.Height = description.DepthOrArraySize = description.MipLevels = 1;
+        description.SampleDesc.Count = 1;
+        description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        description.Flags = index == 1 ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+        buffers[index].allocationCharge = gNrd.reserveMemory(&description, index == 2);
+        if (!buffers[index].allocationCharge) return MCDR_NRD_MEMORY_PRESSURE;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = index == 2 ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_DEFAULT;
+        if (FAILED(gNrd.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &description,
+            index == 2 ? D3D12_RESOURCE_STATE_GENERIC_READ : D3D12_RESOURCE_STATE_COMMON,
+            nullptr, IID_PPV_ARGS(&buffers[index].resource)))) return -1;
+    }
+    NrdResource mask;
+    const char* stage = nullptr;
+    const auto createdMask = createPoolTexture(gNrd.device, {nrd::Format::R32_UINT, 1},
+        gNrd.width, gNrd.height, gNrd.reserveMemory, mask, &stage);
+    if (createdMask <= 0) return createdMask;
+    D3D12_DESCRIPTOR_RANGE maskRange{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 1, 3, 0};
+    std::array<D3D12_ROOT_PARAMETER, 6> parameters{};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants = {0, 3, 16};
+    for (uint32_t index = 1; index <= 3; ++index) {
+        parameters[index].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        parameters[index].Descriptor = {index - 1u, 3};
+    }
+    parameters[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    parameters[4].Descriptor = {0, 3};
+    parameters[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[5].DescriptorTable = {1, &maskRange};
+    const D3D12_ROOT_SIGNATURE_DESC rootDescription{static_cast<UINT>(parameters.size()), parameters.data(), 0, nullptr,
+        D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> serialized;
+    ComPtr<ID3DBlob> errors;
+    ComPtr<ID3D12RootSignature> root;
+    if (FAILED(D3D12SerializeRootSignature(&rootDescription, D3D_ROOT_SIGNATURE_VERSION_1,
+        &serialized, &errors)) || FAILED(gNrd.device->CreateRootSignature(0, serialized->GetBufferPointer(),
+            serialized->GetBufferSize(), IID_PPV_ARGS(&root)))) return -1;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline{};
+    pipeline.pRootSignature = root.Get();
+    pipeline.CS = {kMcdrNrdDependencyUpdate, sizeof(kMcdrNrdDependencyUpdate)};
+    ComPtr<ID3D12PipelineState> update;
+    if (FAILED(gNrd.device->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&update)))) return -1;
+    std::vector<ComPtr<ID3D12PipelineState>> pipelines(gNrd.desc->pipelinesNum);
+    for (uint32_t index = 0; index < pipelines.size(); ++index) {
+        const auto& original = gNrd.desc->pipelines[index];
+        const auto found = std::ranges::find(kMcdrNrdTrackedShaders, std::string_view(original.shaderIdentifier),
+            &McdrNrdTrackedShader::identifier);
+        if (found == std::end(kMcdrNrdTrackedShaders)) continue;
+        pipeline.pRootSignature = gNrd.rootSignature.Get();
+        pipeline.CS = {found->bytecode, found->size};
+        if (FAILED(gNrd.device->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&pipelines[index])))) return -1;
+    }
+    uint8_t* mapped = nullptr;
+    if (FAILED(buffers[2].resource->Map(0, nullptr, reinterpret_cast<void**>(&mapped)))) return -1;
+    gNrd.dependencyRead = std::move(buffers[0]);
+    gNrd.dependencyWrite = std::move(buffers[1]);
+    gNrd.dependencyConstants = std::move(buffers[2]);
+    gNrd.dependencyMask = std::move(mask);
+    gNrd.dependencyMapped = mapped;
+    gNrd.dependencyRoot = std::move(root);
+    gNrd.dependencyUpdate = std::move(update);
+    gNrd.dependencyPipelines = std::move(pipelines);
+    return 1;
+}
+
+void dependencyTransition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,
+    D3D12_RESOURCE_STATES& state, D3D12_RESOURCE_STATES next) {
+    if (state == next) return;
+    const D3D12_RESOURCE_BARRIER barrier{D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        D3D12_RESOURCE_BARRIER_FLAG_NONE, {{resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, state, next}}};
+    list->ResourceBarrier(1, &barrier);
+    state = next;
+}
+
+void copyDependencies(const mcdr_nrd_frame& frame) {
+    auto* list = static_cast<ID3D12GraphicsCommandList*>(frame.list);
+    dependencyTransition(list, gNrd.dependencyWrite.resource.Get(), gNrd.dependencyWriteState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    dependencyTransition(list, gNrd.dependencyRead.resource.Get(), gNrd.dependencyReadState, D3D12_RESOURCE_STATE_COPY_DEST);
+    list->CopyResource(gNrd.dependencyRead.resource.Get(), gNrd.dependencyWrite.resource.Get());
+    dependencyTransition(list, gNrd.dependencyRead.resource.Get(), gNrd.dependencyReadState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    dependencyTransition(list, gNrd.dependencyWrite.resource.Get(), gNrd.dependencyWriteState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+}
+
+void updateDependencies(const mcdr_nrd_frame& frame, UINT descriptor, uint32_t mode,
+    uint32_t count, NrdDependencyBinding binding = {}, uint32_t readOffset = 0, uint32_t lobe = 0) {
+    auto* list = static_cast<ID3D12GraphicsCommandList*>(frame.list);
+    dependencyTransition(list, gNrd.dependencyRead.resource.Get(), gNrd.dependencyReadState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    dependencyTransition(list, gNrd.dependencyWrite.resource.Get(), gNrd.dependencyWriteState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    dependencyTransition(list, gNrd.dependencyMask.resource.Get(), gNrd.dependencyMaskState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const auto& input = *frame.dependencies;
+    const std::array<uint32_t, 16> constants{mode, count, readOffset, binding[0], binding[1], binding[2], binding[3], lobe,
+        input.pathOffset, input.changeOffset, input.changeCount, input.fullDomain, gNrd.dependencyMaskOffset,
+        gNrd.width, gNrd.height, 0};
+    list->SetComputeRootSignature(gNrd.dependencyRoot.Get());
+    list->SetPipelineState(gNrd.dependencyUpdate.Get());
+    list->SetComputeRoot32BitConstants(0, static_cast<uint32_t>(constants.size()), constants.data(), 0);
+    list->SetComputeRootShaderResourceView(1, gNrd.dependencyRead.resource->GetGPUVirtualAddress());
+    list->SetComputeRootShaderResourceView(2, static_cast<ID3D12Resource*>(input.paths)->GetGPUVirtualAddress());
+    list->SetComputeRootShaderResourceView(3, static_cast<ID3D12Resource*>(input.changes)->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(4, gNrd.dependencyWrite.resource->GetGPUVirtualAddress());
+    auto mask = gNrd.descriptors->GetGPUDescriptorHandleForHeapStart();
+    mask.ptr += static_cast<uint64_t>(descriptor) * gNrd.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    list->SetComputeRootDescriptorTable(5, mask);
+    const auto groups = (count + 63u) / 64u;
+    list->Dispatch(std::min(groups, 65535u), (groups + 65534u) / 65535u, 1);
+    ++gNrd.dependencyDispatches;
+    const D3D12_RESOURCE_BARRIER barrier{D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {}};
+    list->ResourceBarrier(1, &barrier);
+}
+
+uint32_t dependencyTileCount(const NrdDependencyBinding& binding) {
+    return ((binding[1] + binding[3] - 1u) / binding[3]) * ((binding[2] + binding[3] - 1u) / binding[3]);
+}
+
+void beginDependencyFrame(const mcdr_nrd_frame& frame, std::span<const nrd::DispatchDesc> dispatches,
+    UINT descriptor, bool reset) {
+    writeView(gNrd.device, gNrd.descriptors.Get(), descriptor, gNrd.dependencyMask.resource.Get(), DXGI_FORMAT_R32_UINT, true);
+    if (reset) updateDependencies(frame, descriptor, 0, gNrd.dependencyEntries);
+    copyDependencies(frame);
+    updateDependencies(frame, descriptor, 4, gNrd.dependencyTiles);
+    for (const auto& dispatch : dispatches) {
+        if (!isTemporalAccumulation(gNrd.desc->pipelines[dispatch.pipelineIndex])) continue;
+        if (frame.dependencies->changeCount == 0 && frame.dependencies->fullDomain == 0) continue;
+        for (const auto& resource : std::span(dispatch.resources, dispatch.resourcesNum)) {
+            if (resource.type != nrd::ResourceType::PERMANENT_POOL) continue;
+            const auto binding = dependencyBinding(resource);
+            updateDependencies(frame, descriptor, 3, dependencyTileCount(binding), binding, binding[0], dispatch.identifier);
+        }
+    }
+    copyDependencies(frame);
+    updateDependencies(frame, descriptor, 5, gNrd.width * gNrd.height);
+    for (const auto& dispatch : dispatches) {
+        if (!isTemporalAccumulation(gNrd.desc->pipelines[dispatch.pipelineIndex])) continue;
+        for (const auto& resource : std::span(dispatch.resources, dispatch.resourcesNum)) {
+            if (resource.type != nrd::ResourceType::PERMANENT_POOL) continue;
+            const auto binding = dependencyBinding(resource);
+            updateDependencies(frame, descriptor, 6, dependencyTileCount(binding), binding, 0, dispatch.identifier);
+        }
+    }
+    for (uint32_t lobe = 0; lobe < gNrd.rawDependencies.size(); ++lobe)
+        updateDependencies(frame, descriptor, 1, gNrd.dependencyTiles, gNrd.rawDependencies[lobe], 0, lobe);
+}
+
+void beginDependencyDispatch(const mcdr_nrd_frame& frame, const nrd::DispatchDesc& dispatch,
+    UINT descriptor, uint32_t constantSlot) {
+    copyDependencies(frame);
+    std::array<NrdDependencyBinding, 32> layout;
+    layout.fill({UINT32_MAX, 1, 1, 1});
+    for (uint32_t index = 0; index < dispatch.resourcesNum; ++index) {
+        const auto& resource = dispatch.resources[index];
+        const auto binding = dependencyBinding(resource);
+        layout[index] = binding;
+        if (resource.descriptorType == nrd::DescriptorType::STORAGE_TEXTURE)
+            updateDependencies(frame, descriptor, 0, dependencyTileCount(binding), binding);
+    }
+    const uint64_t offset = uint64_t{constantSlot} * kDependencyConstantBytes;
+    std::memcpy(gNrd.dependencyMapped + offset, layout.data(), sizeof(layout));
+    auto* list = static_cast<ID3D12GraphicsCommandList*>(frame.list);
+    list->SetComputeRootSignature(gNrd.rootSignature.Get());
+    list->SetComputeRootDescriptorTable(3, gNrd.samplers->GetGPUDescriptorHandleForHeapStart());
+    list->SetComputeRootShaderResourceView(4, gNrd.dependencyRead.resource->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(5, gNrd.dependencyWrite.resource->GetGPUVirtualAddress());
+    list->SetComputeRootConstantBufferView(6, gNrd.dependencyConstants.resource->GetGPUVirtualAddress() + offset);
+}
+
+void endDependencyDispatch(const mcdr_nrd_frame& frame, const nrd::DispatchDesc& dispatch, UINT descriptor) {
+    for (const auto& resource : std::span(dispatch.resources, dispatch.resourcesNum)) {
+        if (resource.descriptorType != nrd::DescriptorType::STORAGE_TEXTURE) continue;
+        const auto binding = dependencyBinding(resource);
+        updateDependencies(frame, descriptor, 2, dependencyTileCount(binding), binding, binding[0]);
+    }
+}
+
 } // namespace
 
 extern "C" int32_t mcdr_nrd_dispatch(const mcdr_nrd_frame* frame, char* outText, int32_t capacity) {
@@ -577,13 +1047,62 @@ extern "C" int32_t mcdr_nrd_dispatch(const mcdr_nrd_frame* frame, char* outText,
     }
     collectContexts();
     if (!gNrd.ready || gNrd.desc == nullptr || frame == nullptr || frame->list == nullptr
-        || frame->completionFence == nullptr || frame->completionValue == 0) {
+        || frame->completionFence == nullptr || frame->completionValue == 0 || gNrd.cancelled()
+        || (frame->diffuseConfidence == nullptr) != (frame->specularConfidence == nullptr)
+        || (frame->recording && (!frame->recordingState ||
+            frame->recordingState(frame->recording.get()) != McdrNrdRecordingState::Pending))) {
         return -1;
     }
     ID3D12Device* device = gNrd.device;
     ID3D12GraphicsCommandList* list = static_cast<ID3D12GraphicsCommandList*>(frame->list);
     const nrd::InstanceDesc& desc = *gNrd.desc;
     int32_t used = 0;
+    if (frame->historyRejection) {
+        const auto description = static_cast<ID3D12Resource*>(frame->historyRejection)->GetDesc();
+        if (description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+            (description.Format != DXGI_FORMAT_R8_UINT && description.Format != DXGI_FORMAT_R32_UINT) ||
+            description.Width != gNrd.width || description.Height != gNrd.height ||
+            description.MipLevels != 1 || description.DepthOrArraySize != 1 || description.SampleDesc.Count != 1 ||
+            (description.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0) {
+            appendLine(outText, capacity, used, "nrd: history rejection mask invalid\n");
+            return -1;
+        }
+    }
+    if (std::ranges::any_of(gNrd.slots, [frame](const auto& slot) {
+        return slot.recording && slot.recording != frame->recording &&
+            (!slot.recordingState || slot.recordingState(slot.recording.get()) != McdrNrdRecordingState::Submitted);
+    })) {
+        appendLine(outText, capacity, used, "nrd: another recording is pending\n");
+        return -1;
+    }
+    auto availableSlot = std::ranges::find_if(gNrd.slots, &NrdDispatchSlot::complete);
+    if (availableSlot == gNrd.slots.end()) {
+        appendLine(outText, capacity, used, "nrd: GPU dispatch slots busy\n");
+        return -1;
+    }
+
+    mcdr_nrd_frame dependencyFrame = *frame;
+    const bool trackDependencies = frame->dependencies != nullptr;
+    if (trackDependencies) {
+        const auto& dependencies = *frame->dependencies;
+        if (!dependencies.paths || !dependencies.changes || dependencies.worldEpoch == 0 ||
+            dependencies.changeCount > 256 || dependencies.fullDomain > 1) return -1;
+        const auto paths = static_cast<ID3D12Resource*>(dependencies.paths)->GetDesc();
+        const auto changes = static_cast<ID3D12Resource*>(dependencies.changes)->GetDesc();
+        const uint64_t tiles = uint64_t{(gNrd.width + 63u) / 64u} * ((gNrd.height + 63u) / 64u);
+        if (paths.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || changes.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+            uint64_t{dependencies.pathOffset} + 64u + tiles * 128u > paths.Width ||
+            uint64_t{dependencies.changeOffset} + 64u + uint64_t{dependencies.changeCount} * 64u > changes.Width) return -1;
+        const auto prepared = prepareDependencies();
+        if (prepared <= 0) {
+            appendLine(outText, capacity, used, "nrd: dependencies unavailable (%d)\n", prepared);
+            return prepared;
+        }
+        dependencyFrame.historyRejection = gNrd.dependencyMask.resource.Get();
+        frame = &dependencyFrame;
+    }
+    const bool dependencyReset = trackDependencies != gNrd.dependencyActive ||
+        (trackDependencies && gNrd.dependencyEpoch != frame->dependencies->worldEpoch);
 
     nrd::CommonSettings common{};
     for (int i = 0; i < 16; ++i) {
@@ -618,8 +1137,9 @@ extern "C" int32_t mcdr_nrd_dispatch(const mcdr_nrd_frame* frame, char* outText,
     common.historyFixAlternatePixelStrideMaterialID = 999.0f;
     common.frameIndex = frame->frameIndex;
     common.enableValidation = frame->validationOutput != nullptr;
+    common.isHistoryConfidenceAvailable = frame->diffuseConfidence != nullptr;
     // 历史只在需要时丢：每帧 CLEAR_AND_RESTART 等于关掉时间累积，噪点全靠空间模糊。
-    common.accumulationMode = frame->resetHistory ? nrd::AccumulationMode::CLEAR_AND_RESTART
+    common.accumulationMode = frame->resetHistory || gNrd.resetPending || dependencyReset ? nrd::AccumulationMode::CLEAR_AND_RESTART
                                                   : nrd::AccumulationMode::CONTINUE;
     common.isMotionVectorInWorldSpace = false;
     if (nrd::SetCommonSettings(*gNrd.instance, common) != nrd::Result::SUCCESS) {
@@ -638,25 +1158,29 @@ extern "C" int32_t mcdr_nrd_dispatch(const mcdr_nrd_frame* frame, char* outText,
     settings.planeDistanceSensitivity = 0.01f;
     settings.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::AREA_3X3;
     settings.maxStabilizedFrameNum = 0;
-    if (nrd::SetDenoiserSettings(*gNrd.instance, 0, &settings) != nrd::Result::SUCCESS) {
-        appendLine(outText, capacity, used, "nrd: denoiser settings rejected\n");
-        return -1;
+    for (const auto& denoiser : kDenoisers) {
+        if (nrd::SetDenoiserSettings(*gNrd.instance, denoiser.identifier, &settings) != nrd::Result::SUCCESS) {
+            appendLine(outText, capacity, used, "nrd: denoiser settings rejected\n");
+            return -1;
+        }
     }
 
     // identifier 表不能留空：空表时库回 SUCCESS + 0 条派发，看着成功、其实一个 pass 都没跑。
-    const nrd::Identifier identifiers[1] = {0};
+    const std::array<nrd::Identifier, 2> identifiers{0, 1};
     const nrd::DispatchDesc* dispatches = nullptr;
     uint32_t dispatchCount = 0;
     const nrd::Result gathered =
-        nrd::GetComputeDispatches(*gNrd.instance, identifiers, 1, dispatches, dispatchCount);
+        nrd::GetComputeDispatches(*gNrd.instance, identifiers.data(),
+            static_cast<uint32_t>(identifiers.size()), dispatches, dispatchCount);
     if (gathered != nrd::Result::SUCCESS || dispatches == nullptr || dispatchCount == 0) {
         appendLine(outText, capacity, used, "nrd: no dispatch (result=%d)\n",
                    static_cast<int32_t>(gathered));
         return -1;
     }
 
-    uint32_t descriptorCount = 0;
+    uint32_t descriptorCount = trackDependencies ? 1u : 0u;
     uint32_t constantCount = 0;
+    uint32_t rejectionCount = 0;
     for (const auto& dispatch : std::span(dispatches, dispatchCount)) {
         if (dispatch.pipelineIndex >= gNrd.pipelines.size()
             || dispatch.constantBufferDataSize > gNrd.constantStride) {
@@ -664,6 +1188,22 @@ extern "C" int32_t mcdr_nrd_dispatch(const mcdr_nrd_frame* frame, char* outText,
             return -1;
         }
         const auto& pipeline = desc.pipelines[dispatch.pipelineIndex];
+        if (trackDependencies && (dispatch.resourcesNum > 32 ||
+            (!gNrd.dependencyPipelines[dispatch.pipelineIndex] &&
+                !std::string_view(pipeline.shaderIdentifier).starts_with("Clear.cs.hlsl")))) {
+            gNrd.resetPending = true;
+            appendLine(outText, capacity, used, "nrd: dependency shader unsupported\n");
+            return -1;
+        }
+        if (frame->historyRejection && isTemporalAccumulation(pipeline)) {
+            if (!historyRejectionLayout(dispatch)) {
+                gNrd.resetPending = true;
+                appendLine(outText, capacity, used, "nrd: history rejection layout unsupported\n");
+                return -1;
+            }
+            descriptorCount += kHistoryRejectionDescriptors;
+            ++rejectionCount;
+        }
         uint32_t resourceCount = 0;
         for (const auto& range : std::span(pipeline.resourceRanges, pipeline.resourceRangesNum)) {
             resourceCount += range.descriptorsNum;
@@ -673,7 +1213,7 @@ extern "C" int32_t mcdr_nrd_dispatch(const mcdr_nrd_frame* frame, char* outText,
             return -1;
         }
         for (const auto& resource : std::span(dispatch.resources, dispatch.resourcesNum)) {
-            if (resolveResource(resource, frame) == nullptr) {
+            if (resolveResource(resource, frame, dispatch.identifier) == nullptr) {
                 appendLine(outText, capacity, used, "nrd: dispatch resource missing\n");
                 return -1;
             }
@@ -685,14 +1225,16 @@ extern "C" int32_t mcdr_nrd_dispatch(const mcdr_nrd_frame* frame, char* outText,
         appendLine(outText, capacity, used, "nrd: dispatch capacity exceeded\n");
         return -1;
     }
-    auto availableSlot = std::ranges::find_if(gNrd.slots, &NrdDispatchSlot::complete);
-    if (availableSlot == gNrd.slots.end()) {
-        appendLine(outText, capacity, used, "nrd: GPU dispatch slots busy\n");
+    if (frame->historyRejection && (rejectionCount != kDenoisers.size() || !prepareHistoryRejection(*frame))) {
+        gNrd.resetPending = true;
+        appendLine(outText, capacity, used, "nrd: history rejection unavailable\n");
         return -1;
     }
     const auto slotIndex = static_cast<uint32_t>(availableSlot - gNrd.slots.begin());
     availableSlot->fence = static_cast<ID3D12Fence*>(frame->completionFence);
     availableSlot->value = frame->completionValue;
+    availableSlot->recording = frame->recording;
+    availableSlot->recordingState = frame->recordingState;
     const uint32_t blockSize = gNrd.descriptorsPerDispatch;
     const UINT blockBase = slotIndex * blockSize;
     const uint32_t constantBase = slotIndex * kConstantSlotsPerDispatch;
@@ -701,11 +1243,14 @@ extern "C" int32_t mcdr_nrd_dispatch(const mcdr_nrd_frame* frame, char* outText,
     list->SetComputeRootSignature(gNrd.rootSignature.Get());
     list->SetDescriptorHeaps(2, heaps);
     list->SetComputeRootDescriptorTable(3, gNrd.samplers->GetGPUDescriptorHandleForHeapStart());
+    gNrd.dependencyDispatches = 0;
+    if (trackDependencies) beginDependencyFrame(*frame, {dispatches, dispatchCount}, blockBase,
+        common.accumulationMode == nrd::AccumulationMode::CLEAR_AND_RESTART);
 
     const UINT increment = device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     const D3D12_GPU_DESCRIPTOR_HANDLE heapGpu = gNrd.descriptors->GetGPUDescriptorHandleForHeapStart();
-    uint32_t slotCursor = blockBase;
+    uint32_t slotCursor = blockBase + (trackDependencies ? 1u : 0u);
     uint32_t constantCursor = constantBase;
     uint32_t missing = 0;
     // 首帧把每个 pass 的管线、线程组、描述符数量报一次：线程组与描述符数量对不上时派发链照跑不报错，
@@ -718,6 +1263,18 @@ extern "C" int32_t mcdr_nrd_dispatch(const mcdr_nrd_frame* frame, char* outText,
             continue;
         }
         const nrd::PipelineDesc& pipelineDesc = desc.pipelines[dispatchDesc.pipelineIndex];
+        if (frame->historyRejection && isTemporalAccumulation(pipelineDesc)) {
+            if (trackDependencies) dependencyTransition(list, gNrd.dependencyMask.resource.Get(),
+                gNrd.dependencyMaskState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            rejectHistory(*frame, dispatchDesc, slotCursor);
+            slotCursor += kHistoryRejectionDescriptors;
+        }
+        const bool trackedPipeline = trackDependencies && gNrd.dependencyPipelines[dispatchDesc.pipelineIndex];
+        if (trackedPipeline) beginDependencyDispatch(*frame, dispatchDesc, blockBase, constantCursor);
+        else {
+            list->SetComputeRootSignature(gNrd.rootSignature.Get());
+            list->SetComputeRootDescriptorTable(3, gNrd.samplers->GetGPUDescriptorHandleForHeapStart());
+        }
         UINT srvCount = 0;
         UINT uavCount = 0;
         for (uint32_t r = 0; r < pipelineDesc.resourceRangesNum; ++r) {
@@ -747,7 +1304,7 @@ extern "C" int32_t mcdr_nrd_dispatch(const mcdr_nrd_frame* frame, char* outText,
                     break;
                 }
                 const nrd::ResourceDesc& resourceDesc = dispatchDesc.resources[read++];
-                ID3D12Resource* resource = resolveResource(resourceDesc, frame);
+                ID3D12Resource* resource = resolveResource(resourceDesc, frame, dispatchDesc.identifier);
                 if (resource == nullptr) {
                     ++missing;
                     ++(storage ? uavCursor : srvCursor);
@@ -791,7 +1348,7 @@ extern "C" int32_t mcdr_nrd_dispatch(const mcdr_nrd_frame* frame, char* outText,
             std::memcpy(gNrd.constantMapped + offset, dispatchDesc.constantBufferData,
                         dispatchDesc.constantBufferDataSize);
             list->SetComputeRootConstantBufferView(
-                0, gNrd.constants->GetGPUVirtualAddress() + offset);
+                0, gNrd.constants.resource->GetGPUVirtualAddress() + offset);
             ++constantCursor;
         }
 
@@ -801,7 +1358,8 @@ extern "C" int32_t mcdr_nrd_dispatch(const mcdr_nrd_frame* frame, char* outText,
         uavHandle.ptr += static_cast<UINT64>(uavBase) * increment;
         list->SetComputeRootDescriptorTable(1, srvHandle);
         list->SetComputeRootDescriptorTable(2, uavHandle);
-        list->SetPipelineState(gNrd.pipelines[dispatchDesc.pipelineIndex].Get());
+        list->SetPipelineState(trackedPipeline ? gNrd.dependencyPipelines[dispatchDesc.pipelineIndex].Get()
+            : gNrd.pipelines[dispatchDesc.pipelineIndex].Get());
         list->Dispatch(dispatchDesc.gridWidth, dispatchDesc.gridHeight, 1);
         if (trace) {
             appendLine(outText, capacity, used, "nrd: p%u %s pipe=%u grid=%ux%u srv=%u uav=%u\n", i,
@@ -814,6 +1372,7 @@ extern "C" int32_t mcdr_nrd_dispatch(const mcdr_nrd_frame* frame, char* outText,
         const D3D12_RESOURCE_BARRIER hazard = {
             D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {}};
         list->ResourceBarrier(1, &hazard);
+        if (trackedPipeline) endDependencyDispatch(*frame, dispatchDesc, blockBase);
     }
 
     if (trace) {
@@ -840,14 +1399,30 @@ extern "C" int32_t mcdr_nrd_dispatch(const mcdr_nrd_frame* frame, char* outText,
         gNrd.traced = true;
     }
 
-    appendLine(outText, capacity, used, "nrd: dispatch passes=%u missing=%u\n", dispatchCount,
+    if (trackDependencies) {
+        dependencyTransition(list, gNrd.dependencyRead.resource.Get(), gNrd.dependencyReadState,
+            D3D12_RESOURCE_STATE_COMMON);
+        dependencyTransition(list, gNrd.dependencyWrite.resource.Get(), gNrd.dependencyWriteState,
+            D3D12_RESOURCE_STATE_COMMON);
+    }
+    const auto totalDispatches = dispatchCount + rejectionCount + gNrd.dependencyDispatches;
+    appendLine(outText, capacity, used, "nrd: dispatch passes=%u missing=%u\n", totalDispatches,
                missing);
-    return missing == 0 ? static_cast<int32_t>(dispatchCount) : -1;
+    if (missing == 0) {
+        gNrd.resetPending = false;
+        gNrd.dependencyActive = trackDependencies;
+        gNrd.dependencyEpoch = trackDependencies ? frame->dependencies->worldEpoch : 0;
+    }
+    return missing == 0 ? static_cast<int32_t>(totalDispatches) : -1;
 }
 
 extern "C" int32_t mcdr_nrd_context_shutdown(void) {
     retireContext();
     return 1;
+}
+
+extern "C" void mcdr_nrd_context_collect(void) {
+    collectContexts();
 }
 
 #else
@@ -869,10 +1444,11 @@ extern "C" int32_t mcdr_nrd_dispatch(const mcdr_nrd_frame* frame, char* outText,
 }
 
 extern "C" int32_t mcdr_nrd_context_init(void* device, int32_t width, int32_t height,
-                                         char* outText, int32_t capacity) {
+                                         McdrNrdReserveMemory reserveMemory, char* outText, int32_t capacity) {
     (void)device;
     (void)width;
     (void)height;
+    (void)reserveMemory;
     if (outText != nullptr && capacity > 0) {
         std::snprintf(outText, static_cast<size_t>(capacity), "nrd: not built in\n");
     }
@@ -882,5 +1458,7 @@ extern "C" int32_t mcdr_nrd_context_init(void* device, int32_t width, int32_t he
 extern "C" int32_t mcdr_nrd_context_shutdown(void) {
     return 0;
 }
+
+extern "C" void mcdr_nrd_context_collect(void) {}
 
 #endif

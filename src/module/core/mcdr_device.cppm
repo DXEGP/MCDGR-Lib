@@ -312,17 +312,20 @@ struct Dx12Object {
     // AccelStructView = 加速结构的 SRV（RAYTRACING_ACCELERATION_STRUCTURE）：自身没有资源，只占一个描述符槽。
     // RaytracingPipeline = 光线追踪状态对象（DXIL 库 + hit group + 全局根签名），没有资源，只承载 stateObject
     // 与取标识符用的 stateProps；同样走 destroyObject 的延迟删除。
-    enum class Kind { Texture, Buffer, Sampler, TextureView, AccelStructView, ComputePipeline, RaytracingPipeline };
+    enum class Kind { Texture, Buffer, Sampler, TextureView, AccelStructView, ComputePipeline, RaytracingPipeline, WorkGraphPipeline };
 
     Kind kind = Kind::Buffer;
+    std::shared_ptr<void> allocationCharge;
     ComPtr<ID3D12Resource> resource;
     D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle{};
     D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle{};
     D3D12_HEAP_TYPE heapType = D3D12_HEAP_TYPE_DEFAULT;
     DXGI_FORMAT dxgiFormat = DXGI_FORMAT_UNKNOWN;  // Texture 的格式（copy 计算行距用）
     void* mappedPtr = nullptr;
+    bool poolable = true;
     int usage = 0;
     long long size = 0;
+    uint64_t allocationBytes = 0;
     // 描述符堆槽位索引（TextureView → SRV 槽；Sampler → sampler 槽；-1 = 未占用）。销毁时归还 free-list 复用，防止长会话耗尽堆。
     int descSlot = -1;
     // TextureView 指向的底层 Texture（采样前需 transition 到 PIXEL_SHADER_RESOURCE）；其它种类恒 nullptr。
@@ -333,6 +336,9 @@ struct Dx12Object {
     // Kind::RaytracingPipeline 时有效：状态对象与它的属性接口（GetShaderIdentifier 从这里取 32 B 标识符）。
     ComPtr<ID3D12StateObject> stateObject;
     ComPtr<ID3D12StateObjectProperties> stateProps;
+    D3D12_PROGRAM_IDENTIFIER workGraphProgram{};
+    uint64_t workGraphMemoryBytes = 0;
+    uint32_t workGraphEntrypoint = 0;
 };
 
 // ---- 设备生命周期 ----
@@ -389,7 +395,7 @@ int dispatchComputeEx(CommandContext* ctx, Dx12Object* pipeline, Dx12Object* con
                       uint64_t cbvOffset, int32_t x, int32_t y, int32_t z);
     int nrdDenoise(CommandContext* ctx, Dx12Object* const* textures, int32_t textureCount,
                const float* matrices, uint32_t frameIndex, uint32_t resetHistory, char* outText,
-               int32_t capacity, const float* jitter);
+               int32_t capacity, const float* jitter, const void* dependencies = nullptr);
     // DLSS-D（S4 4-d）：5 张 = packed 法线-粗糙度，6 张 = 法线 + 粗糙度分开。
     int dlssdEval(CommandContext* ctx, Dx12Object* const* textures, int32_t textureCount,
                   uint32_t width, uint32_t height, uint32_t outputWidth, uint32_t outputHeight,
@@ -417,6 +423,58 @@ int dispatchRays(CommandContext* ctx, Dx12Object* pipeline, Dx12Object* shaderTa
                  int32_t srvCount, Dx12Object* const* uavs, int32_t uavCount,
                  const int32_t* constants, int32_t constantCount, Dx12Object* cbv,
                  uint64_t cbvOffset, int32_t width, int32_t height);
+
+mcdr::Result<void*> createWorkGraphPipeline(const void* dxil, int64_t bytes, int32_t srvCount, int32_t uavCount);
+int dispatchWorkGraph(CommandContext* ctx, Dx12Object* pipeline, Dx12Object* backing, bool initialize,
+    Dx12Object* const* srvs, int32_t srvCount, Dx12Object* const* uavs, int32_t uavCount,
+    const int32_t* constants, int32_t constantCount, Dx12Object* cbv, int32_t width, int32_t height);
+mcdr::Result<uint64_t> createRtFrame(const void* program, bool workGraph = false);
+mcdr::Result<void> releaseRtFrame(uint64_t frame);
+mcdr::Result<uint64_t> createRtGBufferProgram(const void* program);
+mcdr::Result<void> createRtGeometrySnapshot(CommandContext* ctx, const void* desc, void* output);
+mcdr::Result<void> releaseRtGeometrySnapshot(uint64_t snapshot);
+mcdr::Result<void> createRtGeometryDelta(CommandContext* ctx, const void* desc, void* output);
+mcdr::Result<void> getRtGeometryMemory(void* output);
+mcdr::Result<void> getRtAccelerationBudget(uint64_t* values, int32_t valueCount);
+mcdr::Result<void> setRtManagedMemoryBudget(uint64_t bytes);
+mcdr::Result<void> getRtManagedMemoryBudget(uint64_t* values, int32_t valueCount);
+mcdr::Result<std::shared_ptr<void>> reserveRtFrameMemory(const D3D12_RESOURCE_DESC& description, bool host);
+std::shared_ptr<void> reserveRtNrdMemory(const void* description, bool host);
+mcdr::Result<uint64_t> createRtAcceleration(uint64_t snapshot, uint64_t reuse);
+mcdr::Result<uint64_t> createRtScene();
+mcdr::Result<void> releaseRtScene(uint64_t scene);
+mcdr::Result<void> prepareRtScene(CommandContext* ctx, uint64_t scene, const void* desc, void* output);
+mcdr::Result<void> prepareRtSceneTargets(CommandContext* ctx, uint64_t scene, const void* desc,
+    const uint64_t* targets, uint32_t targetCount, void* output);
+mcdr::Result<void> getRtSceneStats(uint64_t scene, uint64_t* values, int32_t valueCount);
+mcdr::Result<void> getRtSceneCaptureDemands(uint64_t scene, uint64_t* values, int32_t valueCount);
+mcdr::Result<void> setRtSceneWorkBudget(uint64_t scene, uint64_t cpuMicros, uint64_t gpuMicros, uint64_t triangles);
+mcdr::Result<void> getRtSceneWorkBudget(uint64_t scene, uint64_t* values, int32_t valueCount);
+mcdr::Result<void> releaseRtAcceleration(uint64_t acceleration);
+mcdr::Result<void> prepareRtAcceleration(CommandContext* ctx, uint64_t acceleration, void* output);
+mcdr::Result<void> filterRtAcceleration(CommandContext* ctx, uint64_t acceleration,
+    const uint64_t* invalidSections, uint32_t count, void* output);
+mcdr::Result<uint64_t> rtAccelerationMemory(uint64_t first, uint64_t second);
+mcdr::Result<void> releaseRtGBufferProgram(uint64_t program);
+mcdr::Result<void> beginRtGBuffer(CommandContext* encoder, uint64_t handle,
+    int64_t frameNanos, int32_t width, int32_t height, void* outputData);
+mcdr::Result<void> endRtGBuffer(CommandContext* encoder, uint64_t handle, uint64_t revision, bool success);
+mcdr::Result<void> replayRtGBuffer(CommandContext* encoder, uint64_t handle, const void* replayData);
+mcdr::Result<uint64_t> captureRtGBuffer(CommandContext* encoder, uint64_t capture, int64_t frameNanos, const void* batchData);
+mcdr::Result<void> replayCapturedRtGBuffer(CommandContext* encoder, uint64_t handle, uint64_t capture, const void* replayData);
+mcdr::Result<void> releaseRtGBufferCapture(CommandContext* encoder, uint64_t capture);
+mcdr::Result<void> setRtFrameSpatial(CommandContext* ctx, uint64_t frame, uint64_t frameId,
+    uint64_t worldEpoch, uint64_t liveRevision, const void* data, int64_t bytes);
+mcdr::Result<void> recordRtFrame(CommandContext* ctx, uint64_t frame, const void* desc, void* output);
+mcdr::Result<void> recordRtFrameTransaction(CommandContext* ctx, uint64_t frame, const void* desc, void* output,
+    const void* lighting = nullptr, int64_t lightingBytes = 0);
+mcdr::Result<void> reblurRtFrame(CommandContext* ctx, uint64_t frame, uint64_t frameId);
+mcdr::Result<void> denoiseRtFrame(CommandContext* ctx, uint64_t frame, const void* desc, void* output);
+mcdr::Result<void> upscaleRtFrame(CommandContext* ctx, uint64_t frame, uint64_t frameId,
+    int32_t backend, void* output);
+mcdr::Result<void> compositeRtFrame(CommandContext* ctx, uint64_t frame, uint64_t frameId,
+    Dx12Object* source, int32_t debugMode, void* output);
+void releaseRtFrames();
 
 // 供 C ABI 层读设备上下文（adapterName / featureLevel）。
 DeviceContext& deviceContext();
@@ -451,9 +509,10 @@ void destroyHiddenWindow(uintptr_t hwnd);
 // 句柄一律以 void* 返回：MSVC 19.51 无法为 std::expected<模块内类型*, mcdr::Error> 在模块边界外产生
 // 一致的实例化符号（LNK2001）。
 mcdr::Result<void*> createTexture(int usage, int format, int width, int height, int depthOrLayers,
-                                  int mipLevels);
+                                  int mipLevels, bool rtManaged = false);
 // 建 buffer（usage 位见 mcdr_buffer_usage）；失败返回 mcdr::Error。
-mcdr::Result<void*> createBuffer(int usage, long long size);
+mcdr::Result<void*> createBuffer(int usage, long long size, bool exactCapacity = false, bool poolable = true,
+    bool rtManaged = false);
 mcdr::Result<void*> createSampler(int addressU, int addressV, int minFilter, int magFilter,
                                   int maxAnisotropy, float maxLod);
 // 地形专用采样器。`mipLodBias` 只应在超分比例 != 1 时非 0（见 D3D12TerrainSampler）。
@@ -462,6 +521,8 @@ mcdr::Result<void*> createSamplerWithMipBias(int addressU, int addressV, int min
 mcdr::Result<void*> createTextureView(Dx12Object* texture, int baseMipLevel, int mipLevels);
 // 销毁任意 Dx12Object*（等到 GPU 不再引用后真正释放；nullptr 安全）。
 void destroyObject(Dx12Object* obj);
+void destroyCompletedRtAccelerationObject(Dx12Object* object);
+mcdr::Result<void*> copyRtTextureView(Dx12Object* view, Dx12Object* retainedTexture);
 
 // ---- 光线追踪加速结构（S3）：BLAS / TLAS ----
 // 加速结构缓冲必须 DEFAULT 堆 + ALLOW_UNORDERED_ACCESS + 初始状态 RAYTRACING_ACCELERATION_STRUCTURE，
@@ -470,12 +531,15 @@ mcdr::Result<void*> createAccelStructBuffer(long long size);
 // out[0] = 结果上限字节，out[1] = scratch 字节（均需 256 字节对齐）。
 mcdr::Result<void> getBlasPrebuildInfo(const mcdr_rt_geometry* geometries, int count,
                                        unsigned long long* out);
+mcdr::Result<void> getAabbBlasPrebuildInfo(unsigned long long* out);
 mcdr::Result<void> getTlasPrebuildInfo(int instanceCount, unsigned long long* out);
 // update != 0 时走 PERFORM_UPDATE；要求 dest 里已是同一拓扑的 BLAS。
 mcdr::Result<void> buildBlas(CommandContext* ctx, Dx12Object* dest, Dx12Object* scratch,
                              const mcdr_rt_geometry* geometries, int count, bool update);
+mcdr::Result<void> buildAabbBlas(CommandContext* ctx, Dx12Object* dest, Dx12Object* scratch,
+                                 Dx12Object* aabbs);
 mcdr::Result<void> buildTlas(CommandContext* ctx, Dx12Object* dest, Dx12Object* scratch,
-                             Dx12Object* instances, int instanceCount);
+                             Dx12Object* instances, int instanceCount, bool immutableInstances = false);
 // COPY_MODE_COMPACT：紧凑版下一帧才能当 SRV 用。
 mcdr::Result<void> copyAccelStruct(CommandContext* ctx, Dx12Object* dest, Dx12Object* src);
 // RAYTRACING_ACCELERATION_STRUCTURE 的 SRV（进描述符堆，给 compute 的 t 槽用）。
@@ -502,6 +566,10 @@ struct Dx12Pipeline {
     std::unordered_map<int, UINT> vertexStrides;
     // mesh 管线（AS/MS）：没有 IA 阶段，setPipeline 不设 IASetPrimitiveTopology，PSO 里也不含输入布局。
     bool isMesh = false;
+    bool hasAmplification = false;
+    bool reverseDepthWrite = false;
+    std::vector<uint8_t> bindingTypes;
+    std::vector<DXGI_FORMAT> colorFormats;
     // mesh 尾参在根签名里的参数索引（按 CBV 稠密编号 + 地形 SRV 表排版算出，经 createMeshPipeline 抄进来）；PushDescriptors 只设到地形 SRV 表，b8 与 t14/t15/t16 由 drawMeshlets 补。0 = 无尾参。
     UINT segmentParam = 0;
     UINT geometryParam = 0;
@@ -525,13 +593,25 @@ struct RtvDsvKeyHash {
 enum class SdkResourceOwner : uint32_t { None, Nrd, RayReconstruction, DlssSr, XeSS, Fsr };
 
 struct FrameUploadPage {
-    ComPtr<ID3D12Resource> resource;
-    uint8_t* mapped = nullptr;
+    std::unique_ptr<Dx12Object> buffer;
     uint64_t capacity = 0;
     uint64_t used = 0;
 };
 
+struct FrameUploadSlice {
+    Dx12Object* buffer;
+    uint64_t offset;
+};
+
+struct RtGBufferCapture;
+struct RtGBufferProgram;
+struct RtGeometrySnapshot;
+struct CommandRecording;
+struct QuerySnapshot;
+
 struct CommandContext {
+    ComPtr<ID3D12Device> ownerDevice;
+    ComPtr<ID3D12CommandQueue> ownerQueue;
     ComPtr<ID3D12CommandAllocator> allocators[3];   // 三帧飞行，等待 value-2 后复用
     // command list 也是 3 路 ring，与 allocator 同槽位：录制帧 N 用帧 N-3 的槽位，只需等该槽位 fence。单条 list 会让主线程等上一帧 GPU 执行完才能 Reset。
     ComPtr<ID3D12GraphicsCommandList> commandLists[3];
@@ -540,6 +620,16 @@ struct CommandContext {
     HANDLE fenceEvent = nullptr;        // SetEventOnCompletion 用
     int listOpen = 0;
     int inRenderPass = 0;
+    uint64_t renderPassSerial = 0;
+    std::shared_ptr<RtGBufferCapture> rtGBufferCapture;
+    std::array<std::vector<std::shared_ptr<RtGBufferCapture>>, 3> rtGBufferRetained;
+    std::array<std::vector<std::shared_ptr<RtGBufferProgram>>, 3> rtGBufferProgramsRetained;
+    std::array<std::vector<std::shared_ptr<RtGeometrySnapshot>>, 3> rtGeometryRetained;
+    std::array<std::vector<std::shared_ptr<Dx12Object>>, 3> rtGeometryUploadsRetained;
+    std::array<std::vector<std::shared_ptr<Dx12Object>>, 3> rtAccelerationRetained;
+    std::array<std::vector<ComPtr<ID3D12QueryHeap>>, 3> queryHeapsRetained;
+    std::array<std::vector<std::shared_ptr<QuerySnapshot>>, 3> querySnapshotsRetained;
+    std::array<std::shared_ptr<CommandRecording>, 3> commandRecordings;
 
     // 本帧使用的 ring 槽位（begin 时按 fenceValue%3 固定，submit 时据此记录 fence）。
     UINT currentListSlot = 0;
@@ -610,6 +700,9 @@ struct CommandContext {
 
 // 创建命令上下文：3 个 allocator + command list + fence + event。
 mcdr::Result<void*> createCommandEncoder();
+mcdr::Result<FrameUploadSlice> uploadFrameData(CommandContext* ctx, const void* data, uint64_t bytes);
+mcdr::Result<FrameUploadSlice> snapshotUploadBufferSlice(
+    CommandContext* ctx, Dx12Object* source, uint64_t offset, uint64_t bytes);
 // 销毁 encoder（等自身 fence 完成后释放 allocator / list / event；幂等）。
 void destroyCommandEncoder(CommandContext* ctx);
 
@@ -657,16 +750,15 @@ void logDeviceStatus(const char* tag);
 // Streamline / FidelityFX 之前用它跳过已失效的活 —— 设备移除后继续调用会解引用失效对象。
 bool deviceRemoved();
 // 非阻塞：请求渲染线程开始下一帧。false = 正在处理上一帧。
-mcdr::Result<void> asyncRenderBeginFrame(CommandContext* ctx);
+mcdr::Result<bool> asyncRenderBeginFrame(CommandContext* ctx);
 // 阻塞：等到本帧提交完成（或超时 ms）。
-mcdr::Result<void> asyncRenderWaitComplete(CommandContext* ctx, UINT64 timeoutMs);
+mcdr::Result<bool> asyncRenderWaitComplete(CommandContext* ctx, UINT64 timeoutMs);
 // 非阻塞：查询渲染线程是否已到达 "recording ready" 阶段。
 bool asyncRenderIsRecordingReady(CommandContext* ctx);
 // 阻塞：等待渲染线程到达 "recording ready" 阶段（超时 ms）。取代 Java 侧 Thread.sleep(1) 轮询。
 bool asyncRenderWaitRecordingReady(CommandContext* ctx, UINT64 timeoutMs);
 // 主线程通知渲染线程：所有命令已入队（设置 gEvtCommandsReady）。
-void asyncSendCommandsReady(CommandContext* ctx);
-// 主动清除 gAsyncRenderCtx（供 Java 侧超时降级时同步调用）。
+bool asyncSendCommandsReady(CommandContext* ctx);
 void clearAsyncRenderCtx();
 // 查询命令列表是否已打开。
 bool isListOpen(CommandContext* ctx);
@@ -778,8 +870,32 @@ mcdr::Result<void> beginRenderPass(CommandContext* ctx, Dx12Object* const* color
 mcdr::Result<void> endRenderPass(CommandContext* ctx);
 
 // ---- Timestamp query pool ----
+struct CommandRecording {
+    ComPtr<ID3D12Fence> fence;
+    uint64_t fenceValue = 0;
+    bool submitted = false;
+    bool committed = false;
+    bool cancelled = false;
+
+    bool available(CommandContext* encoder) const;
+};
+
+std::shared_ptr<CommandRecording> currentCommandRecording(CommandContext* encoder);
+void notifyRtRecordingCommitted(CommandRecording* recording);
+void notifyRtRecordingCancelled(CommandRecording* recording);
+
+struct QuerySnapshot {
+    ComPtr<ID3D12QueryHeap> heap;
+    ComPtr<ID3D12Resource> readback;
+    std::shared_ptr<CommandRecording> recording;
+    int start = 0;
+    int count = 0;
+};
+
 struct QueryPool {
     ComPtr<ID3D12QueryHeap> heap;
+    std::shared_ptr<QuerySnapshot> pending;
+    std::vector<std::shared_ptr<CommandRecording>> producers;
     int size = 0;
 };
 
@@ -793,6 +909,8 @@ mcdr::Result<void> writeTimestampToPool(CommandContext* ctx, QueryPool* pool, in
 mcdr::Result<void> readQueryValue(QueryPool* pool, int index, long long& out);
 // 阻塞读回连续 count 个 timestamp；会等 GPU，仅诊断与一次性路径用。
 mcdr::Result<void> readQueryValues(QueryPool* pool, int start, int count, long long* out);
+mcdr::Result<void> queueQueryValues(CommandContext* ctx, QueryPool* pool, int start, int count);
+mcdr::Result<bool> tryReadQueryValues(QueryPool* pool, int start, int count, long long* out);
 
 // ---- 格式映射（官方 GpuFormat 枚举值 → DXGI_FORMAT） ----
 DXGI_FORMAT toDxgiFormat(int gpuFormat);
@@ -910,13 +1028,17 @@ enum class SrBackendId : int32_t {
 
 class SrContextCompletion {
 public:
-    bool ready(CommandContext* ctx) const;
+    bool prepare(CommandContext* ctx, bool& resetPending, bool& recreatePending);
+    bool ready() const;
     void record(CommandContext* ctx);
     void clear();
 
 private:
-    ComPtr<ID3D12Fence> fence_;
-    UINT64 value_ = 0;
+    struct Use {
+        std::shared_ptr<CommandRecording> recording;
+        bool submissionFailureObserved = false;
+    };
+    std::vector<Use> uses_;
 };
 
 class IUpscaleProvider {
@@ -941,6 +1063,7 @@ public:
     //   2) **返回时 pColorOutput 必须处于 RENDER_TARGET**（GUI 的 pass 紧接着以它重新 attach）。
     //   3) 描述符堆由调用方收尾；私有纹理必须由 provider 在**模块内**创建并登记到跟踪表。
     virtual bool evaluate(CommandContext* ctx, const mcdr_sr_dispatch& desc) = 0;
+    virtual bool readyToRelease() const = 0;
     // 释放 provider 持有的全部资源（幂等；注册表随后把生效后端置 None）。
     virtual void shutdown() = 0;
 };
@@ -1205,6 +1328,7 @@ struct DrawBinding {
 // CBV 走 root descriptor（SetGraphicsRootConstantBufferView，不占堆槽位），SRV 写入本帧 drawHeap
 // 瞬时槽位并 SetGraphicsRootDescriptorTable(cbvCount)。
 mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindings);
+bool hasDrawDescriptorCapacity(const CommandContext* ctx, uint64_t count);
 
 mcdr::Result<void> drawIndexedInstanced(CommandContext* ctx, UINT indexCount, UINT instanceCount,
                                         INT startIndexLocation, INT baseVertexLocation,
@@ -1296,7 +1420,7 @@ extern std::thread gRenderThread;
 // 渲染线程运行标志（供 destroySurface 判断是否需要等待线程退出）。
 extern bool gRenderRunning;
 // 当前正在处理的 ctx（nullptr = 无活动帧），供诊断读回检测 ASYNC 管道活跃。
-extern CommandContext* gAsyncRenderCtx;
+extern std::atomic<CommandContext*> gAsyncRenderCtx;
 // 本帧的 Present 是否已由渲染线程执行（true = Java 侧 present() 必须跳过，否则重复 Present → 窗口闪色）。
 // 渲染线程 present 后置位，Java present() 消费后清位。
 extern bool gAsyncOwnsPresent;

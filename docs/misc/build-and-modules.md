@@ -104,6 +104,17 @@ MSBuild MCDR\MCDR.vcxproj /p:Configuration=Release /p:Platform=x64
 `target\x64_Release\` 里出现的 `libxess.dll`、`amd_fidelityfx_upscaler_dx12.dll` 之类**不是构建产物**，
 是手工放进去做运行期探测的（该目录被 gitignore）。
 
+### 1.5 NRD 依赖着色器与内部头文件
+
+内部 SDK 适配头位于 `include\advanced\`，工程的 `AdditionalIncludeDirectories` 必须包含该目录。
+使用完整路径的包含写成 `advanced/mcdr_nrd_impl.h`；使用文件名的既有包含由同一 include 目录解析。
+
+`BuildNrdDependencies` 在 C++ 编译前运行 `scripts\build-nrd-dependencies.py`，
+输入为 `include\shaders\nrd_dependencies.hlsli` 与 `include\shaders\nrd_dependency_update.hlsl`。
+脚本使用 DXC 的 `cs_6_9` 编译依赖追踪变体，生成 `build\nrd-dependencies.h`，由 `d3d12_nrd.cpp` 包含。
+把这两份输入登记为 `None`；不要给 `.hlsl` 配置 `FxCompile`，默认 FXC profile 不支持其寄存器空间。
+构建指纹核对脚本、输入、编译器、NRD 与 MathLib 源码；指纹未变化时复用生成头。
+
 ---
 
 ## 2. 模块清单与依赖图

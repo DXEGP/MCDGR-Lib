@@ -206,7 +206,9 @@ int32_t MCDR_CALL mcdr_dx12NrdInit(int32_t width, int32_t height, char* outText,
         }
         return -1;
     }
-    return mcdr_nrd_context_init(reinterpret_cast<void*>(device), width, height, outText, capacity);
+    const auto result = mcdr_nrd_context_init(reinterpret_cast<void*>(device), width, height,
+        d3d12_mc::reserveRtNrdMemory, outText, capacity);
+    return result == MCDR_NRD_MEMORY_PRESSURE ? -1 : result;
 }
 
 int32_t MCDR_CALL mcdr_dx12NrdShutdown(void) { return mcdr_nrd_context_shutdown(); }
@@ -242,6 +244,473 @@ int32_t MCDR_CALL mcdr_dx12DispatchRays(
                                   missCount, hitOffset, hitStride, hitCount, srvs, srvCount, uavs,
                                   uavCount, constants, constantCount, cbv, cbvOffset, width, height);
 }
+uint64_t MCDR_CALL mcdr_dx12CreateRtFrame(const mcdr_rt_frame_program* program) {
+    try {
+        const auto result = d3d12_mc::createRtFrame(program);
+        if (result) return *result;
+        mcdr::abi::failWith("mcdr_dx12CreateRtFrame", result.error().message);
+    } catch (...) {
+        mcdr::abi::failWith("mcdr_dx12CreateRtFrame", "rt frame: creation failed");
+    }
+    return 0;
+}
+
+uint64_t MCDR_CALL mcdr_dx12CreateRtWorkGraphFrame(const mcdr_rt_frame_program* program) {
+    try {
+        const auto result = d3d12_mc::createRtFrame(program, true);
+        if (result) return *result;
+        mcdr::abi::failWith("mcdr_dx12CreateRtWorkGraphFrame", result.error().message);
+    } catch (...) {
+        mcdr::abi::failWith("mcdr_dx12CreateRtWorkGraphFrame", "rt WG: creation failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12ReleaseRtFrame(uint64_t frame) {
+    try {
+        const auto result = d3d12_mc::releaseRtFrame(frame);
+        if (result) return 1;
+        return mcdr::abi::failWith("mcdr_dx12ReleaseRtFrame", result.error().message);
+    } catch (...) {
+        return mcdr::abi::failWith("mcdr_dx12ReleaseRtFrame", "rt frame: release failed");
+    }
+}
+
+uint64_t MCDR_CALL mcdr_dx12CreateRtGBufferProgram(const mcdr_rt_gbuffer_program* program) {
+    try {
+        const auto result = d3d12_mc::createRtGBufferProgram(program);
+        if (result) return *result;
+        mcdr::abi::setLastError("mcdr_dx12CreateRtGBufferProgram", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12CreateRtGBufferProgram", "rt gbuffer: program creation failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12CreateRtGeometrySnapshot(mcdr_command_ctx* ctx,
+    const mcdr_rt_geometry_desc* desc, mcdr_rt_geometry_output* output) {
+    if (output) *output = {};
+    try {
+        const auto result = d3d12_mc::createRtGeometrySnapshot(ctx, desc, output);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12CreateRtGeometrySnapshot", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12CreateRtGeometrySnapshot", "rt geometry: creation failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12ReleaseRtGeometrySnapshot(uint64_t snapshot) {
+    try {
+        const auto result = d3d12_mc::releaseRtGeometrySnapshot(snapshot);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12ReleaseRtGeometrySnapshot", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12ReleaseRtGeometrySnapshot", "rt geometry: release failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12CreateRtGeometryDelta(mcdr_command_ctx* ctx,
+    const mcdr_rt_geometry_delta_desc* desc, mcdr_rt_geometry_delta_output* output) {
+    if (output) *output = {};
+    try {
+        const auto result = d3d12_mc::createRtGeometryDelta(ctx, desc, output);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12CreateRtGeometryDelta", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12CreateRtGeometryDelta", "rt geometry: creation failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12GetRtGeometryMemory(mcdr_rt_geometry_memory* output) {
+    if (output) *output = {};
+    try {
+        const auto result = d3d12_mc::getRtGeometryMemory(output);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12GetRtGeometryMemory", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12GetRtGeometryMemory", "rt geometry: memory query failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12GetRtAccelerationBudget(uint64_t* values, int32_t valueCount) {
+    try {
+        const auto result = d3d12_mc::getRtAccelerationBudget(values, valueCount);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12GetRtAccelerationBudget", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12GetRtAccelerationBudget", "rt accel: budget query failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12SetRtManagedMemoryBudget(uint64_t bytes) {
+    try {
+        const auto result = d3d12_mc::setRtManagedMemoryBudget(bytes);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12SetRtManagedMemoryBudget", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12SetRtManagedMemoryBudget", "rt memory: budget update failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12GetRtManagedMemoryBudget(uint64_t* values, int32_t valueCount) {
+    try {
+        const auto result = d3d12_mc::getRtManagedMemoryBudget(values, valueCount);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12GetRtManagedMemoryBudget", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12GetRtManagedMemoryBudget", "rt memory: budget query failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12ReleaseRtGBufferProgram(uint64_t program) {
+    try {
+        const auto result = d3d12_mc::releaseRtGBufferProgram(program);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12ReleaseRtGBufferProgram", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12ReleaseRtGBufferProgram", "rt gbuffer: program release failed");
+    }
+    return 0;
+}
+
+uint64_t MCDR_CALL mcdr_dx12CreateRtAcceleration(uint64_t snapshot, uint64_t reuse) {
+    try {
+        const auto result = d3d12_mc::createRtAcceleration(snapshot, reuse);
+        if (result) return *result;
+        mcdr::abi::setLastError("mcdr_dx12CreateRtAcceleration", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12CreateRtAcceleration", "rt accel: creation failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12ReleaseRtAcceleration(uint64_t acceleration) {
+    try {
+        const auto result = d3d12_mc::releaseRtAcceleration(acceleration);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12ReleaseRtAcceleration", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12ReleaseRtAcceleration", "rt accel: release failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12PrepareRtAcceleration(mcdr_command_ctx* ctx,
+    uint64_t acceleration, mcdr_rt_acceleration_output* output) {
+    if (output) *output = {};
+    try {
+        const auto result = d3d12_mc::prepareRtAcceleration(ctx, acceleration, output);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12PrepareRtAcceleration", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12PrepareRtAcceleration", "rt accel: build failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12FilterRtAcceleration(mcdr_command_ctx* ctx,
+    uint64_t acceleration, const uint64_t* invalidSections, uint32_t count, mcdr_rt_acceleration_output* output) {
+    if (output) *output = {};
+    try {
+        const auto result = d3d12_mc::filterRtAcceleration(ctx, acceleration, invalidSections, count, output);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12FilterRtAcceleration", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12FilterRtAcceleration", "rt accel: filtering failed");
+    }
+    return 0;
+}
+
+uint64_t MCDR_CALL mcdr_dx12RtAccelerationMemory(uint64_t first, uint64_t second) {
+    try {
+        const auto result = d3d12_mc::rtAccelerationMemory(first, second);
+        if (result) return *result;
+        mcdr::abi::setLastError("mcdr_dx12RtAccelerationMemory", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12RtAccelerationMemory", "rt accel: accounting failed");
+    }
+    return 0;
+}
+
+uint64_t MCDR_CALL mcdr_dx12CreateRtScene(void) {
+    try {
+        const auto result = d3d12_mc::createRtScene();
+        if (result) return *result;
+        mcdr::abi::setLastError("mcdr_dx12CreateRtScene", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12CreateRtScene", "rt scene: creation failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12ReleaseRtScene(uint64_t scene) {
+    try {
+        const auto result = d3d12_mc::releaseRtScene(scene);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12ReleaseRtScene", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12ReleaseRtScene", "rt scene: release failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12PrepareRtScene(mcdr_command_ctx* ctx, uint64_t scene,
+    const mcdr_rt_scene_desc* desc, mcdr_rt_scene_output* output) {
+    if (output) *output = {};
+    try {
+        const auto result = d3d12_mc::prepareRtScene(ctx, scene, desc, output);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12PrepareRtScene", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12PrepareRtScene", "rt scene: preparation failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12PrepareRtSceneTargets(mcdr_command_ctx* ctx, uint64_t scene,
+    const mcdr_rt_scene_desc* desc, const uint64_t* targets, uint32_t targetCount, mcdr_rt_scene_output* output) {
+    if (output) *output = {};
+    try {
+        const auto result = d3d12_mc::prepareRtSceneTargets(ctx, scene, desc, targets, targetCount, output);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12PrepareRtSceneTargets", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12PrepareRtSceneTargets", "rt scene: preparation failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12SetRtSceneWorkBudget(uint64_t scene, uint64_t cpuMicros,
+                                            uint64_t gpuMicros, uint64_t triangles) {
+    try {
+        const auto result = d3d12_mc::setRtSceneWorkBudget(scene, cpuMicros, gpuMicros, triangles);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12SetRtSceneWorkBudget", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12SetRtSceneWorkBudget", "rt scene: work configuration failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12GetRtSceneWorkBudget(uint64_t scene, uint64_t* values, int32_t valueCount) {
+    try {
+        const auto result = d3d12_mc::getRtSceneWorkBudget(scene, values, valueCount);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12GetRtSceneWorkBudget", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12GetRtSceneWorkBudget", "rt scene: work query failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12GetRtSceneCaptureDemands(uint64_t scene, uint64_t* values, int32_t valueCount) {
+    try {
+        const auto result = d3d12_mc::getRtSceneCaptureDemands(scene, values, valueCount);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12GetRtSceneCaptureDemands", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12GetRtSceneCaptureDemands", "rt scene: demand query failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12GetRtSceneStats(uint64_t scene, uint64_t* values, int32_t valueCount) {
+    try {
+        const auto result = d3d12_mc::getRtSceneStats(scene, values, valueCount);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12GetRtSceneStats", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12GetRtSceneStats", "rt scene: statistics failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12RtFrameBeginGBuffer(mcdr_command_ctx* ctx, uint64_t frame,
+    int64_t frameNanos, int32_t width, int32_t height, mcdr_rt_gbuffer_output* output) {
+    if (output) *output = {};
+    try {
+        const auto result = d3d12_mc::beginRtGBuffer(ctx, frame, frameNanos, width, height, output);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12RtFrameBeginGBuffer", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12RtFrameBeginGBuffer", "rt gbuffer: begin failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12RtFrameEndGBuffer(mcdr_command_ctx* ctx, uint64_t frame,
+    uint64_t revision, int32_t success) {
+    try {
+        if (success != 0 && success != 1) {
+            mcdr::abi::setLastError("mcdr_dx12RtFrameEndGBuffer", "rt gbuffer: invalid completion");
+            return 0;
+        }
+        const auto result = d3d12_mc::endRtGBuffer(ctx, frame, revision, success != 0);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12RtFrameEndGBuffer", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12RtFrameEndGBuffer", "rt gbuffer: end failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12RtFrameReplayGBuffer(mcdr_command_ctx* ctx, uint64_t frame,
+    const mcdr_rt_gbuffer_replay* replay) {
+    try {
+        const auto result = d3d12_mc::replayRtGBuffer(ctx, frame, replay);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12RtFrameReplayGBuffer", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12RtFrameReplayGBuffer", "rt gbuffer: replay failed");
+    }
+    return 0;
+}
+
+uint64_t MCDR_CALL mcdr_dx12RtCaptureGBuffer(mcdr_command_ctx* ctx, uint64_t capture,
+    int64_t frameNanos, const mcdr_rt_gbuffer_batch* batch) {
+    try {
+        const auto result = d3d12_mc::captureRtGBuffer(ctx, capture, frameNanos, batch);
+        if (result) return *result;
+        mcdr::abi::setLastError("mcdr_dx12RtCaptureGBuffer", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12RtCaptureGBuffer", "rt capture: capture failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12RtReleaseGBufferCapture(mcdr_command_ctx* ctx, uint64_t capture) {
+    try {
+        const auto result = d3d12_mc::releaseRtGBufferCapture(ctx, capture);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12RtReleaseGBufferCapture", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12RtReleaseGBufferCapture", "rt capture: release failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12RtFrameReplayCapturedGBuffer(mcdr_command_ctx* ctx, uint64_t frame,
+    uint64_t capture, const mcdr_rt_gbuffer_replay* replay) {
+    try {
+        const auto result = d3d12_mc::replayCapturedRtGBuffer(ctx, frame, capture, replay);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12RtFrameReplayCapturedGBuffer", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12RtFrameReplayCapturedGBuffer", "rt capture: replay failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12RtFrameReblur(mcdr_command_ctx* ctx, uint64_t frame, uint64_t frameId) {
+    try {
+        const auto result = d3d12_mc::reblurRtFrame(ctx, frame, frameId);
+        if (result) return 1;
+        return mcdr::abi::failWith("mcdr_dx12RtFrameReblur", result.error().message);
+    } catch (...) {
+        return mcdr::abi::failWith("mcdr_dx12RtFrameReblur", "rt frame: signal encoding failed");
+    }
+}
+
+int32_t MCDR_CALL mcdr_dx12RtFrameDenoise(mcdr_command_ctx* ctx, uint64_t frame,
+    const mcdr_rt_denoise_desc* desc, mcdr_rt_denoise_output* output) {
+    if (output) *output = {};
+    try {
+        const auto result = d3d12_mc::denoiseRtFrame(ctx, frame, desc, output);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12RtFrameDenoise", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12RtFrameDenoise", "rt frame: denoising failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12RtFrameUpscale(mcdr_command_ctx* ctx, uint64_t frame,
+    uint64_t frameId, int32_t backend, mcdr_rt_denoise_output* output) {
+    if (output) *output = {};
+    try {
+        const auto result = d3d12_mc::upscaleRtFrame(ctx, frame, frameId, backend, output);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12RtFrameUpscale", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12RtFrameUpscale", "rt sr: reconstruction failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12RtFrameComposite(mcdr_command_ctx* ctx, uint64_t frame,
+    uint64_t frameId, mcdr_object* source, int32_t debugMode, mcdr_rt_denoise_output* output) {
+    if (output) *output = {};
+    try {
+        const auto result = d3d12_mc::compositeRtFrame(ctx, frame, frameId, source, debugMode, output);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12RtFrameComposite", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12RtFrameComposite", "rt composite: recording failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12RtFrameTransaction(mcdr_command_ctx* ctx, uint64_t frame,
+    const mcdr_rt_transaction_desc* desc, mcdr_rt_transaction_output* output) {
+    if (output) *output = {};
+    try {
+        const auto result = d3d12_mc::recordRtFrameTransaction(ctx, frame, desc, output);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12RtFrameTransaction", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12RtFrameTransaction", "rt frame: transaction failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12RtFrameTransactionLighting(mcdr_command_ctx* ctx, uint64_t frame,
+    const mcdr_rt_transaction_desc* desc, const void* lighting, int64_t lightingBytes,
+    mcdr_rt_transaction_output* output) {
+    if (output) *output = {};
+    try {
+        if (!lighting || lightingBytes == 0) {
+            mcdr::abi::setLastError("mcdr_dx12RtFrameTransactionLighting", "rt lighting: payload required");
+            return 0;
+        }
+        const auto result = d3d12_mc::recordRtFrameTransaction(ctx, frame, desc, output, lighting, lightingBytes);
+        if (result) return 1;
+        mcdr::abi::setLastError("mcdr_dx12RtFrameTransactionLighting", result.error().message);
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12RtFrameTransactionLighting", "rt lighting: transaction failed");
+    }
+    return 0;
+}
+
+int32_t MCDR_CALL mcdr_dx12RtFrameSetSpatial(mcdr_command_ctx* ctx, uint64_t frame,
+    uint64_t frameId, uint64_t worldEpoch, uint64_t liveRevision, const void* data, int64_t bytes) {
+    try {
+        const auto result = d3d12_mc::setRtFrameSpatial(ctx, frame, frameId, worldEpoch, liveRevision, data, bytes);
+        if (result) return 1;
+        return mcdr::abi::failWith("mcdr_dx12RtFrameSetSpatial", result.error().message);
+    } catch (...) {
+        return mcdr::abi::failWith("mcdr_dx12RtFrameSetSpatial", "rt spatial: capture failed");
+    }
+}
+
+int32_t MCDR_CALL mcdr_dx12RtFrame(mcdr_command_ctx* ctx, uint64_t frame,
+    const mcdr_rt_frame_desc* desc, mcdr_rt_frame_output* output) {
+    if (output) *output = {};
+    try {
+        const auto result = d3d12_mc::recordRtFrame(ctx, frame, desc, output);
+        if (result) return 1;
+        return mcdr::abi::failWith("mcdr_dx12RtFrame", result.error().message);
+    } catch (...) {
+        return mcdr::abi::failWith("mcdr_dx12RtFrame", "rt frame: recording failed");
+    }
+}
+
 mcdr_object* MCDR_CALL mcdr_dx12CreateSampler(int32_t addressU, int32_t addressV, int32_t minFilter,
                                               int32_t magFilter, int32_t maxAnisotropy, float maxLod) {
     const auto r = d3d12_mc::createSampler(addressU, addressV, minFilter, magFilter, maxAnisotropy, maxLod);

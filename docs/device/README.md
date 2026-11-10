@@ -34,7 +34,7 @@
 ### 1.2 调用链
 
 ```
-Kotlin（Illusion\src\main\kotlin\dev\nts\expdxr\d3d12\**）
+Kotlin（Illusion\src\main\kotlin\io\github\dxegp\d3d12\**）
   D3D12Device / D3D12CommandEncoderBackend / D3D12GpuBuffer / D3D12TransientMemory
         │  MCDR_ABI.kt：Linker.nativeLinker().downcallHandle(...)（java.lang.foreign，无 JNI）
         ▼
@@ -182,13 +182,21 @@ Submit()
 
 ### 2.4 `destroyDevice()`
 
-`:2781`，五步，顺序不可换：
+先调用 `mcdr_dlss_prepare_shutdown()`：光栅 DLSS 尚有 Pending 录制时立即返回；实际提交共享五秒等待上限，
+完成后先释放 viewport 0 / NGX feature。Pending、超时、无效 fence、设备移除或 SDK 释放失败均保留整个设备，
+记录 `dlss: shutdown deferred`。调用方待原录制完成或明确取消后重试；
+`mcdr_dx12DestroyDevice` 没有结果码，可通过 `mcdr_dx12GetDeviceHandle` 核对设备是否仍存活。
+详见 [DLSS §4.9](../advanced/dlss.md#49-光栅录制与-feature-退休)。
+
+预备关闭成功后按以下顺序执行：
 
 1. 关掉 `queueFenceEvent`；
 2. 若 `queueFence->GetCompletedValue() < queueFenceValue` 则 `SetEventOnCompletion` + 等 1000ms；
-3. `flushPendingDeletes(/*force=*/true)` —— 无视 fence 门槛，把延迟删除队列清空；
-4. `mcdr_dlss_shutdown()` —— **必须在设备还活着时**，NGX 要拿 device 释放自己的资源；
+3. `releaseRtFrames()`，再 `flushPendingDeletes(/*force=*/true)` 清空延迟删除队列；
+4. `mcdr_dlss_shutdown()` 在设备存活时交回私有纹理并关闭 NGX；
 5. `gCtx = DeviceContext{}`，再 `resetDescriptorAllocationState()`。
+
+光栅 DLSS 的预备关闭不提供其他 SDK、FG、device removal 或完整设备关闭事务的通过证据。
 
 ### 2.5 JVM 侧 `D3D12Device.close()` 的顺序
 
@@ -459,11 +467,19 @@ regionBaseSlot = frameSlot * sectionSize + reservedPerSection + worker * slotsPe
 | 池上限 | `kMaxFreeBufferBytes = 96ull * 1024 * 1024`（96 MiB） |
 | 池键 | `(D3D12_HEAP_TYPE, 容量)` |
 | 命中条件 | 同堆类型、容量 ≥ 请求、且是该堆类型里容量最小的那块 |
-| 容量口径 | `resource->GetDesc().Width`，或 `(size + 255) & ~255` |
+| 匹配容量 | 缓存 `resource->GetDesc().Width`，或 `(size + 255) & ~255`，查池不调用 COM |
+| 计费口径 | 容量向 64 KiB committed resource 分配粒度上取整；小缓冲不能按 256 B 占用池配额 |
 | 回收时机 | `flushPendingDeletes()` 里，`kind == Buffer` 且**不是** `force` 模式 |
-| 不进池 | READBACK 堆缓冲（一次性读回，进池只会把 96 MiB 占满）；带 `ALLOW_UNORDERED_ACCESS` 的 UAV 缓冲（池键里没有这个维度，复用会丢 flag） |
+| 不进池 | READBACK、带 `ALLOW_UNORDERED_ACCESS` 的 UAV、RT 几何/AS 及显式 `rtManaged=true` 的帧缓冲 |
 
 超出 96 MiB 时直接 `delete`，并把 `gLiveBuf` / `gLiveUploadBytes|Default|Readback` 的计数减回去。
+
+`createTexture(..., rtManaged=false)` 与 `createBuffer(..., rtManaged=false)` 的内部可选参数
+由 RT 帧调用方显式开启。开启后按实际 resource description 查询 committed 字节，
+在驱动分配前同时检查 RT 共享上限与帧域额度，租约随 `Dx12Object` 的物理寿命释放；
+受管 buffer 强制 `poolable=false`。普通调用保持原资源池策略。
+几何与 AS 的专用路径自行领取对应域额度，不再开启帧域计费。
+24 值查询布局、热配置、失败与退休规则见 [RT 受管分配总账](../advanced/rt-frame.md#17-native-rt-受管分配总账)。
 
 ---
 
@@ -471,7 +487,7 @@ regionBaseSlot = frameSlot * sectionSize + reservedPerSection + worker * slotsPe
 
 ### 5.1 录制模型：一个 encoder、三条 list、**一个**队列
 
-`createCommandEncoder()`（`:3674`）一次创建 **3 个 allocator + 3 条 list**，全部初始 `Close()`：
+`createCommandEncoder()` 一次创建 **3 个 allocator + 3 条 list**，全部初始 `Close()`：
 
 ```
 CommandContext
@@ -487,7 +503,7 @@ CommandContext
 设备只有**一个** `ID3D12CommandQueue`（`D3D12_COMMAND_LIST_TYPE_DIRECT`）。
 没有 copy queue、没有 compute queue、没有多队列并行。
 
-`beginCommandList()`（`:3733`）挑槽位：`slot = fenceValue % 3`，然后只等这个槽位上**上一次**的
+`beginCommandList()` 挑槽位：`slot = fenceValue % 3`，然后只等这个槽位上**上一次**的
 per-list fence（`ctx->slotFence[slot]`）。环境变量 `DX12_CMD_RING=0` 可以退回"等本 ctx 全部提交"的
 保守行为，仅供排查用。
 
@@ -510,20 +526,20 @@ JVM 侧 `createFence()` 的 token 必须是 `D3D12GetFenceValue(ctx) + 1`，
 
 ### 5.3 提交语义
 
-`submitCommandList(ctx)`（`:4142`）：
+`submitCommandList(ctx)`：
 
 | 前置状态 | 行为 | 返回值 |
 | --- | --- | --- |
 | `listOpen == 0`（空帧） | **不执行** `ExecuteCommandLists`（重复执行同一 list 会重写资源） | 当前 `ctx->fenceValue`，**不递增** |
 | `listOpen == 1` | `EndCommandList` → `ExecuteCommandLists(1, {list})` → `++fenceValue` → `slotFence[slot] = value` → `Signal(ctx->fence, value)` → `++queueFenceValue` → `Signal(queueFence, qv)` | 新的 `ctx->fenceValue` |
 
-`EndCommandList`（`:4033`）失败时会先 `dumpInfoQueueMessages()`，再返回
+`EndCommandList` 失败时会先 `dumpInfoQueueMessages()`，再返回
 `"endCommandList: Close <HRESULT> — <deviceStatusText>"`。
 `listOpen = 0` 之后 `--gOpenListCount`，**但此处不 flush 延迟删除** —— 必须等渲染线程的 Present fence。
 
 ### 5.4 延迟删除
 
-`destroyObject()`（`:3256`）从不立即 `delete`：
+`destroyObject()` 从不立即 `delete`：
 
 ```cpp
 required = (gOpenListCount > 0) ? kFenceBlockedByOpenList /* UINT64_MAX */
@@ -533,10 +549,37 @@ gPendingDeletes.push_back({obj, required});
 
 - 立即释放会在 `Close()` 时报 `"deleted prior to closing the command list"`（`E_INVALIDARG`）。
 - `+1` 覆盖"并发中尚未 Signal 的那次提交"。
-- `kFenceBlockedByOpenList` 是占位值，`flushPendingDeletes()` 在 `gOpenListCount == 0` 时
-  才把它回填成当时的 `queueFenceValue`。
+- `kFenceBlockedByOpenList` 是占位值；提交完成 queue Signal 后，所有列表已关闭时将其绑定到本次 queue fence。
+  Close、Execute、Signal 和绑定处于同一个提交锁范围。回收函数不得仅凭列表已关闭回填 fence；
+  Close 与 Execute 之间仍可能存在未提交的资源引用。
+- Present 后每帧调用回收，即使下一帧已开始录制，也可回收已绑定且完成 fence 的对象；
+  未绑定或 fence 未完成的对象继续保留。常规单次回收最多 256 个对象或 2 ms，余下对象保留原 fence 进入下次回收。
+  单个驱动释放调用可能超过 2 ms；这是批次预算，不是硬实时保证。设备销毁的 `force` 模式完整清理。
 - `flushPendingDeletes()` 用 `InterlockedExchange(&gPdInProgress, 1)` 防重入；并发/重入调用
   直接跳过并打 `"flushPendingDeletes: concurrent/re-entrant call skipped (pending=…)"`。
+
+`destroyCommandEncoder()` 先撤销未执行或提交未确认的录制，再将整个 `CommandContext` 移入退休队列。
+创建 encoder 时保留实际设备与提交队列，销毁时将这两份所有权一并退休。
+不得用 fence 的 `GetDevice()` 返回指针与当前设备的裸指针相等性推导队列归属；SDK 代理可能返回不同接口地址。
+它不等待固定时长，也不因等待超时释放 allocator、list、描述符页、上传页、readback、RT 或 query 所有权。
+没有 GPU 工作的 context 可以立即释放；已执行的 context 按原设备与所属 fence 的实际完成值回收。
+失败的提交需要补发完成 Signal 时，在提交锁内安排它；Signal 失败则保留 context，并在后续生命周期轮询重试。
+补发完成标记只服务于资源退休，不确认失败录制的输出、history 或 SDK token。
+创建/开始 encoder 与普通延迟删除都会轮询退休队列，释放时一并关闭该 context 的 fence event。
+
+关闭设备前先停止帧提交并销毁 encoder。`destroyDevice()` 遇到仍打开的列表时保留设备；
+否则在提交锁内向当前 DIRECT queue 安排新的 queue fence 标记，最多等待 1000 ms 后复核实际完成值。
+标记失败或仍未完成时保持设备、队列、描述符状态与 SDK 资源，调用方须稍后重试关闭。
+只有该有序标记实际完成或原设备明确 removed，才允许释放相关退休 context、RT 注册表并强制清理延迟对象。
+不得用旧 queue fence、超时、取消位或其它 encoder 的同数值 fence 代替完成证明。
+
+`_port/rt_encoder_retirement_check.py` 在真实阻塞队列上检查三个槽位的所有权、两次提交 Signal 故障、
+退休 Signal 故障、未提交取消、关闭延期与关闭重试。观察桥接仅安装所有权哨兵并保留测试安全引用，
+不替换产品销毁逻辑。真实 G-Buffer/NRD 资源的销毁后恢复另由
+`_port/rt_native_frame_check.py --gbuffer-ownership-only` 检查。
+`_port/rt_rr_encoder_retirement_check.py` 另用真实 RR 检查正常提交和两种 Signal 故障后的 encoder 销毁，
+不手工修补失败的 fence；核对在途槽位、实际 SDK reset、完成前禁止 feature 释放，以及原输出与恢复输出的读回。
+观察桥接须使用当前构建的模块 IFC，不能把旧 `CommandContext` 布局用于新 DLL。
 
 ### 5.5 异步渲染线程
 
@@ -560,7 +603,12 @@ Present 只能显示未初始化的内容 —— 表现是窗口闪烁各种颜�
   会立刻通过 → 自旋进下一帧 → 可能解引用已释放的 ctx → `0xC0000005`。
   另外三个事件保持 manual-reset（广播语义）。
 - 渲染线程等 `gEvtCommandsReady` 时每 500ms 检查一次 `gRenderRunning`，**10 次（5 秒）超时**
-  就 `endCommandList` + 清 `gAsyncRenderCtx` + `SetEvent(gEvtSubmitDone)` 放弃这一帧。
+  就关闭列表、取消录制 ticket，并通知提交失败；直接返回外层等待，禁止落入提交或 Present。
+- `mcdr_dx12AsyncRenderBeginFrame` 返回 1 表示已取得所有权，0 表示未启用异步或没有 active surface，
+  -1 表示无效上下文或前一帧尚未结算。仅返回 0 时允许同步提交。
+- `mcdr_dx12AsyncRenderWaitComplete` 返回 1 表示双 Signal 成功，0 表示观察超时，-1 表示失败。
+  等待必须匹配所属编码器；只有终态才清除 `gAsyncRenderCtx`。观察超时保留所有权，禁止重录或释放。
+  就绪查询与命令交接也必须匹配编码器；`mcdr_dx12ClearAsyncRenderCtx` 不清除仍活动的上下文。
 - `gEvtSubmitDone` **先于** `presentSurface()` 触发，让主线程下一帧的录制与本帧 Present 重叠
   （Present 实测 0.13–1.7ms）。
 - 每个 back buffer 的 `surfaceFences[bbIdx] = queueFenceValue` 必须在 `presentSurface()`
@@ -768,7 +816,7 @@ DXC 侧另有一层**磁盘**缓存（不是内存缓存）：键 =
 
 | 原语 | 关键约束 |
 | --- | --- |
-| `createBuffer(usage, size)` | `alignedSize = (size + 255) & ~255`（256 对齐）；非 UAV 先走 best-fit 池；UPLOAD 初态 `GENERIC_READ`、READBACK 初态 `COPY_DEST`、其余 `COMMON` |
+| `createBuffer(usage, size, exactCapacity, poolable)` | `alignedSize = (size + 255) & ~255`（256 对齐）；默认允许非 UAV best-fit 复用；`exactCapacity=true` 要求池容量相同，`poolable=false` 禁止借用与回收进池；UPLOAD 初态 `GENERIC_READ`、READBACK 初态 `COPY_DEST`、其余 `COMMON` |
 | `mapBuffer(buf, offset, length, read, write)` | 堆必须是 UPLOAD/READBACK；首次调用做一次 `Map(0)` 并把基址缓存进 `mappedPtr`，之后返回 `mappedPtr + offset`；`read` 需 `usage & 1`、`write` 需 `usage & 2` |
 | `unmapBuffer(buf)` | `Unmap(0)` 并把 `mappedPtr` 置空；下次 `mapBuffer` 会重新 Map |
 | `copyBufferToBuffer` / `copyBufferToTexture` / `copyTextureToBuffer` | 自动过渡到 `COPY_SOURCE` / `COPY_DEST`，不负责等待 |
@@ -776,6 +824,10 @@ DXC 侧另有一层**磁盘**缓存（不是内存缓存）：键 =
 
 native 侧**没有** `TransientMemory` / `PipelineCache` 类。`grep` 整个 `src\` 与 `include\`
 只命中一处注释，所以"瞬态内存"在 native 就是"256 对齐 + 缓冲池 + Map"。
+
+AS 的 512 MiB 共享分配预算由 `Dx12Object.allocationCharge` 持有租约，底层资源释放后才退还。
+AS 实例表和代理暂存采用 `poolable=false` 的精确容量缓冲；普通调用仍保留默认池行为。
+构建前预留字节，旧 scratch、在途分配及通用延迟删除阶段同时计费；详细范围见 [RT 帧链路](../advanced/rt-frame.md#13-场景候选发布与局部失效)。
 
 ### 7.2 JVM 侧的上传块
 
@@ -998,10 +1050,10 @@ JVM 侧对应位置（相对仓库根）：
 
 | 路径 | 内容 |
 | --- | --- |
-| `Illusion\src\main\kotlin\dev\nts\expdxr\d3d12\extern\MCDR_ABI.kt` | FFM downcall 绑定与 `MCDR_Layout` |
-| `Illusion\src\main\kotlin\dev\nts\expdxr\d3d12\render\adapter\D3D12Device.kt` | 设备封装、`pipelineCache`、`close()` 顺序 |
-| `Illusion\src\main\kotlin\dev\nts\expdxr\d3d12\backend\D3D12CommandEncoderBackend.kt` | encoder 封装、`submit()` 的同步/异步分支、回读回调 |
-| `Illusion\src\main\kotlin\dev\nts\expdxr\d3d12\render\core\D3D12TransientMemory.kt` | 上传块、按 fence 回收的块池与帧队列 |
+| `Illusion\src\main\kotlin\io\github\dxegp\d3d12\extern\MCDR_ABI.kt` | FFM downcall 绑定与 `MCDR_Layout` |
+| `Illusion\src\main\kotlin\io\github\dxegp\d3d12\render\adapter\D3D12Device.kt` | 设备封装、`pipelineCache`、`close()` 顺序 |
+| `Illusion\src\main\kotlin\io\github\dxegp\d3d12\backend\D3D12CommandEncoderBackend.kt` | encoder 封装、`submit()` 的同步/异步分支、回读回调 |
+| `Illusion\src\main\kotlin\io\github\dxegp\d3d12\render\core\D3D12TransientMemory.kt` | 上传块、按 fence 回收的块池与帧队列 |
 
 ---
 

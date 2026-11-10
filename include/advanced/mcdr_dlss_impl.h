@@ -7,6 +7,8 @@
 
 #include "mcdr_abi.h"  // mcdr_dlss_input
 
+struct mcdr_dlssd_frame;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -68,6 +70,7 @@ int32_t mcdr_dlss_fg_presented(void);
 
 // State the DLSS output texture is left in (0 = unknown); a read-back must use it as StateBefore.
 int32_t mcdr_dlss_output_state(void);
+void mcdr_dlss_invalidate_output(void);
 
 // Reflex mode (0=off 1=eLowLatency 2=eLowLatencyWithBoost) and the availability query.
 void mcdr_reflex_set_mode(int32_t mode);
@@ -113,11 +116,11 @@ using DlssDestroyTextureFn = void (*)(void* ctx, void* object);
 // 注入创建/销毁入口（模块在 wireDlssImpl() 里调一次）；1 = 两个入口都装上了。
 int32_t mcdr_dlss_install_texture_ops(void* createFn, void* destroyFn);
 
-// Creates/rebuilds the feature on an ALREADY OPEN command list (a size change rebuilds).
-int32_t mcdr_dlss_create(void* commandList, const mcdr_dlss_input* in, DlssTransitionFn tl,
+int32_t mcdr_dlss_prepare(const struct mcdr_dlssd_frame* frame, const mcdr_dlss_input* in);
+int32_t mcdr_dlss_prepare_shutdown(void);
+int32_t mcdr_dlss_create(const struct mcdr_dlssd_frame* frame, const mcdr_dlss_input* in, DlssTransitionFn tl,
                          void* tlCtx);
-// One real NGX evaluation per frame. commandList is ID3D12GraphicsCommandList*.
-int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTransitionFn tl,
+int32_t mcdr_dlss_evaluate(const struct mcdr_dlssd_frame* frame, const mcdr_dlss_input* in, DlssTransitionFn tl,
                            void* tlCtx, const DlssSdkResourceOps* resourceOps);
 
 // Depth snapshot. Called BEFORE vanilla's clearDepthTexture wipes the depth to 0.0 (reverse-Z "far"); the

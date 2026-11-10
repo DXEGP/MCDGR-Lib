@@ -323,6 +323,24 @@ int32_t MCDR_CALL mcdr_dx12ReadQueryValues(mcdr_query_pool* pool, int32_t start,
     return 1;
 }
 
+int32_t MCDR_CALL mcdr_dx12QueueQueryValues(mcdr_command_ctx* ctx, mcdr_query_pool* pool,
+                                            int32_t start, int32_t count) {
+    if (const auto result = d3d12_mc::queueQueryValues(ctx, pool, start, count); !result) {
+        return mcdr::abi::failWith("mcdr_dx12QueueQueryValues", result.error().message);
+    }
+    return 1;
+}
+
+int32_t MCDR_CALL mcdr_dx12TryReadQueryValues(mcdr_query_pool* pool, int32_t start, int32_t count,
+                                              int64_t* out) {
+    const auto result = d3d12_mc::tryReadQueryValues(pool, start, count, reinterpret_cast<long long*>(out));
+    if (!result) {
+        mcdr::abi::failVoid("mcdr_dx12TryReadQueryValues", result.error().message);
+        return -1;
+    }
+    return *result ? 1 : 0;
+}
+
 // Async renderer control channel.
 
 void MCDR_CALL mcdr_dx12InitAsyncRenderer(int32_t workerCount) {
@@ -339,7 +357,7 @@ int32_t MCDR_CALL mcdr_dx12AsyncRenderBeginFrame(mcdr_command_ctx* ctx) {
     if (!r && !r.error().message.empty()) {
         mcdr::abi::failVoid("mcdr_dx12AsyncRenderBeginFrame", r.error().message);
     }
-    return r ? 1 : 0;
+    return r ? (*r ? 1 : 0) : -1;
 }
 
 int32_t MCDR_CALL mcdr_dx12AsyncRenderWaitComplete(mcdr_command_ctx* ctx, int64_t timeoutMs) {
@@ -347,7 +365,7 @@ int32_t MCDR_CALL mcdr_dx12AsyncRenderWaitComplete(mcdr_command_ctx* ctx, int64_
     if (!r && !r.error().message.empty()) {
         mcdr::abi::failVoid("mcdr_dx12AsyncRenderWaitComplete", r.error().message);
     }
-    return r ? 1 : 0;
+    return r ? (*r ? 1 : 0) : -1;
 }
 
 int32_t MCDR_CALL mcdr_dx12AsyncRenderIsRecordingReady(mcdr_command_ctx* ctx) {
@@ -359,8 +377,7 @@ int32_t MCDR_CALL mcdr_dx12AsyncRenderWaitRecordingReady(mcdr_command_ctx* ctx, 
 }
 
 int32_t MCDR_CALL mcdr_dx12AsyncSendCommandsReady(mcdr_command_ctx* ctx) {
-    d3d12_mc::asyncSendCommandsReady(ctx);
-    return 1;
+    return d3d12_mc::asyncSendCommandsReady(ctx) ? 1 : 0;
 }
 
 void MCDR_CALL mcdr_dx12ClearAsyncRenderCtx(void) { d3d12_mc::clearAsyncRenderCtx(); }

@@ -359,8 +359,12 @@ public:
             return false;
         }
         const uint32_t flags = contextFlagsFor(dispatch);
+        if (!completion_.prepare(ctx, resetPending_, needsRecreate_)) {
+            problem_ = "previous evaluation pending";
+            return false;
+        }
         if (flags_ != flags && context_ != nullptr) {
-            if (!completion_.ready(ctx)) { problem_ = "previous evaluation pending"; return false; }
+            if (!completion_.ready()) { problem_ = "previous evaluation pending"; return false; }
             destroyContext();
         }
         flags_ = flags;
@@ -422,6 +426,7 @@ public:
             dispatch.viewSpaceToMetersFactor > 0.0f ? dispatch.viewSpaceToMetersFactor : 1.0f;
         desc.flags = 0;
 
+        resetPending_ = true;
         completion_.record(ctx);
         const ffxReturnCode_t rc = runtime().api.dispatch(&context_, &desc.header);
         resources.reclaim();
@@ -445,6 +450,8 @@ public:
         problem_.clear();
         logged_ = false;
     }
+
+    bool readyToRelease() const override { return completion_.ready(); }
 
 private:
     void adoptSizes(int32_t renderWidth, int32_t renderHeight, int32_t displayWidth,
@@ -473,13 +480,12 @@ private:
             problem_ = "size beyond 8k";
             return false;
         }
-        if (context_ != nullptr && renderW_ <= maxRenderW_ && renderH_ <= maxRenderH_ &&
+        if (context_ != nullptr && !needsRecreate_ && renderW_ <= maxRenderW_ && renderH_ <= maxRenderH_ &&
             displayW_ <= maxDisplayW_ && displayH_ <= maxDisplayH_) {
             return true;
         }
         if (context_ != nullptr) {
-            // 旧上下文的内部资源可能还在飞：先等 GPU 追平最后一次提交再销毁。只在首次建 / 尺寸变大时发生。
-            if (!completion_.ready(ctx)) { problem_ = "previous evaluation pending"; return false; }
+            if (!completion_.ready()) { problem_ = "previous evaluation pending"; return false; }
             destroyContext();
         }
 
@@ -534,6 +540,7 @@ private:
         }
         problem_.clear();
         resetPending_ = true;
+        needsRecreate_ = false;
         return true;
     }
 
@@ -563,6 +570,7 @@ private:
     uint32_t flags_ = 0;
     SrContextCompletion completion_;
     bool resetPending_ = true;
+    bool needsRecreate_ = false;
     int32_t renderW_ = 0;
     int32_t renderH_ = 0;
     int32_t displayW_ = 0;

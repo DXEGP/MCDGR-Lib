@@ -63,6 +63,7 @@ IUpscaleProvider（mcdr.d3d12.device 模块内，签名只用 POD）
 | `void onResize(rw, rh, dw, dh)` | 只记账，真正重建推迟到下一次 `evaluate` | 否 |
 | `bool evaluate(CommandContext*, const mcdr_sr_dispatch&)` | 提交一帧 | 是（每类失败最多一行日志） |
 | `void shutdown()` | 释放上下文；调用方负责先等 fence | 否 |
+| `bool readyToRelease() const` | 检查全部实际录制已可退休；实际提交的总等待上限为 5 秒 | 否 |
 
 `initialize` 收到的是种子载荷：`srCreateProvider` 用 `seedFromSizes()` 造，只有尺寸、资源指针为空；
 直接调用 `srEvaluateFrame` 时使用完整逐帧载荷懒建 provider，包含 HDR 与相机参数。
@@ -143,7 +144,7 @@ Kotlin 侧镜像在 `MCDR_Layout.kt` 的 `SR_DISPATCH`。约定（与 `mcdr_dlss
 | `mcdr_dx12SrEvaluate(ctx, const mcdr_sr_dispatch*)` | 1 已执行 / 0 跳过 / -1 非法 | 命令列表必须打开；`desc->backend=0` 时用 `SrPick` 的值 |
 | `mcdr_dx12SrJitter(frameIndex, float* x, float* y)` | 恒 0 | 刻意「无意见」：亚像素 jitter 只有一个源（`D3D12Temporal` 的 Halton(2,3)） |
 | `mcdr_dx12SrJitterPhaseCount(backend, rw, dw)` | 相位长度 / -1 非法 | 0 = 不适用；见 §4.6 |
-| `mcdr_dx12SrDestroy()` | — | 帧首、无打开命令列表时调用；重复调用安全；同时把期望后端清成 NONE |
+| `mcdr_dx12SrDestroy()` | — | 清除期望后端；Pending 或等待超时时保留生效实例与资源，提交完成或取消后重试 |
 | `mcdr_dx12SrQuery(char*, int32_t)` | 1 已写 / 0 无内容 / -1 非法 | `(nullptr, 0)` 只问长度，与 `mcdrLastError` 约定一致 |
 
 ### 3.4 一帧的调用时序
@@ -215,24 +216,40 @@ mask 与颜色别名、mask 为 buffer、输出别名及缺 UAV 标志等非法�
 `ensureProvider(ctx, backendId, seed)`：
 
 1. `gSrProvider != nullptr && gSrActive == backendId` → 直接 `true`；
-2. 否则先 `releaseProviderWithWait(ctx)`，打一行 `SR provider switch <old> -> <new>`；
+2. 否则先 `releaseProviderWithWait()`；未退休时返回 `false` 并保留旧实例，成功后记录后端切换；
 3. `makeProvider(id)`：`Dlss` 直接 `new DlssSrProvider`，`Fsr` / `XeSS` 走各自工厂
    （运行库不在时工厂返回 `nullptr`，原因由工厂自己打日志）；
 4. `provider->initialize(ctx, seed)` 失败 → 返回 `false`（`initialize` 已写 `gSrNote`）；
 5. 成功 → 写 `gSrActive`、打 `SR provider ready: <name> (render WxH display WxH)`。
 
-### 4.3 销毁前必须等 GPU
+### 4.3 实际录制与上下文退休
 
-`releaseProviderWithWait(ctx)`：`ctx != nullptr && ctx->fenceValue > 0` 时
-`waitForFenceValue(ctx, ctx->fenceValue, 5'000'000'000ULL)`，超时只 WARN 然后照常释放。
+XeSS/FSR 的 `SrContextCompletion` 保存全部未退休的共享 `CommandRecording`，按 ticket 去重。
+每次求值在资源接管及上下文设置变化前检查：同 Pending ticket 可顺序继续同模式，外来 Pending 直接拒绝。
+同队列已经提交的使用可按命令顺序继续；新求值不得覆盖更早仍在途的使用。
 
-- 只等 `ctx->fenceValue`、**不等 `+1`**：切换发生在帧内，本帧还没提交，等 `+1` 等于等一个
-  永远不会被 Signal 的值。
-- 不等就释放的典型表现：设备移除，或切换那一帧整块变黑（`ffxDestroyContext` 与
-  `xessDestroyContext` 都会整块释放上下文持有的 GPU 资源）。
+未执行取消直接移除自身，不等待预计 fence；含 SDK 使用的录制取消后，同模式恢复也必须重建上下文，
+避免 SDK 的 CPU 状态已前进而 GPU 命令未执行。执行后 Signal 失败仍保活至该 ticket 的实际 fence 完成，
+每份失败提交只在首次观察时请求一次 reset。SDK execute 失败保留录制与 reset，成功求值才消费 reset。
 
-`srReleaseProvider()`（`SrDestroy` 走这条）没有命令上下文，改用队列级栅栏：
-`currentQueueFenceValue()` + `waitForQueueFenceValue(queueValue, 5'000'000'000ULL)`。
+重建、关闭或更换后端前调用 `readyToRelease()`。任一 Pending 使用使请求立即失败；
+全部实际提交共享 5 秒等待上限。超时、fence 不可用或设备移除时保留实例、内部资源与生效后端，
+`last=previous evaluation pending`；不得超时后继续释放。
+`SrCreate(..., NONE, ...)` 此时返回 0；`SrDestroy()` 没有结果码，清除期望后端但保留生效实例，
+通过 `SrQuery` 查看 `active`，在原录制提交完成或取消后重新请求销毁。
+调用方 encoder 的空 fence、无关 encoder 的较大 fence 或全局预计 queue fence 都不能代替原 producer。
+
+DLSS provider 的 `shutdown()` 不释放共享 DLSS feature，因此适配器对象可直接退休；
+其内部 SDK feature 生命周期由 DLSS 实现单独负责。光栅 viewport 0 与 NGX 使用实际录制集合，
+取消恢复、模式切换和设备关闭前核对全部 producer，释放失败保留恢复请求与设备，
+详见 [DLSS §4.9](dlss.md#49-光栅录制与-feature-退休)；本节的 XeSS/FSR 集合不替代该责任。
+
+`python _port/rt_sr_recording_check.py` 在隔离目录使用 target DLL，经真实 XeSS/FSR SDK 检查
+跨 encoder、真实取消、旧提交保活、两个 Signal 位置的失败、SDK 返回错误注入、后端切换及销毁超时。
+观察桥接按 SDK 头读取 reset，记录上下文创建与销毁入口/返回；销毁入口直接检查被观察 producer fence。
+负例若尝试过早销毁，由探针拦住并报告失败，不实际释放仍被 GPU 使用的 SDK 内存。
+错误注入先转发实际 execute，再把成功替换为错误；报告区分实际结果与注入结果。
+资源 scope、后续有限值读回与 D3D12 corruption/error 同时检查；本命令不提供世界内噪点与帧时结论。
 
 ### 4.4 每帧的收尾动作（必须保留）
 
@@ -395,10 +412,8 @@ ffxCreateContextDescUpscale   (type = ..._TYPE_UPSCALE, pNext = ↓)
 
 ### 6.6 上下文尺寸与重建
 
-- 上下文按 **max** 建、按**实际** dispatch：`ensureContext` 只在「首次」或「尺寸变大超出已建上界」
-  时重建；已建上界之内直接复用。
-- 重建前若 `ctx->fenceValue > 0`，先 `waitForFenceValue(ctx, ctx->fenceValue, 2'000'000'000ULL)`：
-  旧上下文的内部资源可能还在飞，不等就销毁会导致设备移除或整帧变黑。
+- 上下文按 **max** 建、按**实际** dispatch；首次、尺寸超出已建上界、HDR/MV 约定变化或未执行取消时重建。
+- 重建前等待该上下文的全部实际提交，共享 5 秒上限；Pending、超时或 fence 不可用时保留旧上下文，见 §4.3。
 - `onResize` 只记账，重建发生在下一帧 `evaluate`（那时才有能等的命令上下文）。
 - 建失败只 WARN 一次（`FSR context creation failed: <rc> (render=… display=…)`）。
 
@@ -494,11 +509,10 @@ QUALITY → BALANCED → ULTRA_QUALITY → PERFORMANCE → ULTRA_QUALITY_PLUS �
 ### 7.6 重建条件
 
 `handle_ != nullptr && !needsRecreate_ && displayW/H == builtDisplayW/H &&
-inputMin_ ≤ (renderW, renderH) ≤ inputMax_` → 直接复用。否则先等 fence
-（`waitForFenceValue(ctx, ctx->fenceValue, 2'000'000'000ULL)`）再销毁重建。
+inputMin_ ≤ (renderW, renderH) ≤ inputMax_` → 直接复用。否则按 §4.3 等全部实际使用退休后销毁重建。
 
-显示尺寸变化、输入越界、掩码开关变化都会触发重建——这是「只在必要时重建」的全部条件，
-不要在别处再读 `renderW_` 做判断。
+显示尺寸变化、输入越界、掩码开关、MV jitter 约定变化或未执行取消均触发重建。
+掩码与 MV 约定在旧上下文仍有 Pending 使用时不得改写；拒绝后原模式仍能继续同录制求值。
 
 ### 7.7 caps
 

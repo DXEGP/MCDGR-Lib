@@ -156,6 +156,24 @@ namespace
     // render 比它小时 NGXDLAA::EvaluateFeature 只写一行 dynamic scaling error 并交出空纹理
     // —— 世界全黑、GUI 正常。
     static const double kTierNominalFactor[5] = {3.0, 2.0, 1.72, 1.5, 1.0};
+    struct RasterDlssMode {
+        std::array<int32_t, 4> sizes{};
+        std::array<DXGI_FORMAT, 4> formats{};
+        int32_t quality = 0;
+        int32_t preset = 0;
+        int32_t flags = 0;
+        bool hdr = false;
+        bool operator==(const RasterDlssMode&) const = default;
+    };
+
+    struct RasterDlssRecording {
+        std::shared_ptr<void> recording;
+        McdrDlssRecordingState (*state)(const void*) = nullptr;
+        Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+        uint64_t completion = 0;
+        bool failureObserved = false;
+    };
+
     struct State
     {
         bool initAttempted = false;   // NGX init was tried (success or not)
@@ -169,6 +187,10 @@ namespace
         bool evalOk = false;
         bool evalFailWarned = false;  // an evaluate failure was already reported
         bool resetPending = false;    // a reset request is folded into the next Evaluate
+        bool recreatePending = false;
+        bool slRasterUsed = false;
+        std::optional<RasterDlssMode> rasterMode;
+        std::vector<RasterDlssRecording> rasterRecordings;
         // DLSS 是独立开关（权威门在设备模块的 gCtx.dlssEnabled），这里只是镜像，供状态查询与日志用。
         bool enabled = false;
         uint64_t submitCount = 0;     // successful Evaluate calls
@@ -1106,12 +1128,13 @@ namespace
         return s.qualityValue;
     }
 
-    void destroyFeature() {
+    bool destroyFeature() {
         if (s.feature != nullptr) {
             const NVSDK_NGX_Result r = NVSDK_NGX_D3D12_ReleaseFeature(s.feature);
             if (NVSDK_NGX_FAILED(r)) {
                 logWarn("NVSDK_NGX_D3D12_ReleaseFeature failed: %s",
                         ngxResultString(r).c_str());
+                return false;
             }
             s.feature = nullptr;
         }
@@ -1120,6 +1143,100 @@ namespace
         // feature 已销毁，下次 create 必须重推选项。
         s.slOptsApplied = false;
         s.slEvalOptsValid = false;
+        return true;
+    }
+
+    RasterDlssMode rasterDlssMode(const mcdr_dlss_input& input) {
+        return {{input.renderWidth, input.renderHeight, input.targetWidth, input.targetHeight},
+            {reinterpret_cast<ID3D12Resource*>(input.pInColor)->GetDesc().Format,
+                reinterpret_cast<ID3D12Resource*>(input.pInDepth)->GetDesc().Format,
+                reinterpret_cast<ID3D12Resource*>(input.pInMotionVectors)->GetDesc().Format,
+                reinterpret_cast<ID3D12Resource*>(input.pInOutput)->GetDesc().Format},
+            s.requestedQuality, s.requestedPreset, computeFeatureFlags(input), mcdr_hdr_state_active() != 0};
+    }
+
+    bool rasterRecordingsReady() {
+        if (std::ranges::any_of(s.rasterRecordings, [](const auto& use) {
+            return use.state(use.recording.get()) == McdrDlssRecordingState::Pending;
+        })) return false;
+        const auto started = GetTickCount64();
+        for (const auto& use : s.rasterRecordings) {
+            if (use.state(use.recording.get()) == McdrDlssRecordingState::Cancelled) continue;
+            if (!use.fence) return false;
+            const auto completed = use.fence->GetCompletedValue();
+            if (completed == UINT64_MAX) return false;
+            if (completed >= use.completion) continue;
+            const auto elapsed = GetTickCount64() - started;
+            if (elapsed >= 5000) return false;
+            const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (event == nullptr) return false;
+            const auto result = use.fence->SetEventOnCompletion(use.completion, event);
+            const bool ready = SUCCEEDED(result) &&
+                WaitForSingleObject(event, static_cast<DWORD>(5000 - elapsed)) == WAIT_OBJECT_0;
+            CloseHandle(event);
+            if (!ready) return false;
+        }
+        return true;
+    }
+
+    bool releaseRasterFeature() {
+        s.recreatePending = true;
+        s.resetPending = true;
+#if MCDR_DLSS_HAVE_STREAMLINE
+        if (s.slRasterUsed) {
+            const auto module = GetModuleHandleW(L"sl.interposer.dll");
+            const auto release = module == nullptr ? nullptr :
+                reinterpret_cast<PFun_slFreeResources*>(GetProcAddress(module, "slFreeResources"));
+            if (release == nullptr || release(sl::kFeatureDLSS, sl::ViewportHandle(0)) != sl::Result::eOk) return false;
+            s.slRasterUsed = false;
+        }
+#endif
+        if (!destroyFeature()) return false;
+        s.rasterRecordings.clear();
+        s.rasterMode.reset();
+        s.recreatePending = false;
+        s.resetPending = true;
+        return true;
+    }
+
+    bool prepareRasterFeature(const mcdr_dlssd_frame* frame, const RasterDlssMode& mode) {
+        if (frame == nullptr || frame->list == nullptr || !frame->recording || frame->recordingState == nullptr ||
+            frame->completionFence == nullptr || frame->completionValue == 0 ||
+            frame->recordingState(frame->recording.get()) != McdrDlssRecordingState::Pending) return false;
+        for (auto use = s.rasterRecordings.begin(); use != s.rasterRecordings.end();) {
+            const auto status = use->state(use->recording.get());
+            if (status == McdrDlssRecordingState::Cancelled) {
+                s.resetPending = true;
+                s.recreatePending = true;
+                use = s.rasterRecordings.erase(use);
+                continue;
+            }
+            if (status == McdrDlssRecordingState::Pending) {
+                if (use->recording != frame->recording) return false;
+                ++use;
+                continue;
+            }
+            if (status == McdrDlssRecordingState::SubmissionFailed && !use->failureObserved) {
+                s.resetPending = true;
+                use->failureObserved = true;
+            }
+            if (!use->fence) return false;
+            const auto completed = use->fence->GetCompletedValue();
+            if (completed == UINT64_MAX) return false;
+            if (completed >= use->completion) use = s.rasterRecordings.erase(use);
+            else ++use;
+        }
+        if (s.recreatePending || (s.rasterMode && *s.rasterMode != mode)) {
+            if (!rasterRecordingsReady() || !releaseRasterFeature()) return false;
+        }
+        return true;
+    }
+
+    void retainRasterRecording(const mcdr_dlssd_frame& frame) {
+        if (std::ranges::none_of(s.rasterRecordings, [&](const auto& use) { return use.recording == frame.recording; })) {
+            s.rasterRecordings.push_back({frame.recording, frame.recordingState,
+                static_cast<ID3D12Fence*>(frame.completionFence), frame.completionValue});
+        }
     }
 // 创建/重建 feature。要求命令列表已打开 —— NGX 在 CreateFeature 里录自己的命令。
     bool ensureFeature(ID3D12GraphicsCommandList* cmd, const mcdr_dlss_input& in) {
@@ -1204,7 +1321,7 @@ namespace
             return true;
         }
         if (sizeChanged || qualityChanged || presetChanged) {
-            destroyFeature();
+            if (!destroyFeature()) return false;
             // 尺寸变化使历史失效；重建的 feature 本来也没有历史，两种情况都重置。
             s.resetPending = true;
         }
@@ -1575,7 +1692,17 @@ void mcdr_dlss_query(char* note, int32_t noteCap, char* optimal, int32_t optimal
     }
 }
 
-int32_t mcdr_dlss_create(void* commandList, const mcdr_dlss_input* in, DlssTransitionFn tl,
+int32_t mcdr_dlss_prepare(const mcdr_dlssd_frame* frame, const mcdr_dlss_input* in) {
+    if (in == nullptr || in->pInColor == nullptr || in->pInDepth == nullptr ||
+        in->pInMotionVectors == nullptr || in->pInOutput == nullptr) return 0;
+    return prepareRasterFeature(frame, rasterDlssMode(*in)) ? 1 : 0;
+}
+
+int32_t mcdr_dlss_prepare_shutdown(void) {
+    return rasterRecordingsReady() && releaseRasterFeature() ? 1 : 0;
+}
+
+int32_t mcdr_dlss_create(const mcdr_dlssd_frame* frame, const mcdr_dlss_input* in, DlssTransitionFn tl,
                          void* tlCtx) {
     if (in == nullptr) {
         return -1;
@@ -1583,6 +1710,8 @@ int32_t mcdr_dlss_create(void* commandList, const mcdr_dlss_input* in, DlssTrans
     if (s.disabled) {
         return -1;
     }
+    if (mcdr_dlss_prepare(frame, in) != 1) return 0;
+    retainRasterRecording(*frame);
     if (!s.initOk || !s.paramsOk) {
 #if MCDR_DLSS_HAVE_STREAMLINE
         // streamline 模式下 ensureInit 跳过 NGX：把创建/选项交给 slDLSSSetOptions 并返回 1（返回 0 会让 JVM 跳过 evaluate）。
@@ -1590,13 +1719,14 @@ int32_t mcdr_dlss_create(void* commandList, const mcdr_dlss_input* in, DlssTrans
             // 先解析档位再下发选项，否则 qualityValue 还是初值 0（= MaxPerf）。
             (void)resolveQualityValue(*in);
             s.initAttempted = true;  // 状态串用：SL 拥有 NGX，我们自己的 init 永远不会跑
-            (void)streamlineApplyOptions(*in);
+            if (streamlineApplyOptions(*in) != 0) return 0;
+            s.rasterMode = rasterDlssMode(*in);
             return 1;
         }
 #endif
         return 0;
     }
-    auto* cmd = static_cast<ID3D12GraphicsCommandList*>(commandList);
+    auto* cmd = static_cast<ID3D12GraphicsCommandList*>(frame->list);
     if (cmd == nullptr) {
         return 0;
     }
@@ -1607,6 +1737,7 @@ int32_t mcdr_dlss_create(void* commandList, const mcdr_dlss_input* in, DlssTrans
     if (!ensureFeature(cmd, *in)) {
         return 0;
     }
+    s.rasterMode = rasterDlssMode(*in);
     logFrameChange(*in, s.createdThisFrame);
     return 1;
 }
@@ -2066,6 +2197,8 @@ sl::FrameToken* gLastFrameToken = nullptr;
     int32_t streamlineEvaluate(void* commandList, const mcdr_dlss_input& in, DlssTransitionFn tl,
                                void* tlCtx, const DlssSdkResourceOps* resourceOps) {
         gDlssOutputState.store(0);
+        const bool reset = in.reset != 0 || s.resetPending;
+        s.resetPending = true;
         auto* cmd = static_cast<ID3D12GraphicsCommandList*>(commandList);
         if (cmd == nullptr) return 0;
         StreamlineEvalApi& api = streamlineEvalApi();
@@ -2190,7 +2323,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
             cnst.motionVectorsJittered = gCameraConstants.motionVectorsJittered
                                              ? sl::Boolean::eTrue
                                              : sl::Boolean::eFalse;
-            cnst.reset = gCameraConstants.reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+            cnst.reset = gCameraConstants.reset || reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
             // 本版 SDK 的 sl::Constants 没有 renderingGameFrames 字段，那一位不用。
             cnst.motionVectorsDilated = sl::Boolean::eFalse;
             cnst.orthographicProjection = sl::Boolean::eFalse;
@@ -2297,6 +2430,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
             return 0;
         }
         sl::Result evalResult = sl::Result::eOk;
+        s.slRasterUsed = true;
         evalResult = api.evaluate(sl::kFeatureDLSS, *token, evalInputs, 1, cmd);
         resources.reclaim();
         if (evalResult != sl::Result::eOk) {
@@ -2453,21 +2587,24 @@ sl::FrameToken* gLastFrameToken = nullptr;
                                              : D3D12_RESOURCE_STATE_COPY_SOURCE)
                 : 0);
 
+        s.resetPending = false;
         return 1;
     }
 #endif
 
-int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTransitionFn tl,
+int32_t mcdr_dlss_evaluate(const mcdr_dlssd_frame* frame, const mcdr_dlss_input* in, DlssTransitionFn tl,
                            void* tlCtx, const DlssSdkResourceOps* resourceOps) {
     if (in == nullptr) {
         return -1;
     }
+    if (mcdr_dlss_prepare(frame, in) != 1) return 0;
+    retainRasterRecording(*frame);
 #if MCDR_DLSS_HAVE_STREAMLINE
     // 先判 Streamline：s.disabled 是 **NGX 路径**自己的失败状态，排在前面会让 SL 被永久挡在门外
     // （每帧静默 return -1，JVM 只看到 evaluate 连续失败）。
     if (dlssImplStreamline()) {
         // streamline 模式下 NGX 从未 init/创建：直接走 SL 的 tag -> options -> evaluate（状态由内部负责）。
-        return streamlineEvaluate(commandList, *in, tl, tlCtx, resourceOps);
+        return streamlineEvaluate(frame->list, *in, tl, tlCtx, resourceOps);
     }
 #endif
     if (s.disabled) {
@@ -2476,7 +2613,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     if (!s.featureOk || s.params == nullptr) {
         return 0;
     }
-    auto* cmd = static_cast<ID3D12GraphicsCommandList*>(commandList);
+    auto* cmd = static_cast<ID3D12GraphicsCommandList*>(frame->list);
     if (cmd == nullptr) {
         return 0;
     }
@@ -2615,6 +2752,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
 
     DlssSdkResourceScope resources(resourceOps, tlCtx, color, depthForDlss, mvForDlss, ngxTarget);
     if (!resources) return 0;
+    s.resetPending = true;
     const NVSDK_NGX_Result er = NGX_D3D12_EVALUATE_DLSS_EXT(cmd, s.feature, s.params, &ep);
     resources.reclaim();
     if (NVSDK_NGX_FAILED(er)) {
@@ -2738,9 +2876,9 @@ int32_t mcdr_dlss_set_output_texture(void* resource) {
     }
 
     void mcdr_dlss_shutdown(void) {
+    if (!rasterRecordingsReady() || !releaseRasterFeature()) return;
     mcdr_rt_reset_exposure();
     mcdr_dlss_invalidate_depth_snapshot();
-    destroyFeature();
     // 三张私有纹理归模块所有：设备消失**之前**交回（ctx = nullptr：只做延迟删除，不碰命令列表）。
     destroyTrackedTexture(nullptr, &s.mvBufferObject);
     s.mvBuffer = nullptr;
@@ -2758,8 +2896,8 @@ int32_t mcdr_dlss_set_output_texture(void* resource) {
         if (NVSDK_NGX_FAILED(r)) {
             logWarn("NVSDK_NGX_D3D12_Shutdown1 failed: %s", ngxResultString(r).c_str());
         }
-        s = State{};
     }
+    s = State{};
 
 }  // mcdr_dlss_shutdown
 // DXGI 工厂升级入口：设备模块建完工厂立刻调一次，否则 DLSS-G 一次都不出帧。
@@ -2802,6 +2940,10 @@ int32_t mcdr_dlss_output_state(void) {
     return gDlssOutputState.load();
 }
 
+void mcdr_dlss_invalidate_output(void) {
+    gDlssOutputState.store(0);
+}
+
 // ---- DLSS-D（Ray Reconstruction）逐帧求值 -------------------------------------
 // RR 与 DLSS-SR 是两份插件，函数也从 sl.interposer.dll 现场解析：宁可这里返回 0，
 // 也不要在游戏进程里自己调 NVSDK_NGX_D3D12_Init_*（SL 持有 NGX，会撞 0xBAD00005）。
@@ -2810,17 +2952,35 @@ namespace {
 
 using PFn_GetFeatureFunction = sl::Result (*)(sl::Feature, const char*, void*&);
 
+struct RtFeatureRecording {
+    std::shared_ptr<void> recording;
+    McdrDlssRecordingState (*recordingState)(const void*);
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    uint64_t completionValue = 0;
+    bool submissionFailureObserved = false;
+};
+
 struct RtExposureState {
     int32_t manual = -1;
     bool evaluated = false;
     bool resetPending = true;
-    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
-    uint64_t completionValue = 0;
+    bool recreatePending = false;
+    std::vector<RtFeatureRecording> recordings;
 };
 
 std::array<RtExposureState, 2>& rtExposureStates() {
     static std::array<RtExposureState, 2> states;
     return states;
+}
+
+void retainRtFeatureRecording(RtExposureState& state, const mcdr_dlssd_frame& frame) {
+    if (std::ranges::none_of(state.recordings, [&](const auto& use) {
+        return use.recording == frame.recording;
+    })) {
+        state.recordings.push_back({frame.recording, frame.recordingState,
+            static_cast<ID3D12Fence*>(frame.completionFence), frame.completionValue});
+    }
+    state.evaluated = true;
 }
 
 struct DlssdApi {
@@ -2974,10 +3134,54 @@ extern "C" void mcdr_rt_reset_exposure() {
     rtExposureStates() = {};
 }
 
-extern "C" int32_t mcdr_rt_prepare_exposure(int32_t rr, int32_t manual, void* completionFence,
-    uint64_t completionValue, char* outText, int32_t capacity) {
+extern "C" int32_t mcdr_rt_prepare_exposure(int32_t rr, int32_t manual,
+    const mcdr_dlssd_frame* frame, char* outText, int32_t capacity) {
+    if (frame == nullptr || !frame->recording || frame->recordingState == nullptr ||
+        frame->completionFence == nullptr || frame->completionValue == 0 ||
+        frame->recordingState(frame->recording.get()) != McdrDlssRecordingState::Pending) {
+        writeText(outText, capacity, "exposure: recording unavailable");
+        return 0;
+    }
     auto& state = rtExposureStates()[rr != 0 ? 1 : 0];
-    if (state.manual == manual) return 1;
+    for (auto use = state.recordings.begin(); use != state.recordings.end();) {
+        const auto status = use->recordingState(use->recording.get());
+        if (status == McdrDlssRecordingState::Cancelled) {
+            state.resetPending = true;
+            state.recreatePending = true;
+            use = state.recordings.erase(use);
+            continue;
+        }
+        if (status == McdrDlssRecordingState::Pending) {
+            if (use->recording != frame->recording || state.manual != manual) {
+                writeText(outText, capacity, state.manual != manual
+                    ? "exposure: submit before switching modes" : "exposure: recording not submitted");
+                return 0;
+            }
+            ++use;
+            continue;
+        }
+        if (status == McdrDlssRecordingState::SubmissionFailed && !use->submissionFailureObserved) {
+            state.resetPending = true;
+            use->submissionFailureObserved = true;
+        }
+        const uint64_t completed = use->fence->GetCompletedValue();
+        if (completed == UINT64_MAX) {
+            writeText(outText, capacity, "exposure: completion fence unavailable");
+            return 0;
+        }
+        if (completed >= use->completionValue) {
+            use = state.recordings.erase(use);
+        } else {
+            ++use;
+        }
+    }
+    if (state.manual == manual && !state.recreatePending) return 1;
+    if (std::ranges::any_of(state.recordings, [](const auto& use) {
+        return use.recordingState(use.recording.get()) == McdrDlssRecordingState::Pending;
+    })) {
+        writeText(outText, capacity, "exposure: submit before rebuilding feature");
+        return 0;
+    }
     auto& common = dlssdApi();
     if ((rr != 0 && !common.ok) || common.setConstants == nullptr || common.setTag == nullptr ||
         common.evaluate == nullptr || common.newFrameToken == nullptr) {
@@ -2985,18 +3189,25 @@ extern "C" int32_t mcdr_rt_prepare_exposure(int32_t rr, int32_t manual, void* co
         return 0;
     }
     if (state.evaluated) {
-        if (common.freeResources == nullptr || state.fence == nullptr) return 0;
-        const uint64_t completed = state.fence->GetCompletedValue();
-        if (completed == UINT64_MAX) return 0;
-        if (completed < state.completionValue) {
-            if (state.fence.Get() == completionFence && state.completionValue == completionValue) {
-                writeText(outText, capacity, "exposure: submit before switching modes");
+        if (common.freeResources == nullptr) return 0;
+        const auto waitStart = GetTickCount64();
+        for (const auto& use : state.recordings) {
+            const uint64_t completed = use.fence->GetCompletedValue();
+            if (completed == UINT64_MAX) {
+                writeText(outText, capacity, "exposure: completion fence unavailable");
+                return 0;
+            }
+            if (completed >= use.completionValue) continue;
+            const auto elapsed = GetTickCount64() - waitStart;
+            if (elapsed >= 5000) {
+                writeText(outText, capacity, "exposure: previous frame still in flight");
                 return 0;
             }
             HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
             if (event == nullptr) return 0;
-            const HRESULT result = state.fence->SetEventOnCompletion(state.completionValue, event);
-            const bool ready = SUCCEEDED(result) && WaitForSingleObject(event, 5000) == WAIT_OBJECT_0;
+            const HRESULT result = use.fence->SetEventOnCompletion(use.completionValue, event);
+            const bool ready = SUCCEEDED(result) &&
+                WaitForSingleObject(event, static_cast<DWORD>(5000 - elapsed)) == WAIT_OBJECT_0;
             CloseHandle(event);
             if (!ready) {
                 writeText(outText, capacity, "exposure: previous frame still in flight");
@@ -3013,8 +3224,8 @@ extern "C" int32_t mcdr_rt_prepare_exposure(int32_t rr, int32_t manual, void* co
     state.manual = manual;
     state.evaluated = false;
     state.resetPending = true;
-    state.fence.Reset();
-    state.completionValue = 0;
+    state.recreatePending = false;
+    state.recordings.clear();
     if (rr != 0) {
         common.inputWidth = common.inputHeight = common.optionWidth = common.optionHeight = 0;
     } else {
@@ -3036,6 +3247,9 @@ extern "C" int32_t mcdr_dlss_sr_eval(const mcdr_dlssd_frame* frame, char* outTex
         writeText(outText, capacity, "rt sr: streamline api unavailable");
         return 0;
     }
+    auto& exposureState = rtExposureStates()[0];
+    const bool resetPending = exposureState.resetPending;
+    exposureState.resetPending = true;
     const sl::ViewportHandle viewport(2);
     sl::DLSSOptions options{};
     options.outputWidth = frame->outputWidth;
@@ -3091,8 +3305,7 @@ extern "C" int32_t mcdr_dlss_sr_eval(const mcdr_dlssd_frame* frame, char* outTex
     sl::FrameToken* token = nullptr;
     if (common.newFrameToken(token, &frame->frameIndex) != sl::Result::eOk || token == nullptr) return -1;
     auto values = rtCameraConstants(*frame);
-    auto& exposureState = rtExposureStates()[0];
-    if (exposureState.resetPending) values.reset = sl::Boolean::eTrue;
+    if (resetPending) values.reset = sl::Boolean::eTrue;
     values.depthInverted = frame->constants[10] >= 0.0f ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     const sl::Result constantsResult = common.setConstants(values, *token, viewport);
     if (constantsResult != sl::Result::eOk) {
@@ -3113,14 +3326,12 @@ extern "C" int32_t mcdr_dlss_sr_eval(const mcdr_dlssd_frame* frame, char* outTex
         sl::ResourceTag(&motion, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate),
         sl::ResourceTag(&exposure, sl::kBufferTypeExposure, sl::ResourceLifecycle::eOnlyValidNow, &exposureExtent)};
     const uint32_t tagCount = frame->exposure != nullptr ? 5u : 4u;
+    retainRtFeatureRecording(exposureState, *frame);
     if (common.setTag(*token, viewport, tags.data(), tagCount, list) != sl::Result::eOk) {
         writeText(outText, capacity, "rt sr: resource tags rejected");
         return -1;
     }
     const sl::BaseStructure* inputs[]{&viewport};
-    exposureState.fence = static_cast<ID3D12Fence*>(frame->completionFence);
-    exposureState.completionValue = frame->completionValue;
-    exposureState.evaluated = true;
     const sl::Result result = common.evaluate(sl::kFeatureDLSS, *token, inputs, 1u, list);
     if (result == sl::Result::eOk) exposureState.resetPending = false;
     char text[160]{};
@@ -3153,6 +3364,9 @@ extern "C" int32_t mcdr_dlssd_eval(const mcdr_dlssd_frame* frame, char* outText,
         writeText(outText, capacity, "dlssd: streamline rr api missing");
         return 0;
     }
+    auto& exposureState = rtExposureStates()[1];
+    const bool resetPending = exposureState.resetPending;
+    exposureState.resetPending = true;
     auto* list = static_cast<ID3D12GraphicsCommandList*>(frame->list);
     const sl::ViewportHandle viewport(1);
 
@@ -3238,7 +3452,7 @@ extern "C" int32_t mcdr_dlssd_eval(const mcdr_dlssd_frame* frame, char* outText,
     sl::Result constantsResult = sl::Result::eErrorMissingInputParameter;
     if (api.setConstants != nullptr && frame->constants != nullptr) {
         auto values = rtCameraConstants(*frame);
-        if (rtExposureStates()[1].resetPending) values.reset = sl::Boolean::eTrue;
+        if (resetPending) values.reset = sl::Boolean::eTrue;
         constantsResult = api.setConstants(values, *token, viewport);
     }
     if (constantsResult != sl::Result::eOk) {
@@ -3305,6 +3519,7 @@ extern "C" int32_t mcdr_dlssd_eval(const mcdr_dlssd_frame* frame, char* outText,
         tags[tagCount++] = sl::ResourceTag(&exposureRes, sl::kBufferTypeExposure,
             sl::ResourceLifecycle::eOnlyValidNow, &exposureExtent);
     }
+    retainRtFeatureRecording(exposureState, *frame);
     const sl::Result tagResult = api.setTag(*token, viewport, tags, tagCount, list);
     if (tagResult != sl::Result::eOk) {
         char line[160] = {};
@@ -3315,10 +3530,6 @@ extern "C" int32_t mcdr_dlssd_eval(const mcdr_dlssd_frame* frame, char* outText,
     }
 
     const sl::BaseStructure* inputs[1] = {&viewport};
-    auto& exposureState = rtExposureStates()[1];
-    exposureState.fence = static_cast<ID3D12Fence*>(frame->completionFence);
-    exposureState.completionValue = frame->completionValue;
-    exposureState.evaluated = true;
     const sl::Result evalResult = api.evaluate(sl::kFeatureDLSS_RR, *token, inputs, 1, list);
     if (evalResult == sl::Result::eOk) exposureState.resetPending = false;
     char line[176] = {};
@@ -3334,7 +3545,7 @@ extern "C" int32_t mcdr_dlssd_eval(const mcdr_dlssd_frame* frame, char* outText,
 
 extern "C" void mcdr_rt_reset_exposure() {}
 
-extern "C" int32_t mcdr_rt_prepare_exposure(int32_t, int32_t, void*, uint64_t, char*, int32_t) {
+extern "C" int32_t mcdr_rt_prepare_exposure(int32_t, int32_t, const mcdr_dlssd_frame*, char*, int32_t) {
     return 0;
 }
 

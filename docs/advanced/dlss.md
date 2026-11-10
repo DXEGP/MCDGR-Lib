@@ -296,7 +296,7 @@ tooSmall(have, need) := have < need * 0.995      // 0.5% 容差
 1. 所有 `NVSDK_NGX_Parameter_Set*` 必须在 `NVSDK_NGX_D3D12_GetScratchBufferSize` **之前**，也在 `NGX_D3D12_CREATE_DLSS_EXT` 之前。
 2. 所有 `sl::DLSSOptions` / `NVSDK_NGX_DLSS_Eval_Params` 的赋值必须在 `EvaluateFeature` 调用**之前**；本层没有"设一半"的路径，构造完结构体一次性下发。
 3. 命令列表必须先打开（`NGX_D3D12_CREATE_DLSS_EXT` 与 `EVALUATE` 都要录自己的命令）。
-4. render pass 必须在 create 之前结束。`applyDlssToTexture` 完成绑定预检后调用 `endRenderPass(ctx)`，调用方后续重新开 pass。
+4. render pass 必须在 create 之前结束。`applyDlssToTexture` 完成绑定与实际录制预检后调用 `endRenderPass(ctx)`，调用方后续重新开 pass。
 
 ### 4.2 jitter 约定
 
@@ -344,8 +344,10 @@ JVM 在 `GameRenderer.render` HEAD 调用帧起点，必须早于 main pass RETU
 并在 NGX 使用 MV 中间纹理时接收该实际 MV，不能把原资源误声明为 SRV。
 工作区离线检查 `python _port/rt_dlss_depth_check.py` 分别执行隔离 NGX 运行库与开发目录 Streamline，按
 R32_FLOAT、D32_FLOAT、D24_UNORM_S8_UINT、D32_FLOAT_S8X24_UINT、R32_FLOAT、D32_FLOAT 的顺序提交。
+`--runtime-directory <dir>` 指定包含新 MCDR.dll 与完整 SDK 的独立目录，无需覆盖游戏 DLL。
 每种格式四帧，另对 R32/D32 各执行捕获、漏捕获、空深度、空 encoder、不同源、320×180 快照、关闭再开启、重新捕获八帧。
 每实现 40 次，共 80 次实际 SDK 求值；全部在求值前清零当前源深度。
+每实现另检查四项非法绑定和两项未知 flags 的原子拒绝，分别由绑定层和 SR 参数入口拒绝。
 有效快照的当前源状态保持原值；回退当前源时状态为 `NON_PIXEL_SHADER_RESOURCE`，从实际接管资源区分两条路径。
 逐帧检查 SDK scope、后续颜色 compute 读回，并验证两实现合计 18,432,000 个源深度值为零，D3D12 corruption/error 为零。
 此检查已接 GPU 总门；当前覆盖 2D 单 mip/单 layer/单 sample 的录制、格式往返与状态归属，
@@ -403,6 +405,8 @@ Streamline 要求 `slSetConstants` 入口存在；常量提交返回非 `eOk` �
 同一 frame token/viewport 的相同常量允许重复提交，不同常量由 SDK 返回 `eErrorDuplicatedConstants`（27/`0x1B`）。
 常量错误日志前 3 次逐条输出，之后仅第 4、8、16…次输出；失败不锁死 DLSS，下一个新帧可正常重试。
 tag 与 options 也必须成功后才执行 Evaluate；接管之后的失败由 scope 归还资源。
+设备模块仅在求值成功或本次已经接管资源后将 GUI 输出恢复为 `RENDER_TARGET`；
+常量拒绝等接管前失败不得额外改写原输出状态。
 
 scope 归还时，实际输入保持 `NON_PIXEL_SHADER_RESOURCE`、实际输出保持 UAV；
 后续宿主拷回可以继续调用跟踪式 transition，GUI 输出最终回到 `RENDER_TARGET`。
@@ -421,6 +425,7 @@ NGX 使用 MV 中间纹理时，原 MV 因预备拷贝保持 `COPY_SOURCE`，实
 独立 NGX 检查增加 `--depth-snapshot` 可验证实际快照分支；四格式、有效期与回退检查见 §4.4。
 `python _port/rt_dlss_failure_check.py` 在每次成功求值后，同 frame token 改变相机位置再求值，
 要求实际 SDK 的 `0x1B` 诊断共四次，ABI 返回 0，五个宿主资源的状态与接管/归还/恢复堆计数完全不变。
+该命令也接受 `--runtime-directory <dir>`，父进程和实际求值子进程使用同一指定运行库。
 每次拒绝后另建 frame token 并提交正确常量，要求恢复成功，随后实际 compute 读回颜色。
 常量拒绝与求值拒绝检查已接 GPU 总门。
 同一进程内，测试桥接使用 SDK 原始头编译，通过 `slGetFeatureFunction` 取得实际 `slDLSSSetOptions`，
@@ -433,6 +438,46 @@ NGX 使用 MV 中间纹理时，原 MV 因预备拷贝保持 `COPY_SOURCE`，实
 桥接由 runner 用 MSVC x64 `/std:c++latest` 自动编译到工作区临时目录，源代码、SDK 头、DLL 哈希均保存到报告。
 此项不证明 tag/options 错误、SDK 部分写入 GPU 后的错误、NGX SDK 错误或 FG 失败收尾。
 这组检查没有 HDR surface，光栅仅测 SDR；不代替非零 jitter、动态场景或窗口/世界内画质验收。
+
+### 4.9 光栅录制与 feature 退休
+
+光栅 DLSS 的 Streamline viewport 0 与直连 NGX 共用 `RasterDlssRecording` 集合。
+`mcdr_dlss_create` / `mcdr_dlss_evaluate` 接收包含实际列表、共享录制 ticket、状态回调与 producer fence 的
+`mcdr_dlssd_frame`；不能只传裸 command list 或预计 fence 数值。
+创建和求值前登记使用，同 ticket 去重，全部实际提交分别保活到自己的 completion。
+
+`mcdr_dlss_prepare` 必须先于 render pass 结束和输出转态执行。
+相同 Pending ticket 可顺序继续同模式；外来 Pending 立即拒绝。
+未执行取消只移除自身，同模式恢复也必须重建 feature；更早在途提交继续保留。
+执行后 Signal 失败仅在首次观察时请求 reset，使用仍保活至实际 fence 完成。
+常量、tag 或 evaluate 失败保留 reset，只有成功求值才消费请求。
+每次 `applyDlssToTexture` 开始先清空旧输出交接状态，拒绝不能返回旧 handover 状态。
+
+模式键包含输入/输出尺寸、四张输入/输出资源的 DXGI 格式、请求质量档、preset、创建 flags 与 HDR 状态。
+键变化或取消恢复需要重建时，先检查全部使用：Pending 立即拒绝，实际提交共享 5 秒总等待上限。
+超时、无效 fence 或设备移除均保留 feature 和模式，完成或明确取消后重试。
+Streamline 实际用过的 viewport 0 先调用 `slFreeResources(kFeatureDLSS, 0)`，NGX 释放实际 feature；
+释放成功才清空模式、录制集合和两份 SL options 缓存。
+释放失败保留恢复请求，后续同模式求值也须重新完成释放与创建，不能继续沿用失效的选项缓存。
+
+`mcdr_dlss_prepare_shutdown` 在设备清理前检查录制并尝试释放 feature。
+Pending、超时或 SDK 释放失败时，`destroyDevice()` 保留整个设备，调用方待原录制完成或取消后重试。
+通过 `mcdr_dx12GetDeviceHandle` 核对是否仍存活；该 void 销毁入口没有新增结果码。
+NGX `ReleaseFeature` 失败保留原句柄，禁止把失败当成已释放。
+
+工作区 `python _port/rt_dlss_recording_check.py` 默认在隔离目录使用 target DLL，
+`--native-dll <path>` 指定构建，`--output-dir <dir>` 指定证据目录。
+两实现分别覆盖 Pending、真正 End/Begin 取消、模式切换、旧提交保活、双 Signal 故障与约五秒等待超时；
+模式切换用例实际改变质量档，其余模式键组合没有逐项执行切换。
+Streamline 另注入 constants/tag/evaluate 返回错误和 freeResources 调用前拒绝，并检查设备关闭拒绝与恢复。
+constants/tag/evaluate 先执行真实 SDK 再替换成功结果；freeResources 在调用前返回错误，
+报告用 `actualResult=INT32_MIN` 标明未调用 SDK。两者均不视为 SDK 自发失败。
+父进程复核调用/reset/结果序列、资源 scope、源码/桥接/运行库哈希和实际 GPU 读回；
+Streamline feature 释放入口核对原 producer fence，D3D12 corruption/error 必须为空。
+NGX 的 SDK reset 常量、ReleaseFeature 入口与错误没有独立拦截，深度快照 producer、device removal 和 FG 另行验证。
+SDK 释放已经产生副作用却返回错误时，重复释放可能返回 `eErrorInvalidParameter`；
+此时继续保留设备和恢复请求，不把错误当成释放成功，自动恢复仍未闭合。
+这些工程检查不提供世界内噪点、帧时或完整子帧提交事务的通过证据。
 
 ## 5. 输出资源的所有权
 
@@ -449,6 +494,7 @@ NGX 使用 MV 中间纹理时，原 MV 因预备拷贝保持 `COPY_SOURCE`，实
 
 - 关命令列表之前，若调用了 `mcdr_dlss_set_output_texture(tex)`，必须在销毁 `tex` 之前调 `mcdr_dlss_set_output_texture(nullptr)`。本层持有裸 `ID3D12Resource*`，不做引用计数。
 - 私有纹理一律走模块的 `destroyTrackedTexture`（内部进延迟删除队列），**禁止**在本层 `Release()`。唯一例外是 scratch buffer：它绕过模块自建，也必须由本层释放。
+- 设备关闭前先完成 `mcdr_dlss_prepare_shutdown()`；未提交、在途超时或 SDK 释放失败时保留设备，不能继续清理附件和描述符。
 - `mcdr_dlss_shutdown()` 必须在设备还活着时调用；它把所有私有纹理交回模块（`ctx = nullptr`），再 `Shutdown1`。
 - 违反后果：调试层报 `resource deleted prior to closing the command list`；release 下是 GPU 读写已释放内存 → 花屏、`RemoveDevice`、TDR 冻结。这类问题不会在崩溃点附近留下可读的日志。
 
@@ -462,7 +508,9 @@ NGX 使用 MV 中间纹理时，原 MV 因预备拷贝保持 `COPY_SOURCE`，实
 | 深度快照 | `NON_PIXEL_SHADER_RESOURCE` | 供本次 evaluate 读 |
 | scratch | 不转换 | 由 NGX 内部管理 |
 
-`mcdr_dlss_output_state()` 返回上一帧结束时被 DLSS 写过的输出纹理的 `D3D12_RESOURCE_STATES` 整数，0 表示本帧没有 handover 纹理。JVM 做读回时必须用它当 `StateBefore`：按 `COMMON` 硬转会拿到未定义内容。
+`mcdr_dlss_output_state()` 返回最近一次光栅 DLSS 尝试成功交接的输出状态；每次尝试开始清为 0，
+拒绝或失败不得暴露旧值。Streamline 成功 handover 的非零值为 `D3D12_RESOURCE_STATES` 整数，
+NGX 的实际状态由资源跟踪查询。JVM 做读回时必须使用实际 `StateBefore`，不能硬写 `COMMON`。
 
 ## 6. 能力查询
 
@@ -706,17 +754,26 @@ RR 插件读取可选曝光 tag 并交给 NGX，其创建 flags 未设置 AutoEx
 SR 的曝光 flag 在 feature 创建时确定，重建判断只有 mode、输出尺寸和 preset；
 改变 `useAutoExposure` 必须同时明确 feature 生命周期，不能用 setOptions 成功代替实际模式切换验证。
 
-ABI 23 的 `mcdr_dx12DlssdEvalExposure` / `mcdr_dx12RtSrEvalExposure` 通过独立两 float 参数段
+`mcdr_dx12DlssdEvalExposure` / `mcdr_dx12RtSrEvalExposure` 通过独立两 float 参数段
 传入 `preExposure / exposureScale`，可在原八/四张纹理后追加一张 1×1 `R32_FLOAT` 曝光资源。
 标量范围为 `[2^-16,2^16]`，不改变 104-float 相机载荷。
 新旧入口共同检查纹理形状、尺寸、读写能力、别名与归属，完整预检后才接管。
 曝光 tag 使用 1×1 extent；SR 按资源有无明确设置 `useAutoExposure`，RR 仅提交可选资源与两个标量。
 同一模式内标量变化会刷新 SR options；RR 每次设置 options。
 
-每个 RT viewport 保存上次实际求值的 completion fence/value，SDK 返回错误也保留在途生命周期。
-曝光资源有无变化时，先等上次提交完成，再 `slFreeResources`、清尺寸/选项缓存并设置 pending reset。
-同一未提交列表内切换返回 0，诊断 `exposure: submit before switching modes`；其他未完成提交最多等 5 秒。
-reset 只在实际求值成功后消费；曝光纹理返回后回 `COMMON`，资源须存活至对应 fence 完成。
+每个 RT viewport 持有尚未退休的 `CommandRecording` 集合及各自的 completion fence/value。
+内部桥接通过不透明共享 ticket 与四态回调区分 Pending、Submitted、Cancelled、SubmissionFailed；公共 ABI 不变。
+同一 Pending 录制可按命令顺序继续求值同模式；其他录制即使使用相同模式也在接管纹理前返回 0，
+诊断 `exposure: recording not submitted`。曝光资源有无变化时，任意 Pending 使用均返回 0，
+诊断 `exposure: submit before switching modes`。
+未执行的 Cancelled 使用直接退休，不等待其预计 fence，并标记 feature 必须重建；SubmissionFailed 仍按真实 GPU 完成保活。
+取消更新的录制不撤销更早的 Submitted 使用。取消恢复即使沿用同一曝光模式，也必须重建 feature，
+不能用 reset 标志修复 SDK 内部已前进但 GPU 未执行的资源状态。重建或切换曝光资源模式前等待集合内全部实际提交完成，
+所有等待共享 5 秒上限，再 `slFreeResources`、清尺寸/选项缓存并请求 reset；超时不接管纹理。
+在调用 SDK resource tag 前登记录制，SDK 返回错误也保留可能已录入命令的使用，且不消费 reset。
+reset 只在求值成功后消费；后续观察到取消或提交失败会重新请求。
+每份失败提交只登记一次 reset 请求；其使用继续保活，但后续轮询同一在途记录不得重复请求 reset。
+恢复求值再次失败时仍保留请求，恢复录制被取消时重新请求。曝光纹理返回后回 `COMMON`，资源须存活至对应 fence 完成。
 玩家 RR/RT DLSS-SR 调用显式曝光入口，两个标量均为 1；1×1 R32_FLOAT 纹理由引擎测光生成。
 NeoForge 配置 `exposureMode / exposureEv / exposureSpeed` 控制引擎手动/自动测光，
 两种模式都保留资源，最终合光读取同一纹理并执行一次曝光；SDK 输入仍为未曝光线性 HDR。
@@ -727,14 +784,32 @@ RR/SR 共 384 次求值与 344 次拒绝。旧/新默认输出逐帧逐位一致
 父进程核验源码/SDK/运行库/输入哈希、模式序列，并重算二十四份分段末帧快照的曝光值与误差。
 接管/归还/恢复堆计数、拒绝原子性、后续 compute 读回及 D3D12 debug layer 同时检查。
 新增两个同队列跨 encoder 组各执行 164 次求值，检查另一 encoder 完成不能满足旧 encoder 的 fence。
-旧列表未提交和已提交但 GPU queue 被 fence 阻塞时，均须约五秒超时且保持两套资源状态/归属/计数不变；
+旧列表未提交时须在一秒内拒绝；已提交但 GPU queue 被 fence 阻塞时须约五秒超时。
+两种拒绝均保持两套资源状态/归属/计数不变；
 提交旧列表或解除阻塞后，同一新列表上的重试须成功。
 另外四次双向资源模式切换观察至少 0.25 秒阻塞等待，解除阻塞前调用不得返回或接管资源。
 每次恢复后再求值 31 帧，脚本对其 MSE 使用 0.001 诊断预算，重建 feature 后首帧使用 0.1；
 图像指标未达到预算不阻塞阶段，重试成功、输出有限与资源归还仍须通过。
 父进程复核新增二十四份完整快照、fence/时间/模式序列和两套 scope 计数。
-总计 712 次实际 SDK 求值、348 次原子拒绝，纳入 `rt_check_all.py --gpu`；
+基础与跨 encoder 组共 712 次实际 SDK 求值、348 次原子拒绝；
 `--cross-encoder` 只运行新增两组并复用已有 JVM 输入。
+`--recording-lifecycle` 单独检查 RR/SR 的同录制顺序求值、外来 Pending 拒绝、关闭后重新 Begin 的真实取消，
+以及旧提交被 GPU fence 阻塞、更新录制已取消时的保活与模式切换等待。恢复后提交并回读实际 SDK 输出，
+检查有限值、曝光纹理、scope 归还与调试层；`--native-dll <path>` 可在隔离目录使用指定构建。
+六组共 208 次求值、两次外来 Pending 拒绝和两次延迟等待；默认命令包含此组，
+合计 920 次实际求值、350 次原子拒绝，纳入 `rt_check_all.py --gpu`。
+`--reuse-inputs` 复用已有 JVM 输入 manifest，仍校验输入和运行库哈希；报告标明 `existing_manifest`，
+该运行不提供纯 JVM 自检通过证据。默认命令仍要求先通过纯 JVM 自检。
+`rt_sdk_history_check.py` 另行观察产品实际传给 `slSetConstants` 的 reset；不推测 SDK 结构偏移。
+隔离桥接按 SDK 头编译，只改当前 MCDR 模块的 `GetProcAddress` IAT 插槽，转发真实 SDK 后记录结果，设备关闭后恢复插槽。
+RR/SR 分别覆盖同模式真实取消、更晚取消但更早提交仍在途、两个队列 Signal 位置的失败，
+以及 constants/tag/evaluate 返回值的单次注入错误。
+注入错误组须记录实际 SDK 成功与返回给产品的错误，不能表述为 SDK 自发失败。
+失败提交组阻塞 GPU 后执行真实命令，恢复被注入的 Signal；随后验证只请求一次 reset，
+取消更新录制仍保留旧提交，在 `slFreeResources` 入口直接读取原 producer fence 的完成值并核对目标。
+每组核对 32 帧预热与恢复序列、scope 计数、有限值读回、曝光纹理和 D3D12 corruption/error。
+该命令明确复用已有 JVM manifest；默认验证 target DLL，可用 `--native-dll <path>` 指定隔离构建。
+它与曝光 ABI 组分别进入 GPU 总门，不能据此宣布完整 SDK 历史事务验收。
 独立 GPU queue 与同时求值不在本组覆盖内；世界内画质仍待确认，曝光错配敏感度保留为可选诊断。
 
 RR/RT DLSS SR 使用 [SDK 接管](../device/README.md#57-sdk-资源接管与归还)，返回后输入输出均回 `COMMON`。

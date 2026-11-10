@@ -82,6 +82,68 @@ constexpr UINT64 kFenceBlockedByOpenList = UINT64_MAX;
 // 「列表 B 的 fence 值」，等待方提前醒来就读到还没写完的缓冲（不报错，只是结果不对）。
 std::mutex gSubmitMutex;
 
+struct RetiredCommandEncoder {
+    std::unique_ptr<CommandContext> context;
+    ComPtr<ID3D12Device> device;
+    ComPtr<ID3D12CommandQueue> queue;
+    bool completionRequested = false;
+};
+std::vector<RetiredCommandEncoder> gRetiredCommandEncoders;
+std::mutex gRetiredCommandEncodersMutex;
+
+void reclaimRetiredCommandEncoders(ID3D12CommandQueue* completedQueue = nullptr) {
+    std::vector<std::unique_ptr<CommandContext>> completed;
+    {
+        const std::lock_guard lock(gRetiredCommandEncodersMutex);
+        auto pending = gRetiredCommandEncoders.begin();
+        while (pending != gRetiredCommandEncoders.end()) {
+            const auto value = pending->context->fence->GetCompletedValue();
+            const bool removed = pending->device && FAILED(pending->device->GetDeviceRemovedReason());
+            const bool queueCompleted = completedQueue && pending->queue.Get() == completedQueue;
+            if (removed || queueCompleted || (value != UINT64_MAX && value >= pending->context->fenceValue)) {
+                completed.push_back(std::move(pending->context));
+                pending = gRetiredCommandEncoders.erase(pending);
+                continue;
+            }
+            if (!pending->completionRequested && pending->queue) {
+                const std::unique_lock submitLock(gSubmitMutex, std::try_to_lock);
+                if (submitLock.owns_lock()) {
+                    pending->completionRequested = SUCCEEDED(pending->queue->Signal(
+                        pending->context->fence.Get(), pending->context->fenceValue));
+                }
+            }
+            ++pending;
+        }
+    }
+    for (auto& context : completed) {
+        if (context->fenceEvent) {
+            CloseHandle(context->fenceEvent);
+            context->fenceEvent = nullptr;
+        }
+    }
+}
+
+bool completeDeviceQueueForShutdown() {
+    if (!gCtx.device || FAILED(gCtx.device->GetDeviceRemovedReason())) return true;
+    if (gOpenListCount != 0 || !gCtx.queue || !gCtx.queueFence) return false;
+    uint64_t target = 0;
+    {
+        const std::lock_guard submitLock(gSubmitMutex);
+        target = ++gCtx.queueFenceValue;
+        if (FAILED(gCtx.queue->Signal(gCtx.queueFence.Get(), target))) return false;
+    }
+    const auto completed = gCtx.queueFence->GetCompletedValue();
+    if (completed != UINT64_MAX && completed >= target) return true;
+    const auto event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!event) return false;
+    const auto armed = gCtx.queueFence->SetEventOnCompletion(target, event);
+    const auto waited = SUCCEEDED(armed) ? WaitForSingleObject(event, 1000) : WAIT_FAILED;
+    CloseHandle(event);
+    const auto observed = gCtx.queueFence->GetCompletedValue();
+    return (waited == WAIT_OBJECT_0 && observed != UINT64_MAX && observed >= target) ||
+        FAILED(gCtx.device->GetDeviceRemovedReason());
+}
+
 Dx12Object* volatile gPdDeletingObj = nullptr;
 volatile long gPdDeletingIndex = -1;
 volatile long gPdDeletingTotal = 0;
@@ -99,6 +161,8 @@ std::mutex gDeviceInitMutex;
 
 struct PooledBuffer {
     Dx12Object* obj;
+    UINT64 capacity;
+    size_t cost;
 };
 std::vector<PooledBuffer> gFreeBuffers;
 size_t gFreeBufferBytes = 0;
@@ -112,15 +176,15 @@ UINT64 bufferCapacity(const Dx12Object* o) {
     return (static_cast<UINT64>(o->size) + 255ULL) & ~255ULL;
 }
 
-Dx12Object* takePooledBuffer(D3D12_HEAP_TYPE heapType, UINT64 capacity) {
+Dx12Object* takePooledBuffer(D3D12_HEAP_TYPE heapType, UINT64 capacity, bool exactCapacity) {
     std::lock_guard<std::mutex> lk(gFreeBufferMutex);
     size_t best = SIZE_MAX;
     UINT64 bestCap = 0;
     for (size_t i = 0; i < gFreeBuffers.size(); ++i) {
         PooledBuffer& pb = gFreeBuffers[i];
         if (pb.obj->heapType != heapType) continue;
-        UINT64 cap = bufferCapacity(pb.obj);
-        if (cap < capacity) continue;
+        UINT64 cap = pb.capacity;
+        if (cap < capacity || (exactCapacity && cap != capacity)) continue;
         if (best == SIZE_MAX || cap < bestCap) {
             best = i;
             bestCap = cap;
@@ -129,7 +193,7 @@ Dx12Object* takePooledBuffer(D3D12_HEAP_TYPE heapType, UINT64 capacity) {
     if (best == SIZE_MAX) return nullptr;
     Dx12Object* obj = gFreeBuffers[best].obj;
     // 记账量被 kMaxFreeBufferBytes（96 MiB）封顶，32 位 size_t 也不会溢出，显式收窄以免 x86 下 C4244。
-    gFreeBufferBytes -= static_cast<size_t>(bestCap);
+    gFreeBufferBytes -= gFreeBuffers[best].cost;
     gFreeBuffers[best] = gFreeBuffers.back();
     gFreeBuffers.pop_back();
     return obj;
@@ -141,14 +205,16 @@ void accountLiveBuffer(D3D12_HEAP_TYPE heapType, long long bytes);
 
 void recyclePooledBuffer(Dx12Object* obj) {
     UINT64 capacity = bufferCapacity(obj);
+    constexpr UINT64 allocationAlignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    const auto cost = static_cast<size_t>((capacity + allocationAlignment - 1) & ~(allocationAlignment - 1));
     // READBACK 堆缓冲**不进池**：它们基本是一次性读回（如 vanilla 每秒一次的 Screenshot buffer，1.6MB），
     // 复用要求尺寸完全一致、几乎从不命中；进池只会用一次性大块占满 96 MiB 上限。
-    const bool poolable = (obj->heapType != D3D12_HEAP_TYPE_READBACK);
+    const bool poolable = obj->poolable && obj->heapType != D3D12_HEAP_TYPE_READBACK && (obj->usage & 1024) == 0;
     if (poolable) {
         std::lock_guard<std::mutex> lk(gFreeBufferMutex);
-        if (gFreeBufferBytes + static_cast<size_t>(capacity) <= kMaxFreeBufferBytes) {
-            gFreeBuffers.push_back(PooledBuffer{obj});
-            gFreeBufferBytes += static_cast<size_t>(capacity);
+        if (cost <= kMaxFreeBufferBytes - gFreeBufferBytes) {
+            gFreeBuffers.push_back(PooledBuffer{obj, capacity, cost});
+            gFreeBufferBytes += cost;
             return;
         }
     }
@@ -409,12 +475,12 @@ void flushPendingDeletes(bool force) {
                static_cast<long long>(pendingDeletesCount()));
         return;
     }
+    reclaimRetiredCommandEncoders();
+    const double retireStart = nowMs();
     UINT64 gpuDone = UINT64_MAX;
     if (!force && gCtx.queueFence) {
         gpuDone = gCtx.queueFence->GetCompletedValue();
     }
-    const bool canResolveBlocked = (gOpenListCount == 0);
-    const UINT64 resolveFence = gCtx.queueFenceValue;
     std::vector<PendingDelete> local;
     {
         std::lock_guard<std::mutex> lk(gPendingMutex);
@@ -426,11 +492,8 @@ void flushPendingDeletes(bool force) {
                 continue;
             }
             if (pd.requiredFence == kFenceBlockedByOpenList) {
-                if (!canResolveBlocked) {
-                    keep.push_back(pd);
-                    continue;
-                }
-                pd.requiredFence = resolveFence;
+                keep.push_back(pd);
+                continue;
             }
             if (pd.requiredFence <= gpuDone) {
                 local.push_back(pd);
@@ -440,16 +503,28 @@ void flushPendingDeletes(bool force) {
         }
         gPendingDeletes.swap(keep);
     }
+    const double selectedAt = nowMs();
+    size_t bufferCount = 0;
+    double bufferMs = 0.0;
+    double slowestMs = 0.0;
+    int slowestKind = -1;
     gPdDeletingTotal = static_cast<long>(local.size());
     if (gPdDeletingTotal > 0) {
         dbgLogDebug("flushPendingDeletes: count=%ld deferred=%lld gpuDone=%llu", gPdDeletingTotal,
                     static_cast<long long>(pendingDeletesCount()), static_cast<unsigned long long>(gpuDone));
     }
-    long idx = 0;
+    size_t retiredCount = 0;
     for (const PendingDelete& pd : local) {
+        if (!force && retiredCount != 0 && (retiredCount >= 256 || nowMs() - selectedAt >= 2.0)) {
+            std::lock_guard lock(gPendingMutex);
+            gPendingDeletes.insert(gPendingDeletes.end(), local.begin() + retiredCount, local.end());
+            break;
+        }
         Dx12Object* o = pd.obj;
+        const double objectStart = nowMs();
+        const int objectKind = static_cast<int>(o->kind);
         gPdDeletingObj = o;
-        gPdDeletingIndex = idx++;
+        gPdDeletingIndex = static_cast<long>(retiredCount++);
         if (o->descSlot >= 0) {
             std::lock_guard<std::mutex> lk(gFreeSlotMutex);
             if (o->kind == Dx12Object::Kind::TextureView
@@ -461,6 +536,13 @@ void flushPendingDeletes(bool force) {
         }
         if (!force && o->kind == Dx12Object::Kind::Buffer) {
             recyclePooledBuffer(o);
+            ++bufferCount;
+            const double elapsed = nowMs() - objectStart;
+            bufferMs += elapsed;
+            if (elapsed > slowestMs) {
+                slowestMs = elapsed;
+                slowestKind = objectKind;
+            }
             continue;
         }
         if (o->kind == Dx12Object::Kind::Texture) --gLiveTex;
@@ -469,6 +551,22 @@ void flushPendingDeletes(bool force) {
             if (o->resource) accountLiveBuffer(o->heapType, -static_cast<long long>(o->resource->GetDesc().Width));
         }
         delete o;
+        const double elapsed = nowMs() - objectStart;
+        if (elapsed > slowestMs) {
+            slowestMs = elapsed;
+            slowestKind = objectKind;
+        }
+    }
+    const double elapsed = nowMs() - retireStart;
+    if (elapsed > 100.0) {
+        static uint64_t slowRetirements = 0;
+        const auto count = ++slowRetirements;
+        if (count <= 4 || (count & (count - 1)) == 0) {
+            dbgLogWarn("retire: %.1f ms, select=%.1f ms, objects=%zu", elapsed,
+                selectedAt - retireStart, retiredCount);
+            dbgLogWarn("retire: buffers=%zu in %.1f ms, max=%.1f ms kind=%d",
+                bufferCount, bufferMs, slowestMs, slowestKind);
+        }
     }
     gPdDeletingObj = nullptr;
     gPdDeletingIndex = -1;
@@ -2728,23 +2826,21 @@ mcdr::Result<void> ensureDevice() {
 
 void destroyDevice() {
     dbgLogProgress("destroyDevice stage: enter");
+    if (!completeDeviceQueueForShutdown()) {
+        dbgLogWarn("device: shutdown deferred");
+        return;
+    }
+    if (mcdr_dlss_prepare_shutdown() != 1) {
+        dbgLogWarn("dlss: shutdown deferred");
+        return;
+    }
     if (gCtx.queueFenceEvent) {
         CloseHandle(gCtx.queueFenceEvent);
         gCtx.queueFenceEvent = nullptr;
     }
-    if (gCtx.queue && gCtx.queueFence) {
-        UINT64 target = gCtx.queueFenceValue;
-        if (gCtx.queueFence->GetCompletedValue() < target) {
-            HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            if (evt) {
-                if (SUCCEEDED(gCtx.queueFence->SetEventOnCompletion(target, evt))) {
-                    WaitForSingleObject(evt, 1000);
-                }
-                CloseHandle(evt);
-            }
-        }
-    }
+    reclaimRetiredCommandEncoders(gCtx.queue.Get());
     dbgLogProgress("destroyDevice stage: queue fence wait done");
+    releaseRtFrames();
     flushPendingDeletes(/*force=*/true);
     dbgLogProgress("destroyDevice stage: pending deletes flushed");
     if (gDxilCompiled > 0 || gDxilCacheHits > 0) {
@@ -2929,7 +3025,7 @@ D3D12_RESOURCE_FLAGS textureFlags(int usage, int format) {
 // ---- 资源创建 ----
 
 mcdr::Result<void*> createTexture(int usage, int format, int width, int height, int depthOrLayers,
-                                  int mipLevels) {
+                                  int mipLevels, bool rtManaged) {
     if (auto d = ensureDevice(); !d) return mcdr::err("createTexture", errorMessage(d.error()));
 
     DXGI_FORMAT dxgi = toDxgiFormat(format);
@@ -2948,6 +3044,13 @@ mcdr::Result<void*> createTexture(int usage, int format, int width, int height, 
     desc.Format = typelessDepthFormat(dxgi);
     desc.SampleDesc.Count = 1;
     desc.Flags = textureFlags(usage, format);
+
+    std::shared_ptr<void> charge;
+    if (rtManaged) {
+        auto reserved = reserveRtFrameMemory(desc, false);
+        if (!reserved) return std::unexpected(reserved.error());
+        charge = std::move(*reserved);
+    }
 
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -2968,6 +3071,7 @@ mcdr::Result<void*> createTexture(int usage, int format, int width, int height, 
 
     auto obj = std::make_unique<Dx12Object>();
     obj->kind = Dx12Object::Kind::Texture;
+    obj->allocationCharge = std::move(charge);
     ++gLiveTex;
     obj->usage = usage;
     obj->size = static_cast<long long>(desc.Width) * desc.Height;
@@ -2997,13 +3101,14 @@ mcdr::Result<void*> createTexture(int usage, int format, int width, int height, 
     return static_cast<void*>(obj.release());
 }
 
-mcdr::Result<void*> createBuffer(int usage, long long size) {
+mcdr::Result<void*> createBuffer(int usage, long long size, bool exactCapacity, bool poolable, bool rtManaged) {
     if (auto d = ensureDevice(); !d) return mcdr::err("createBuffer", errorMessage(d.error()));
     if (size <= 0) {
         return mcdr::err("createBuffer", "createBuffer: buffer size must be positive");
     }
 
     D3D12_HEAP_TYPE heapType = pickBufferHeapType(usage);
+    if (rtManaged) poolable = false;
 
     // usage 位 1024（本工程内部约定）= 当 UAV 用（RWByteAddressBuffer），必须带 ALLOW_UNORDERED_ACCESS，且**不进池**：池键只有
     // (heapType, 容量)，复用到没这个标志的旧缓冲会让 CreateUnorderedAccessView 失败。不要用位 512：26.3 的
@@ -3012,8 +3117,8 @@ mcdr::Result<void*> createBuffer(int usage, long long size) {
 
     // 优先复用池中 (heapType, 容量) 完全匹配的空闲 buffer；池内对象均为 fence 已覆盖者，复用安全。
     const UINT64 alignedSize = (static_cast<UINT64>(size) + 255ULL) & ~255ULL;
-    if (!uavBuffer) {
-        if (Dx12Object* reused = takePooledBuffer(heapType, alignedSize)) {
+    if (!uavBuffer && poolable) {
+        if (Dx12Object* reused = takePooledBuffer(heapType, alignedSize, exactCapacity)) {
             reused->usage = usage;
             reused->size = size;
             reused->mappedPtr = nullptr;
@@ -3039,8 +3144,18 @@ mcdr::Result<void*> createBuffer(int usage, long long size) {
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
+    if (uavBuffer) desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    std::shared_ptr<void> charge;
+    if (rtManaged) {
+        auto reserved = reserveRtFrameMemory(desc, heapType != D3D12_HEAP_TYPE_DEFAULT);
+        if (!reserved) return std::unexpected(reserved.error());
+        charge = std::move(*reserved);
+    }
+
     auto obj = std::make_unique<Dx12Object>();
     obj->kind = Dx12Object::Kind::Buffer;
+    obj->allocationCharge = std::move(charge);
+    obj->poolable = poolable;
     ++gLiveBuf;
     accountLiveBuffer(heapType, static_cast<long long>(alignedSize));
     if (heapType == D3D12_HEAP_TYPE_READBACK) {
@@ -3051,7 +3166,6 @@ mcdr::Result<void*> createBuffer(int usage, long long size) {
     obj->size = size;
     obj->heapType = heapType;
     // UAV 缓冲必须显式带 ALLOW_UNORDERED_ACCESS，否则 CreateUnorderedAccessView 直接失败（缓冲默认 Flags = NONE）。
-    if (uavBuffer) desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     ++gStatBufCreate;
     HRESULT hr = gCtx.device->CreateCommittedResource(
         &heap, D3D12_HEAP_FLAG_NONE, &desc, initialStateFor(heapType), nullptr, IID_PPV_ARGS(&obj->resource));
@@ -3156,15 +3270,11 @@ bool accelList(CommandContext* ctx, const char* where, ComPtr<ID3D12GraphicsComm
     return true;
 }
 
-mcdr::Result<D3D12_GPU_VIRTUAL_ADDRESS> snapshotUploadBuffer(
-    CommandContext* ctx, Dx12Object* source, uint64_t offset, uint64_t bytes) {
-    if (!ctx || !ctx->listOpen || !source || source->kind != Dx12Object::Kind::Buffer ||
-        !source->resource || bytes == 0 || offset > static_cast<uint64_t>(source->size) ||
-        bytes > static_cast<uint64_t>(source->size) - offset) {
-        return mcdr::err("rt upload", "rt upload: invalid buffer range");
-    }
-    if (source->heapType != D3D12_HEAP_TYPE_UPLOAD) {
-        return source->resource->GetGPUVirtualAddress() + offset;
+}
+
+mcdr::Result<FrameUploadSlice> uploadFrameData(CommandContext* ctx, const void* data, uint64_t bytes) {
+    if (!ctx || !ctx->listOpen || !data || bytes == 0 || bytes > INT64_MAX - 255) {
+        return mcdr::err("rt upload", "rt upload: invalid data range");
     }
     constexpr uint64_t alignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
     constexpr uint64_t pageBytes = 64ull * 1024ull;
@@ -3177,6 +3287,10 @@ mcdr::Result<D3D12_GPU_VIRTUAL_ADDRESS> snapshotUploadBuffer(
     if (ctx->frameUploadPage == pages.size()) {
         FrameUploadPage page;
         page.capacity = std::max(pageBytes, alignedBytes);
+        page.buffer = std::make_unique<Dx12Object>();
+        page.buffer->heapType = D3D12_HEAP_TYPE_UPLOAD;
+        page.buffer->size = static_cast<int64_t>(page.capacity);
+        page.buffer->usage = 2 | 8 | 64 | 128;
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_UPLOAD;
         heap.CreationNodeMask = 1;
@@ -3190,15 +3304,30 @@ mcdr::Result<D3D12_GPU_VIRTUAL_ADDRESS> snapshotUploadBuffer(
         description.SampleDesc.Count = 1;
         description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         auto status = gCtx.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &description,
-            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&page.resource));
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&page.buffer->resource));
         if (FAILED(status)) return mcdr::err("rt upload", "rt upload: allocation failed");
         void* mapped = nullptr;
         const D3D12_RANGE emptyRange{};
-        status = page.resource->Map(0, &emptyRange, &mapped);
+        status = page.buffer->resource->Map(0, &emptyRange, &mapped);
         if (FAILED(status)) return mcdr::err("rt upload", "rt upload: page map failed");
-        page.mapped = static_cast<uint8_t*>(mapped);
+        page.buffer->mappedPtr = mapped;
         pages.push_back(std::move(page));
     }
+    auto& page = pages[ctx->frameUploadPage];
+    std::memcpy(static_cast<uint8_t*>(page.buffer->mappedPtr) + page.used, data, static_cast<size_t>(bytes));
+    const FrameUploadSlice slice{page.buffer.get(), page.used};
+    page.used += alignedBytes;
+    return slice;
+}
+
+mcdr::Result<FrameUploadSlice> snapshotUploadBufferSlice(
+    CommandContext* ctx, Dx12Object* source, uint64_t offset, uint64_t bytes) {
+    if (!ctx || !ctx->listOpen || !source || source->kind != Dx12Object::Kind::Buffer ||
+        !source->resource || bytes == 0 || offset > static_cast<uint64_t>(source->size) ||
+        bytes > static_cast<uint64_t>(source->size) - offset) {
+        return mcdr::err("rt upload", "rt upload: invalid buffer range");
+    }
+    if (source->heapType != D3D12_HEAP_TYPE_UPLOAD) return FrameUploadSlice{source, offset};
     void* sourceData = source->mappedPtr;
     const bool temporaryMap = sourceData == nullptr;
     if (temporaryMap) {
@@ -3207,16 +3336,21 @@ mcdr::Result<D3D12_GPU_VIRTUAL_ADDRESS> snapshotUploadBuffer(
             return mcdr::err("rt upload", "rt upload: source map failed");
         }
     }
-    auto& page = pages[ctx->frameUploadPage];
-    std::memcpy(page.mapped + page.used, static_cast<const uint8_t*>(sourceData) + offset,
-        static_cast<size_t>(bytes));
+    const auto slice = uploadFrameData(ctx, static_cast<const uint8_t*>(sourceData) + offset, bytes);
     if (temporaryMap) {
         const D3D12_RANGE emptyRange{};
         source->resource->Unmap(0, &emptyRange);
     }
-    const auto address = page.resource->GetGPUVirtualAddress() + page.used;
-    page.used += alignedBytes;
-    return address;
+    return slice;
+}
+
+namespace {
+
+mcdr::Result<D3D12_GPU_VIRTUAL_ADDRESS> snapshotUploadBuffer(
+    CommandContext* ctx, Dx12Object* source, uint64_t offset, uint64_t bytes) {
+    const auto slice = snapshotUploadBufferSlice(ctx, source, offset, bytes);
+    if (!slice) return std::unexpected(slice.error());
+    return slice->buffer->resource->GetGPUVirtualAddress() + slice->offset;
 }
 
 bool accelStorage(Dx12Object* obj, const char* where, const char* role, unsigned long long need,
@@ -3332,6 +3466,30 @@ mcdr::Result<void> getBlasPrebuildInfo(const mcdr_rt_geometry* geometries, int c
     return mcdr::ok();
 }
 
+mcdr::Result<void> getAabbBlasPrebuildInfo(unsigned long long* out) {
+    if (auto device = ensureDevice(); !device) return std::unexpected(device.error());
+    auto* device5 = accelDevice();
+    if (!device5 || !out) return mcdr::err("rt proxy", "rt proxy: prebuild unavailable");
+    D3D12_RAYTRACING_GEOMETRY_DESC geometry{};
+    geometry.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS;
+    geometry.AABBs.AABBCount = 1;
+    geometry.AABBs.AABBs.StrideInBytes = sizeof(D3D12_RAYTRACING_AABB);
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
+    inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    inputs.NumDescs = 1;
+    inputs.pGeometryDescs = &geometry;
+    inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
+    device5->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
+    if (info.ResultDataMaxSizeInBytes == 0 || info.ScratchDataSizeInBytes == 0) {
+        return mcdr::err("rt proxy", "rt proxy: empty prebuild result");
+    }
+    out[0] = info.ResultDataMaxSizeInBytes;
+    out[1] = info.ScratchDataSizeInBytes;
+    return {};
+}
+
 mcdr::Result<void> getTlasPrebuildInfo(int instanceCount, unsigned long long* out) {
     if (auto d = ensureDevice(); !d) {
         return mcdr::err("getTlasPrebuildInfo", errorMessage(d.error()));
@@ -3420,8 +3578,37 @@ mcdr::Result<void> buildBlas(CommandContext* ctx, Dx12Object* dest, Dx12Object* 
     return mcdr::ok();
 }
 
+mcdr::Result<void> buildAabbBlas(CommandContext* ctx, Dx12Object* dest, Dx12Object* scratch,
+    Dx12Object* aabbs) {
+    ComPtr<ID3D12GraphicsCommandList4> list;
+    if (!accelList(ctx, "rt proxy", list) ||
+        !accelStorage(dest, "rt proxy", "destination", 0) ||
+        !accelStorage(scratch, "rt proxy", "scratch", 0) ||
+        !accelStorage(aabbs, "rt proxy", "bounds", sizeof(D3D12_RAYTRACING_AABB))) {
+        return mcdr::err("rt proxy", "rt proxy: invalid build resources");
+    }
+    D3D12_RAYTRACING_GEOMETRY_DESC geometry{};
+    geometry.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS;
+    geometry.AABBs.AABBCount = 1;
+    geometry.AABBs.AABBs.StartAddress = aabbs->resource->GetGPUVirtualAddress();
+    geometry.AABBs.AABBs.StrideInBytes = sizeof(D3D12_RAYTRACING_AABB);
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC description{};
+    description.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    description.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    description.Inputs.NumDescs = 1;
+    description.Inputs.pGeometryDescs = &geometry;
+    description.Inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
+    description.DestAccelerationStructureData = dest->resource->GetGPUVirtualAddress();
+    description.ScratchAccelerationStructureData = scratch->resource->GetGPUVirtualAddress();
+    transitionBufferTo(ctx, aabbs, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transitionBufferTo(ctx, scratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    list->BuildRaytracingAccelerationStructure(&description, 0, nullptr);
+    accelBarrier(list.Get(), dest->resource.Get());
+    return {};
+}
+
 mcdr::Result<void> buildTlas(CommandContext* ctx, Dx12Object* dest, Dx12Object* scratch,
-                             Dx12Object* instances, int instanceCount) {
+                             Dx12Object* instances, int instanceCount, bool immutableInstances) {
     ComPtr<ID3D12GraphicsCommandList4> list4;
     if (!accelList(ctx, "buildTlas", list4)) {
         return mcdr::err("buildTlas", "buildTlas: no usable command list");
@@ -3436,8 +3623,9 @@ mcdr::Result<void> buildTlas(CommandContext* ctx, Dx12Object* dest, Dx12Object* 
     if (instanceCount <= 0) {
         return mcdr::err("buildTlas", "buildTlas: instance count must be positive");
     }
-    auto instanceSnapshot = snapshotUploadBuffer(ctx, instances, 0,
-        static_cast<uint64_t>(instanceCount) * sizeof(D3D12_RAYTRACING_INSTANCE_DESC));
+    auto instanceSnapshot = immutableInstances ? mcdr::Result<D3D12_GPU_VIRTUAL_ADDRESS>(
+        instances->resource->GetGPUVirtualAddress()) : snapshotUploadBuffer(ctx, instances, 0,
+            static_cast<uint64_t>(instanceCount) * sizeof(D3D12_RAYTRACING_INSTANCE_DESC));
     if (!instanceSnapshot) return std::unexpected(instanceSnapshot.error());
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc{};
     desc.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
@@ -3509,8 +3697,6 @@ mcdr::Result<void*> createAccelStructView(Dx12Object* accel) {
     obj->gpuHandle.ptr += static_cast<SIZE_T>(slot) * gCtx.srvInc;
     obj->descSlot = slot;
     obj->sourceTexture = accel;
-    dbgLogInfo("as: accel struct view slot=%d address=%llu", slot,
-               static_cast<unsigned long long>(srv.RaytracingAccelerationStructure.Location));
     return static_cast<void*>(obj.release());
 }
 
@@ -3632,6 +3818,30 @@ mcdr::Result<void*> createTextureView(Dx12Object* texture, int baseMipLevel, int
     return static_cast<void*>(obj.release());
 }
 
+mcdr::Result<void*> copyRtTextureView(Dx12Object* view, Dx12Object* retainedTexture) {
+    if (!view || view->kind != Dx12Object::Kind::TextureView || !view->cpuHandle.ptr ||
+        !retainedTexture || !retainedTexture->resource || !view->sourceTexture ||
+        view->sourceTexture->resource != retainedTexture->resource) {
+        return mcdr::err("rt capture", "rt capture: invalid texture view");
+    }
+    auto slot = allocSrvSlot();
+    if (!slot) return std::unexpected(slot.error());
+    auto retained = std::make_unique<Dx12Object>();
+    retained->kind = Dx12Object::Kind::TextureView;
+    retained->descSlot = *slot;
+    retained->sourceTexture = retainedTexture;
+    const auto offset = static_cast<SIZE_T>(*slot) * gCtx.srvInc;
+    retained->cpuHandle = gCtx.srvCpuHeap->GetCPUDescriptorHandleForHeapStart();
+    retained->cpuHandle.ptr += offset;
+    retained->gpuHandle = gCtx.srvHeap->GetGPUDescriptorHandleForHeapStart();
+    retained->gpuHandle.ptr += offset;
+    auto visible = gCtx.srvHeap->GetCPUDescriptorHandleForHeapStart();
+    visible.ptr += offset;
+    gCtx.device->CopyDescriptorsSimple(1, retained->cpuHandle, view->cpuHandle, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    gCtx.device->CopyDescriptorsSimple(1, visible, view->cpuHandle, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    return retained.release();
+}
+
 void destroyObject(Dx12Object* obj) {
     if (!obj) return;
     if (obj->mappedPtr) {
@@ -3655,6 +3865,25 @@ void destroyObject(Dx12Object* obj) {
         std::lock_guard<std::mutex> lk(gPendingMutex);
         gPendingDeletes.push_back(PendingDelete{obj, required});
     }
+}
+
+void destroyCompletedRtAccelerationObject(Dx12Object* object) {
+    if (!object) return;
+    if (object->kind == Dx12Object::Kind::Buffer) {
+        if (object->mappedPtr && object->resource) object->resource->Unmap(0, nullptr);
+        object->mappedPtr = nullptr;
+        recyclePooledBuffer(object);
+        return;
+    }
+    if (object->kind == Dx12Object::Kind::AccelStructView) {
+        const std::unique_ptr<Dx12Object> completed(object);
+        if (object->descSlot >= 0) {
+            const std::lock_guard lock(gFreeSlotMutex);
+            gFreeSrvSlots.push_back(static_cast<UINT>(object->descSlot));
+        }
+        return;
+    }
+    destroyObject(object);
 }
 
 // ---- Buffer 映射（对应官方 GpuBuffer.map：read 需 MAP_READ，write 需 MAP_WRITE）----
@@ -4136,9 +4365,12 @@ mcdr::Result<void> deviceWaitIdle() {
 }
 
 mcdr::Result<void*> createCommandEncoder() {
+    reclaimRetiredCommandEncoders();
     if (auto d = ensureDevice(); !d) return mcdr::err("createCommandEncoder", errorMessage(d.error()));
     DBG_LOG_DEBUG("createCommandEncoder: enter");
     auto ctx = std::make_unique<CommandContext>();
+    ctx->ownerDevice = gCtx.device;
+    ctx->ownerQueue = gCtx.queue;
     for (int i = 0; i < 3; ++i) {
         ++gStatEncoderCreate;
         if (FAILED(gCtx.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -4170,27 +4402,31 @@ mcdr::Result<void*> createCommandEncoder() {
 
 void destroyCommandEncoder(CommandContext* ctx) {
     if (!ctx) return;
-    DBG_LOG_DEBUG("destroyCommandEncoder: enter fenceValue=%llu", (unsigned long long)ctx->fenceValue);
-    // 该 ctx 可能仍有已提交未执行的命令；先等它完成再销毁 allocator，否则 GPU 用已释放的 allocator → DEVICE_REMOVED。
-    if (ctx->fenceValue > 0) {
-        auto w = waitForFenceValue(ctx, ctx->fenceValue, 5000000000ULL);
-        if (!w) {
-            dbgLogError("destroyCommandEncoder: wait FAILED: %s", errorMessage(w.error()).c_str());
+    for (const auto& recording : ctx->commandRecordings) {
+        if (recording && !recording->submitted) {
+            recording->cancelled = true;
+            notifyRtRecordingCancelled(recording.get());
+        } else if (recording && !recording->committed) {
+            recording->cancelled = true;
+            notifyRtRecordingCancelled(recording.get());
         }
     }
-    // ctx 仍处于打开（begin 后从未 submit）：命令从未进 GPU 队列，引用它的资源不再被引用，打开计数一并释放。
     if (ctx->listOpen) {
         ctx->listOpen = 0;
         if (gOpenListCount > 0) --gOpenListCount;
-        dbgLog("destroyCommandEncoder: openList now=%d", gOpenListCount.load());
-        if (gOpenListCount == 0) flushPendingDeletes();
     }
-    if (ctx->fenceEvent) CloseHandle(ctx->fenceEvent);
-    delete ctx;
-    dbgLogInfo("destroyCommandEncoder: done ctx=%p", reinterpret_cast<void*>(ctx));
+    RetiredCommandEncoder retired{std::unique_ptr<CommandContext>(ctx), ctx->ownerDevice, ctx->ownerQueue};
+    retired.completionRequested = ctx->prevFenceValue >= ctx->fenceValue;
+    {
+        const std::lock_guard lock(gRetiredCommandEncodersMutex);
+        gRetiredCommandEncoders.push_back(std::move(retired));
+    }
+    reclaimRetiredCommandEncoders();
+    if (gOpenListCount == 0) flushPendingDeletes();
 }
 
 mcdr::Result<void> beginCommandList(CommandContext* ctx) {
+    reclaimRetiredCommandEncoders();
     if (ctx != nullptr && !ctx->externalResources.empty()) {
         ++ctx->sdkViolations;
         return mcdr::err("beginCommandList", "SDK resources remain externally owned");
@@ -4424,9 +4660,27 @@ mcdr::Result<void> beginCommandListWithWait(CommandContext* ctx, UINT64 waitForV
         return mcdr::err("beginCommandListWithWait", "beginCommandListWithWait: list Reset " + hrText(hr));
     }
     dbgLogDebug("beginCommandListWithWait: list reset ok");
+    auto& recording = ctx->commandRecordings[ctx->currentListSlot];
+    if (recording && !recording->submitted) {
+        recording->cancelled = true;
+        notifyRtRecordingCancelled(recording.get());
+    } else if (recording && !recording->committed) {
+        recording->cancelled = true;
+        notifyRtRecordingCancelled(recording.get());
+    }
+    recording.reset();
     ctx->computeDescriptorPage = 0;
     ctx->nextComputeDescriptor = 0;
     ctx->frameUploadPage = 0;
+    ctx->currentPipeline = nullptr;
+    ctx->rtGBufferCapture.reset();
+    ctx->rtGBufferRetained[ctx->currentListSlot].clear();
+    ctx->rtGBufferProgramsRetained[ctx->currentListSlot].clear();
+    ctx->rtGeometryRetained[ctx->currentListSlot].clear();
+    ctx->rtGeometryUploadsRetained[ctx->currentListSlot].clear();
+    ctx->rtAccelerationRetained[ctx->currentListSlot].clear();
+    ctx->queryHeapsRetained[ctx->currentListSlot].clear();
+    ctx->querySnapshotsRetained[ctx->currentListSlot].clear();
     for (auto& page : ctx->frameUploadPages[ctx->currentListSlot]) page.used = 0;
     ctx->textureReadbackStaging[ctx->currentListSlot].clear();
     // Reset 之后列表就是 D3D12 默认的 1X1；只有 Java 侧的 scope（setShadingRateNow）才会把某一批绘制改粗。
@@ -4478,6 +4732,7 @@ mcdr::Result<void> endCommandList(CommandContext* ctx) {
         ++ctx->sdkViolations;
         return mcdr::err("endCommandList", "SDK resources remain externally owned");
     }
+    ctx->rtGBufferCapture.reset();
     // 采样纹理在本 list 内被 transition 到 SHADER_RESOURCE 后，列表结束必须回切 COMMON，以维持「列表结束一切资源
     // 回 COMMON」的约定。否则下一 list 按 COMMON 写 Before 状态，与 GPU 上遗留的 SHADER_RESOURCE 错配 → 每帧验证 ERROR。
     for (auto it = ctx->resourceState.begin(); it != ctx->resourceState.end();) {
@@ -4574,23 +4829,29 @@ mcdr::Result<UINT64> submitCommandList(CommandContext* ctx) {
         // 返回本 ctx 已 Signal 的最新值，且**不递增**：之前 createFence() 生成的 token 仍挂着，等下一次真正提交才完成。
         return ctx->fenceValue;
     }
+    const std::lock_guard<std::mutex> submitLock(gSubmitMutex);
     if (auto e = endCommandList(ctx); !e) {
         return mcdr::err("submitCommandList", errorMessage(e.error()));
     }
     // 整个「分配 fence 值 → ExecuteCommandLists → Signal → 记账」必须原子：见 gSubmitMutex 的注释。
-    const std::lock_guard<std::mutex> submitLock(gSubmitMutex);
     UINT64 value = ctx->fenceValue + 1;
     if ((value % 300ULL) == 1) {
         logMemoryClass(value);
     }
     DBG_LOG_DEBUG("submit: ExecuteCommandLists enter (v->%llu)", (unsigned long long)value);
     ID3D12CommandList* lists[] = {ctx->commandList};
+    const auto recording = ctx->commandRecordings[ctx->currentListSlot];
     gCtx.queue->ExecuteCommandLists(1, lists);
+    if (recording) recording->submitted = true;
     value = ++ctx->fenceValue;
     // 记录本槽位最后一次提交的 per-list fence，供 3 帧后的 beginCommandList 等它完成。
     ctx->slotFence[ctx->currentListSlot] = value;
     DBG_LOG_DEBUG("submit: executed, Signal v=%llu", (unsigned long long)value);
     if (FAILED(gCtx.queue->Signal(ctx->fence.Get(), value))) {
+        if (recording) {
+            recording->cancelled = true;
+            notifyRtRecordingCancelled(recording.get());
+        }
         return mcdr::err("submitCommandList", "submitCommandList: Signal failed");
     }
     // 全局队列 fence 只服务于 surface / present 记账，**不是** GpuFence token 的判据 —— 否则一次临时上传
@@ -4598,15 +4859,31 @@ mcdr::Result<UINT64> submitCommandList(CommandContext* ctx) {
     {
         UINT64 qv = ++gCtx.queueFenceValue;
         if (FAILED(gCtx.queue->Signal(gCtx.queueFence.Get(), qv))) {
+            if (recording) {
+                recording->cancelled = true;
+                notifyRtRecordingCancelled(recording.get());
+            }
             return mcdr::err("submitCommandList", "submitCommandList: Signal(queue) failed");
         }
         // 记录本次 submit 的 queue fence 值，供 beginCommandListWithWait 等待。
         ctx->lastSubmitQueueFence = qv;
         ctx->prevFenceValue = value;
+        {
+            std::lock_guard lock(gPendingMutex);
+            if (gOpenListCount == 0) {
+                for (auto& pending : gPendingDeletes) {
+                    if (pending.requiredFence == kFenceBlockedByOpenList) pending.requiredFence = qv;
+                }
+            }
+        }
         dbgLogDebug("submit: ctx=%p value=%llu qf=%llu lastQF=%llu",
                     reinterpret_cast<void*>(ctx), static_cast<unsigned long long>(value),
                     static_cast<unsigned long long>(gCtx.queueFenceValue),
                     static_cast<unsigned long long>(ctx->lastSubmitQueueFence));
+    }
+    if (recording) {
+        recording->committed = true;
+        notifyRtRecordingCommitted(recording.get());
     }
     // 记录 per-backbuffer fence 值，供 acquireSurface 按需同步（非阻塞）。
     Dx12Surface* s = getActiveSurface();
@@ -5359,6 +5636,7 @@ mcdr::Result<void> beginRenderPass(CommandContext* ctx, Dx12Object* const* color
     D3D12_RECT scissor{x, y, x + w, y + h};
     ctx->commandList->RSSetScissorRects(1, &scissor);
     ctx->inRenderPass = 1;
+    ++ctx->renderPassSerial;
     // 确认渲染 pass 绑定的附件（blit 源纹理应出现在 color[0]）。降级为 DBG_LOG_DEBUG：数千次 pass 调用会拖死主线程。
     DBG_LOG_DEBUG("beginRenderPass: ctx=%p colorCount=%d area=%d,%d %dx%d depth=%s", (void*)ctx, colorCount,
                   x, y, w, h, depthView ? "yes" : "no");
@@ -5417,6 +5695,24 @@ mcdr::Result<void> endRenderPass(CommandContext* ctx) {
 
 // ---- Timestamp query pool ----
 
+bool CommandRecording::available(CommandContext* encoder) const {
+    if (cancelled || !fence || !encoder || !encoder->listOpen) return false;
+    const auto completed = fence->GetCompletedValue();
+    if (completed == UINT64_MAX) return false;
+    if (!submitted) return encoder->commandRecordings[encoder->currentListSlot].get() == this;
+    return fence == encoder->fence || completed >= fenceValue;
+}
+
+std::shared_ptr<CommandRecording> currentCommandRecording(CommandContext* ctx) {
+    auto& recording = ctx->commandRecordings[ctx->currentListSlot];
+    if (!recording) {
+        recording = std::make_shared<CommandRecording>();
+        recording->fence = ctx->fence;
+        recording->fenceValue = ctx->fenceValue + 1;
+    }
+    return recording;
+}
+
 mcdr::Result<void*> createQueryPool(int size) {
     if (auto d = ensureDevice(); !d) return mcdr::err("createQueryPool", errorMessage(d.error()));
     if (size <= 0) {
@@ -5430,19 +5726,36 @@ mcdr::Result<void*> createQueryPool(int size) {
         return mcdr::err("createQueryPool", "createQueryPool: CreateQueryHeap failed");
     }
     pool->size = size;
+    pool->producers.resize(static_cast<size_t>(size));
     return static_cast<void*>(pool.release());
 }
 
 void destroyQueryPool(QueryPool* pool) { delete pool; }
 
 mcdr::Result<void> writeTimestampToPool(CommandContext* ctx, QueryPool* pool, int index) {
-    if (!ctx || !ctx->listOpen) {
+    if (!ctx || !ctx->listOpen || !ctx->commandList || !ctx->fence) {
         return mcdr::err("writeTimestampToPool", "writeTimestampToPool: no open command list");
     }
     if (!pool || index < 0 || index >= pool->size) {
         return mcdr::err("writeTimestampToPool", "writeTimestampToPool: invalid index");
     }
+    if (pool->pending && pool->pending->recording->cancelled) {
+        pool->pending.reset();
+    }
+    if (pool->pending && index >= pool->pending->start &&
+            index < pool->pending->start + pool->pending->count) {
+        const auto& recording = *pool->pending->recording;
+        if (!recording.available(ctx)) {
+            return mcdr::err("query snapshot", "query snapshot: foreign resolve pending");
+        }
+    }
+    const auto recording = currentCommandRecording(ctx);
+    auto& retained = ctx->queryHeapsRetained[ctx->currentListSlot];
+    if (std::ranges::none_of(retained, [pool](const auto& heap) { return heap == pool->heap; })) {
+        retained.push_back(pool->heap);
+    }
     ctx->commandList->EndQuery(pool->heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(index));
+    pool->producers[static_cast<size_t>(index)] = recording;
     return {};
 }
 
@@ -5452,6 +5765,73 @@ mcdr::Result<void> readQueryValue(QueryPool* pool, int index, long long& out) {
 
 mcdr::Result<void> readQueryValues(QueryPool* pool, int start, int count, long long* out) {
     return resolveQuery(pool, start, count, out);
+}
+
+mcdr::Result<void> queueQueryValues(CommandContext* ctx, QueryPool* pool, int start, int count) {
+    if (!ctx || !ctx->listOpen || !ctx->commandList || ctx->inRenderPass || !ctx->fence) {
+        return mcdr::err("query snapshot", "query snapshot: open list required");
+    }
+    if (!pool || start < 0 || count <= 0 || start >= pool->size || count > pool->size - start) {
+        return mcdr::err("query snapshot", "query snapshot: invalid range");
+    }
+    if (pool->pending && pool->pending->recording->cancelled) pool->pending.reset();
+    if (pool->pending) return mcdr::err("query snapshot", "query snapshot: read pending");
+    for (int index = start; index < start + count; ++index) {
+        const auto& producer = pool->producers[static_cast<size_t>(index)];
+        if (!producer || producer->cancelled) return mcdr::err("query snapshot", "query snapshot: timestamp unavailable");
+        if (!producer->available(ctx)) {
+            return mcdr::err("query snapshot", "query snapshot: producer pending");
+        }
+    }
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = static_cast<uint64_t>(count) * sizeof(long long);
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    auto snapshot = std::make_shared<QuerySnapshot>();
+    if (FAILED(gCtx.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&snapshot->readback)))) {
+        return mcdr::err("query snapshot", "query snapshot: allocation failed");
+    }
+    snapshot->heap = pool->heap;
+    snapshot->recording = currentCommandRecording(ctx);
+    snapshot->start = start;
+    snapshot->count = count;
+    ctx->querySnapshotsRetained[ctx->currentListSlot].push_back(snapshot);
+    ctx->commandList->ResolveQueryData(pool->heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+        static_cast<UINT>(start), static_cast<UINT>(count), snapshot->readback.Get(), 0);
+    pool->pending = std::move(snapshot);
+    return {};
+}
+
+mcdr::Result<bool> tryReadQueryValues(QueryPool* pool, int start, int count, long long* out) {
+    if (!pool || !pool->pending || !out || start != pool->pending->start || count != pool->pending->count) {
+        return mcdr::err("query snapshot", "query snapshot: request mismatch");
+    }
+    const auto& snapshot = *pool->pending;
+    if (snapshot.recording->cancelled) {
+        pool->pending.reset();
+        return mcdr::err("query snapshot", "query snapshot: recording cancelled");
+    }
+    const auto completed = snapshot.recording->fence->GetCompletedValue();
+    if (completed == UINT64_MAX) return mcdr::err("query snapshot", "query snapshot: device removed");
+    if (!snapshot.recording->submitted || completed < snapshot.recording->fenceValue) return false;
+    const auto bytes = static_cast<SIZE_T>(count) * sizeof(long long);
+    D3D12_RANGE range{0, bytes};
+    void* mapped = nullptr;
+    if (FAILED(snapshot.readback->Map(0, &range, &mapped))) {
+        return mcdr::err("query snapshot", "query snapshot: map failed");
+    }
+    std::memcpy(out, mapped, bytes);
+    D3D12_RANGE written{0, 0};
+    snapshot.readback->Unmap(0, &written);
+    pool->pending.reset();
+    return true;
 }
 
 unsigned long long getTimestampFrequency() { return gCtx.timestampFrequency; }
@@ -6116,7 +6496,7 @@ int dispatchComputeEx(CommandContext* ctx, Dx12Object* pipeline, Dx12Object* con
 
 int nrdDenoise(CommandContext* ctx, Dx12Object* const* textures, int32_t textureCount,
                const float* matrices, uint32_t frameIndex, uint32_t resetHistory, char* outText,
-               int32_t capacity, const float* jitter) {
+               int32_t capacity, const float* jitter, const void* dependencyData) {
     if (outText != nullptr && capacity > 0) {
         outText[0] = '\0';
     }
@@ -6124,13 +6504,63 @@ int nrdDenoise(CommandContext* ctx, Dx12Object* const* textures, int32_t texture
         dbgLogError("nrdDenoise: called without an open command list");
         return -2;
     }
-    if (textures == nullptr || textureCount != 7 || matrices == nullptr) {
-        dbgLogError("nrdDenoise: expects 7 textures and 4 matrices");
+    if (textures == nullptr || textureCount < 7 || textureCount > 11 || matrices == nullptr) {
+        dbgLogError("nrd: invalid inputs");
         return 0;
     }
     if (jitter != nullptr) {
         for (int32_t index = 0; index < 4; ++index) {
             if (!std::isfinite(jitter[index]) || std::abs(jitter[index]) > 0.5f) return 0;
+        }
+    }
+    McdrNrdDependencies dependencies{};
+    Dx12Object* dependencyPaths = nullptr;
+    if (dependencyData) {
+        dependencies = *static_cast<const McdrNrdDependencies*>(dependencyData);
+        dependencyPaths = static_cast<Dx12Object*>(dependencies.paths);
+        auto* changes = static_cast<Dx12Object*>(dependencies.changes);
+        if (!dependencyPaths || !changes || dependencyPaths->kind != Dx12Object::Kind::Buffer ||
+            changes->kind != Dx12Object::Kind::Buffer || !dependencyPaths->resource || !changes->resource ||
+            ctx->externalResources.contains(dependencyPaths->resource.Get()) ||
+            ctx->externalResources.contains(changes->resource.Get())) return 0;
+        dependencies.paths = dependencyPaths->resource.Get();
+        dependencies.changes = changes->resource.Get();
+    }
+    if (textureCount >= 8) {
+        for (const auto index : {2, 7}) {
+            const auto* depth = textures[index];
+            if (!depth || depth->kind != Dx12Object::Kind::Texture || !depth->resource) return 0;
+            const auto description = depth->resource->GetDesc();
+            if (description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                description.Format != DXGI_FORMAT_R32_FLOAT || description.MipLevels != 1 ||
+                description.DepthOrArraySize != 1 || description.SampleDesc.Count != 1 ||
+                (description.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0) return 0;
+        }
+        const auto diffuseDepth = textures[2]->resource->GetDesc();
+        const auto specularDepth = textures[7]->resource->GetDesc();
+        if (diffuseDepth.Width != specularDepth.Width || diffuseDepth.Height != specularDepth.Height) return 0;
+        if (textureCount >= 10) {
+            for (const auto index : {8, 9}) {
+                const auto* confidence = textures[index];
+                if (!confidence || confidence->kind != Dx12Object::Kind::Texture || !confidence->resource) return 0;
+                const auto description = confidence->resource->GetDesc();
+                if (description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                    (description.Format != DXGI_FORMAT_R8_UNORM && description.Format != DXGI_FORMAT_R16_FLOAT &&
+                        description.Format != DXGI_FORMAT_R32_FLOAT) ||
+                    description.Width != diffuseDepth.Width || description.Height != diffuseDepth.Height ||
+                    description.MipLevels != 1 || description.DepthOrArraySize != 1 || description.SampleDesc.Count != 1 ||
+                    (description.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0) return 0;
+            }
+        }
+        if (textureCount == 9 || textureCount == 11) {
+            const auto* rejection = textures[textureCount - 1];
+            if (!rejection || rejection->kind != Dx12Object::Kind::Texture || !rejection->resource) return 0;
+            const auto description = rejection->resource->GetDesc();
+            if (description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                (description.Format != DXGI_FORMAT_R8_UINT && description.Format != DXGI_FORMAT_R32_UINT) ||
+                description.Width != diffuseDepth.Width || description.Height != diffuseDepth.Height ||
+                description.MipLevels != 1 || description.DepthOrArraySize != 1 || description.SampleDesc.Count != 1 ||
+                (description.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0) return 0;
         }
     }
     std::vector<SdkResourceAccess> accesses;
@@ -6145,6 +6575,13 @@ int nrdDenoise(CommandContext* ctx, Dx12Object* const* textures, int32_t texture
     frame.list = ctx->commandList;
     frame.completionFence = ctx->fence.Get();
     frame.completionValue = ctx->fenceValue + 1;
+    frame.recording = currentCommandRecording(ctx);
+    frame.recordingState = [](const void* producer) {
+        const auto& recording = *static_cast<const CommandRecording*>(producer);
+        if (recording.cancelled && recording.submitted) return McdrNrdRecordingState::SubmissionFailed;
+        return recording.cancelled ? McdrNrdRecordingState::Cancelled :
+            recording.submitted ? McdrNrdRecordingState::Submitted : McdrNrdRecordingState::Pending;
+    };
     frame.motion = textures[0]->resource.Get();
     frame.normalRoughness = textures[1]->resource.Get();
     frame.viewZ = textures[2]->resource.Get();
@@ -6152,6 +6589,19 @@ int nrdDenoise(CommandContext* ctx, Dx12Object* const* textures, int32_t texture
     frame.radianceOut = textures[4]->resource.Get();
     frame.specularIn = textures[5]->resource.Get();
     frame.specularOut = textures[6]->resource.Get();
+    frame.specularViewZ = textureCount >= 8 ? textures[7]->resource.Get() : nullptr;
+    frame.diffuseConfidence = textureCount >= 10 ? textures[8]->resource.Get() : nullptr;
+    frame.specularConfidence = textureCount >= 10 ? textures[9]->resource.Get() : nullptr;
+    frame.historyRejection = textureCount == 9 || textureCount == 11 ? textures[textureCount - 1]->resource.Get() : nullptr;
+    frame.createHistoryRejectionPipeline = [](const char* source, void* rootSignature, void** output) {
+        std::vector<uint8_t> bytecode;
+        if (!compileHlslToDxil(source, "RejectHistory", "cs_6_9", bytecode)) return false;
+        D3D12_COMPUTE_PIPELINE_STATE_DESC description{};
+        description.pRootSignature = static_cast<ID3D12RootSignature*>(rootSignature);
+        description.CS = {bytecode.data(), bytecode.size()};
+        return SUCCEEDED(gCtx.device->CreateComputePipelineState(&description,
+            __uuidof(ID3D12PipelineState), output));
+    };
     for (int i = 0; i < 16; ++i) {
         frame.viewToClip[i] = matrices[i];
         frame.viewToClipPrev[i] = matrices[16 + i];
@@ -6160,6 +6610,10 @@ int nrdDenoise(CommandContext* ctx, Dx12Object* const* textures, int32_t texture
     }
     frame.frameIndex = frameIndex;
     frame.resetHistory = resetHistory;
+    if (dependencyData) {
+        transitionBufferTo(ctx, dependencyPaths, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        frame.dependencies = &dependencies;
+    }
     if (jitter != nullptr) {
         frame.cameraJitter[0] = jitter[0];
         frame.cameraJitter[1] = jitter[1];
@@ -6167,6 +6621,7 @@ int nrdDenoise(CommandContext* ctx, Dx12Object* const* textures, int32_t texture
         frame.cameraJitterPrev[1] = jitter[3];
     }
     const int32_t result = mcdr_nrd_dispatch(&frame, outText, capacity);
+    if (dependencyData) transitionBufferTo(ctx, dependencyPaths, D3D12_RESOURCE_STATE_COMMON);
     resources.reclaim();
     return result;
 }
@@ -6209,6 +6664,21 @@ static bool validRtExposureInputs(CommandContext* ctx, Dx12Object* const* textur
     return true;
 }
 
+static mcdr_dlssd_frame rtFeatureFrame(CommandContext* ctx) {
+    mcdr_dlssd_frame frame{};
+    frame.list = ctx->commandList;
+    frame.completionFence = ctx->fence.Get();
+    frame.completionValue = ctx->fenceValue + 1;
+    frame.recording = currentCommandRecording(ctx);
+    frame.recordingState = [](const void* producer) {
+        const auto& recording = *static_cast<const CommandRecording*>(producer);
+        if (recording.cancelled && recording.submitted) return McdrDlssRecordingState::SubmissionFailed;
+        return recording.cancelled ? McdrDlssRecordingState::Cancelled :
+            recording.submitted ? McdrDlssRecordingState::Submitted : McdrDlssRecordingState::Pending;
+    };
+    return frame;
+}
+
 int rtSrEval(CommandContext* ctx, Dx12Object* const* textures, int32_t textureCount,
              uint32_t width, uint32_t height, uint32_t outputWidth, uint32_t outputHeight,
              uint32_t frameIndex, int32_t reset, const float* constants, char* outText,
@@ -6219,8 +6689,8 @@ int rtSrEval(CommandContext* ctx, Dx12Object* const* textures, int32_t textureCo
         height == 0u || outputWidth == 0u || outputHeight == 0u) return 0;
     if (!validRtExposureInputs(ctx, textures, textureCount, 4, width, height,
                                outputWidth, outputHeight, exposure)) return 0;
-    if (mcdr_rt_prepare_exposure(0, textureCount == 5, ctx->fence.Get(), ctx->fenceValue + 1,
-                                 outText, capacity) <= 0) return 0;
+    auto frame = rtFeatureFrame(ctx);
+    if (mcdr_rt_prepare_exposure(0, textureCount == 5, &frame, outText, capacity) <= 0) return 0;
     std::vector<SdkResourceAccess> accesses;
     for (int32_t index = 0; index < textureCount; ++index) {
         accesses.push_back({textures[index], index == 1 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
@@ -6229,15 +6699,11 @@ int rtSrEval(CommandContext* ctx, Dx12Object* const* textures, int32_t textureCo
     }
     SdkResourceScope resources(ctx, SdkResourceOwner::DlssSr, std::move(accesses));
     if (!resources) return 0;
-    mcdr_dlssd_frame frame{};
-    frame.list = ctx->commandList;
     frame.radiance = textures[0]->resource.Get();
     frame.output = textures[1]->resource.Get();
     frame.depth = textures[2]->resource.Get();
     frame.motion = textures[3]->resource.Get();
     frame.exposure = textureCount == 5 ? textures[4]->resource.Get() : nullptr;
-    frame.completionFence = ctx->fence.Get();
-    frame.completionValue = ctx->fenceValue + 1;
     if (exposure != nullptr) {
         frame.preExposure = exposure[0];
         frame.exposureScale = exposure[1];
@@ -6275,8 +6741,8 @@ int dlssdEval(CommandContext* ctx, Dx12Object* const* textures, int32_t textureC
     }
     if (!validRtExposureInputs(ctx, textures, textureCount, 8, width, height,
                                outputWidth, outputHeight, exposure)) return 0;
-    if (mcdr_rt_prepare_exposure(1, textureCount == 9, ctx->fence.Get(), ctx->fenceValue + 1,
-                                 outText, capacity) <= 0) return 0;
+    auto frame = rtFeatureFrame(ctx);
+    if (mcdr_rt_prepare_exposure(1, textureCount == 9, &frame, outText, capacity) <= 0) return 0;
     std::vector<SdkResourceAccess> accesses;
     for (int32_t index = 0; index < textureCount; ++index) {
         accesses.push_back({textures[index], index == 1 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
@@ -6285,8 +6751,6 @@ int dlssdEval(CommandContext* ctx, Dx12Object* const* textures, int32_t textureC
     }
     SdkResourceScope resources(ctx, SdkResourceOwner::RayReconstruction, std::move(accesses));
     if (!resources) return 0;
-    mcdr_dlssd_frame frame{};
-    frame.list = ctx->commandList;
     frame.radiance = textures[0]->resource.Get();
     frame.output = textures[1]->resource.Get();
     frame.depth = textures[2]->resource.Get();
@@ -6296,8 +6760,6 @@ int dlssdEval(CommandContext* ctx, Dx12Object* const* textures, int32_t textureC
     frame.specularAlbedo = textures[6]->resource.Get();
     frame.specularHitDistance = textures[7]->resource.Get();
     frame.exposure = textureCount == 9 ? textures[8]->resource.Get() : nullptr;
-    frame.completionFence = ctx->fence.Get();
-    frame.completionValue = ctx->fenceValue + 1;
     if (exposure != nullptr) {
         frame.preExposure = exposure[0];
         frame.exposureScale = exposure[1];
@@ -6503,6 +6965,107 @@ mcdr::Result<void*> createRaytracingPipeline(const void* dxilLib, int64_t dxilSi
                static_cast<void*>(obj.get()), static_cast<long long>(dxilSize), groupCount, srvCount,
                uavCount, maxRecursion);
     return static_cast<void*>(obj.release());
+}
+
+mcdr::Result<void*> createWorkGraphPipeline(const void* dxil, int64_t bytes,
+    int32_t srvCount, int32_t uavCount) {
+    if (auto ready = ensureDevice(); !ready) return std::unexpected(ready.error());
+    if (!dxil || bytes <= 0 || srvCount < 0 || srvCount > 16 || uavCount < 0 || uavCount > 16 ||
+        srvCount + uavCount == 0) return mcdr::err("rt WG", "rt WG: invalid program");
+    D3D12_FEATURE_DATA_D3D12_OPTIONS21 options{};
+    if (FAILED(gCtx.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS21, &options, sizeof(options))) ||
+        options.WorkGraphsTier == D3D12_WORK_GRAPHS_TIER_NOT_SUPPORTED) {
+        return mcdr::err("rt WG", "rt WG: work graphs unavailable");
+    }
+    auto* device = accelDevice();
+    if (!device) return mcdr::err("rt WG", "rt WG: ray queries unavailable");
+    auto object = std::make_unique<Dx12Object>();
+    object->kind = Dx12Object::Kind::WorkGraphPipeline;
+    object->size = bytes;
+    if (!makeRtRootSignature(srvCount, uavCount, &object->computeRootSignature)) {
+        return mcdr::err("rt WG", "rt WG: root signature unavailable");
+    }
+    D3D12_DXIL_LIBRARY_DESC library{};
+    library.DXILLibrary = {dxil, static_cast<SIZE_T>(bytes)};
+    D3D12_GLOBAL_ROOT_SIGNATURE root{object->computeRootSignature.Get()};
+    D3D12_WORK_GRAPH_DESC graph{};
+    graph.ProgramName = L"RtGraph";
+    graph.Flags = D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES;
+    const std::array<D3D12_STATE_SUBOBJECT, 3> subobjects{{
+        {D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &library},
+        {D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &root},
+        {D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH, &graph},
+    }};
+    const D3D12_STATE_OBJECT_DESC description{D3D12_STATE_OBJECT_TYPE_EXECUTABLE,
+        static_cast<UINT>(subobjects.size()), subobjects.data()};
+    const auto result = device->CreateStateObject(&description, IID_PPV_ARGS(&object->stateObject));
+    if (FAILED(result)) return mcdr::err("rt WG", "rt WG: state object failed (" + hrText(result) + ")");
+    ComPtr<ID3D12StateObjectProperties1> program;
+    ComPtr<ID3D12WorkGraphProperties> properties;
+    if (FAILED(object->stateObject.As(&program)) || FAILED(object->stateObject.As(&properties))) {
+        return mcdr::err("rt WG", "rt WG: graph properties unavailable");
+    }
+    object->workGraphProgram = program->GetProgramIdentifier(graph.ProgramName);
+    if (std::ranges::all_of(object->workGraphProgram.OpaqueData, [](const auto value) { return value == 0; })) {
+        return mcdr::err("rt WG", "rt WG: program identifier unavailable");
+    }
+    const auto index = properties->GetWorkGraphIndex(graph.ProgramName);
+    if (index == UINT_MAX || properties->GetNumNodes(index) == 0 || properties->GetNumEntrypoints(index) != 1) {
+        return mcdr::err("rt WG", "rt WG: invalid graph entries");
+    }
+    object->workGraphEntrypoint = properties->GetEntrypointIndex(index, {L"RtWgPrimary", 0});
+    if (object->workGraphEntrypoint == UINT_MAX ||
+        properties->GetEntrypointRecordSizeInBytes(index, object->workGraphEntrypoint) != 12) {
+        return mcdr::err("rt WG", "rt WG: invalid entry record");
+    }
+    D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS memory{};
+    properties->GetWorkGraphMemoryRequirements(index, &memory);
+    const uint64_t granularity = std::max(uint64_t{1}, uint64_t{memory.SizeGranularityInBytes});
+    if (memory.MinSizeInBytes > memory.MaxSizeInBytes || memory.MaxSizeInBytes > INT64_MAX - granularity) {
+        return mcdr::err("rt WG", "rt WG: invalid backing memory");
+    }
+    object->workGraphMemoryBytes = (memory.MaxSizeInBytes + granularity - 1) / granularity * granularity;
+    dbgLogDebug("rt WG: nodes=%u backing=%llu", properties->GetNumNodes(index),
+        static_cast<unsigned long long>(object->workGraphMemoryBytes));
+    return static_cast<void*>(object.release());
+}
+
+int dispatchWorkGraph(CommandContext* ctx, Dx12Object* pipeline, Dx12Object* backing, bool initialize,
+    Dx12Object* const* srvs, int32_t srvCount, Dx12Object* const* uavs, int32_t uavCount,
+    const int32_t* constants, int32_t constantCount, Dx12Object* cbv, int32_t width, int32_t height) {
+    if (!ctx || !ctx->listOpen || !ctx->commandList || ctx->inRenderPass || !pipeline ||
+        pipeline->kind != Dx12Object::Kind::WorkGraphPipeline || !pipeline->stateObject ||
+        !pipeline->computeRootSignature || width <= 0 || height <= 0 || width > 16384 || height > 16384 ||
+        srvCount < 0 || srvCount > 16 || uavCount < 0 || uavCount > 16 ||
+        (srvCount > 0 && !srvs) || (uavCount > 0 && !uavs) ||
+        constantCount < 0 || constantCount > 8 || (constantCount > 0 && !constants)) return 0;
+    if (pipeline->workGraphMemoryBytes != 0 && (!backing || !backing->resource ||
+        backing->kind != Dx12Object::Kind::Buffer || (backing->usage & 1024) == 0 ||
+        backing->heapType != D3D12_HEAP_TYPE_DEFAULT ||
+        static_cast<uint64_t>(backing->size) < pipeline->workGraphMemoryBytes)) return 0;
+    ComPtr<ID3D12GraphicsCommandList10> list;
+    if (FAILED(ctx->commandList->QueryInterface(IID_PPV_ARGS(&list)))) return 0;
+    if (!bindComputeStyle(ctx, list.Get(), pipeline->computeRootSignature.Get(), srvs, srvCount,
+            uavs, uavCount, constants, constantCount, cbv, 0, true)) return 0;
+    if (backing) transitionTextureTo(ctx, backing, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_SET_PROGRAM_DESC program{};
+    program.Type = D3D12_PROGRAM_TYPE_WORK_GRAPH;
+    program.WorkGraph.ProgramIdentifier = pipeline->workGraphProgram;
+    program.WorkGraph.Flags = initialize ? D3D12_SET_WORK_GRAPH_FLAG_INITIALIZE : D3D12_SET_WORK_GRAPH_FLAG_NONE;
+    if (backing) program.WorkGraph.BackingMemory = {
+        backing->resource->GetGPUVirtualAddress(), pipeline->workGraphMemoryBytes};
+    list->SetProgram(&program);
+    const std::array<uint32_t, 3> record{static_cast<uint32_t>((width + 7) / 8),
+        static_cast<uint32_t>((height + 7) / 8), 1};
+    D3D12_DISPATCH_GRAPH_DESC dispatch{};
+    dispatch.Mode = D3D12_DISPATCH_MODE_NODE_CPU_INPUT;
+    dispatch.NodeCPUInput = {pipeline->workGraphEntrypoint, 1, record.data(), sizeof(record)};
+    list->DispatchGraph(&dispatch);
+    if (backing) transitionTextureTo(ctx, backing, D3D12_RESOURCE_STATE_COMMON);
+    for (int32_t index = 0; index < uavCount; ++index) transitionTextureTo(ctx, uavs[index], D3D12_RESOURCE_STATE_COMMON);
+    for (int32_t index = 0; index < srvCount; ++index) transitionTextureTo(ctx, srvs[index], D3D12_RESOURCE_STATE_COMMON);
+    restoreDrawHeap(ctx);
+    return 1;
 }
 
 int32_t getShaderIdentifier(Dx12Object* pipeline, const char* exportName, void* out32) {
@@ -7520,6 +8083,10 @@ namespace {
 void writeRawBufferSRV(const D3D12_CPU_DESCRIPTOR_HANDLE& dst, Dx12Object* buf, long long offset,
                        long long length);
 
+}
+
+bool hasDrawDescriptorCapacity(const CommandContext* ctx, uint64_t count) {
+    return ctx && ctx->nextDrawSlot <= syncRingCapacity() && count <= syncRingCapacity() - ctx->nextDrawSlot;
 }
 
 mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindings) {
@@ -10341,6 +10908,7 @@ void destroyDlssTexture(CommandContext* ctx, void* object) {
 }
 
 bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
+    mcdr_dlss_invalidate_output();
     // 闸门是**独立的 DLSS 开关**，不看 aaMode。两者都开时 SMAA 三趟先跑（同一张低分辨率世界层），再由 DLSS 升采样。
     if (!gCtx.dlssEnabled) {
         return false;  // 开关关着：一个动作都没有
@@ -10374,7 +10942,6 @@ bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
             return false;
         }
     }
-    if (ctx->inRenderPass && !endRenderPass(ctx)) return false;
     wireDlssImpl();
     auto unwrapResource = [](mcdr_object* handle) -> void* {
         auto* obj = reinterpret_cast<Dx12Object*>(handle);
@@ -10412,7 +10979,10 @@ bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
         }
         mcdr_dlss_set_output_texture(overrideRaw);
     }
-    const int32_t created = mcdr_dlss_create(reinterpret_cast<void*>(ctx->commandList), &resolved,
+    const auto frame = rtFeatureFrame(ctx);
+    if (mcdr_dlss_prepare(&frame, &resolved) != 1) return false;
+    if (ctx->inRenderPass && !endRenderPass(ctx)) return false;
+    const int32_t created = mcdr_dlss_create(&frame, &resolved,
                                              tl, ctx);
     restoreDrawHeap(ctx);
     ctx->cachedPso = nullptr;
@@ -10433,9 +11003,12 @@ bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
             return *scope ? scope.release() : nullptr;
         },
         [](void* scope) { std::unique_ptr<SdkResourceScope> resources(static_cast<SdkResourceScope*>(scope)); }};
-    const int32_t evaluated = mcdr_dlss_evaluate(reinterpret_cast<void*>(ctx->commandList), &resolved,
+    const auto acquiredBefore = ctx->sdkAcquired;
+    const int32_t evaluated = mcdr_dlss_evaluate(&frame, &resolved,
                                                 tl, ctx, &resourceOps);
-    transitionTextureTo(ctx, reinterpret_cast<Dx12Object*>(in.pInOutput), D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (evaluated == 1 || ctx->sdkAcquired != acquiredBefore) {
+        transitionTextureTo(ctx, reinterpret_cast<Dx12Object*>(in.pInOutput), D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
     restoreDrawHeap(ctx);
     ctx->cachedPso = nullptr;
     if (evaluated != 1) {
@@ -11198,6 +11771,10 @@ HANDLE gEvtSubmitDone = nullptr;  // 渲染线程→主线程：命令已提交�
 // 渲染线程正在处理一帧（从取到 ctx 起，到此帧 Present 收尾止）。主线程在 configureSurface 里必须确认「渲染线程没有在飞帧」：
 // gAsyncRenderCtx 为空时渲染线程被唤醒后只走 continue，永不置位 submitDone ⇒ 主线程白等满 10 s。
 std::atomic<bool> gRenderThreadBusy{false};
+std::atomic<bool> gAsyncSubmitSucceeded{false};
+
+enum class RenderThreadPhase : uint32_t { Idle, AwaitCommands, Submit, Present, Retire };
+std::atomic<RenderThreadPhase> gRenderThreadPhase{RenderThreadPhase::Idle};
 
 // 多帧飞行：Present 完成护栏。主线程不再每帧等 Present 返回，因此可能在上一帧 Present 尚未完成时就去 acquire 下一个 back buffer；
 // GetCurrentBackBufferIndex 只在 Present 之后轮转，提前 acquire 会拿到同一个 buffer（两帧写同一处 → 闪帧/撕裂）。acquireSurface
@@ -11215,6 +11792,7 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
     dbgLogInfo("renderThread: started tid=%lu", static_cast<unsigned long>(GetCurrentThreadId()));
 
     while (true) {
+        gRenderThreadPhase.store(RenderThreadPhase::Idle, std::memory_order_release);
         // 步骤 1：等待主线程请求开始新帧（500ms 超时 + 每轮检查 gRenderRunning 退出）。
         for (;;) {
             if (!gRenderRunning) return 0;
@@ -11223,9 +11801,8 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
             if (r == WAIT_TIMEOUT && !gRenderRunning) return 0;
         }
         if (!gRenderRunning) return 0;
-        if (!gAsyncRenderCtx) continue;
-
-        CommandContext* ctx = gAsyncRenderCtx;
+        CommandContext* ctx = gAsyncRenderCtx.load(std::memory_order_acquire);
+        if (!ctx) continue;
 
         // 本帧处理期间置 busy=1，所有退出路径由 RAII 清除，供主线程判断「有没有在飞的帧」。
         struct RenderBusyGuard {
@@ -11244,6 +11821,7 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
 
         // 步骤 5：通知主线程命令已可提交。
         dbgLogDebug("renderThread: signaling recordingReady ctx=%p", reinterpret_cast<void*>(ctx));
+        gRenderThreadPhase.store(RenderThreadPhase::AwaitCommands, std::memory_order_release);
         SetEvent(gEvtRecordingReady);
 
         // 步骤 6：等待主线程完成命令录制（超时保护：5s 后放弃当前帧）。
@@ -11253,6 +11831,7 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         static double sProfWaitCmdMs = 0.0, sProfSubmitMs = 0.0, sProfPresentMs = 0.0;
         const double tProfWait0 = sProf ? nowMs() : 0.0;
         int commandsWaitLoops = 0;
+        bool commandsReady = false;
         for (;;) {
             if (!gRenderRunning) {
                 destroySurfaceNoWaitIdle(getActiveSurface());
@@ -11261,6 +11840,7 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
             DWORD r = WaitForSingleObject(gEvtCommandsReady, 500);
             if (r == WAIT_OBJECT_0) {
                 dbgLogDebug("renderThread: commandsReady ctx=%p", reinterpret_cast<void*>(ctx));
+                commandsReady = gRenderRunning;
                 break;
             }
             if (r == WAIT_TIMEOUT && !gRenderRunning) {
@@ -11269,28 +11849,35 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
             }
             // 超时保护：5s 内未收到 CommandsReady，说明主线程卡死，放弃本帧。
             if (++commandsWaitLoops >= 10) {
-                dbgLogError("renderThread: commands timeout after %ds, aborting ctx=%p",
-                       commandsWaitLoops * 500 / 1000, reinterpret_cast<void*>(ctx));
+                dbgLogWarn("async submit: commands timed out (5000 ms)");
                 if (ctx->listOpen) {
                     (void)endCommandList(ctx);
                 }
-                gAsyncRenderCtx = nullptr;
+                const auto recording = ctx->commandRecordings[ctx->currentListSlot];
+                if (recording && !recording->submitted) {
+                    recording->cancelled = true;
+                    notifyRtRecordingCancelled(recording.get());
+                }
+                gAsyncSubmitSucceeded.store(false, std::memory_order_release);
                 SetEvent(gEvtSubmitDone);
                 break;
             }
         }
+        if (!commandsReady) continue;
 
         const double tProfWait1 = sProf ? nowMs() : 0.0;
+        gRenderThreadPhase.store(RenderThreadPhase::Submit, std::memory_order_release);
         auto submitRes = submitCommandList(ctx);
         const double tProfSubmit1 = sProf ? nowMs() : 0.0;
         if (!submitRes) {
-            dbgLogError("renderThread: submitCommandList FAILED: %s", errorMessage(submitRes.error()).c_str());
+            dbgLogError("async submit: failed");
             // 不清除 surface（submit 失败不代表 surface 无效）。
-            if (gAsyncRenderCtx == ctx) gAsyncRenderCtx = nullptr;
+            gAsyncSubmitSucceeded.store(false, std::memory_order_release);
             SetEvent(gEvtSubmitDone);
             continue;
         }
         [[maybe_unused]] const UINT64 value = *submitRes;
+        gAsyncSubmitSucceeded.store(true, std::memory_order_release);
 
         // 全局 queue fence（submitCommandList 已推进 gCtx.queueFenceValue）。
         ctx->lastSubmitQueueFence = gCtx.queueFenceValue;
@@ -11323,6 +11910,7 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
 
         dbgLogDebug("renderThread: about to presentSurface qf=%llu bbIdx=%d",
                     static_cast<unsigned long long>(gCtx.queueFenceValue), bbIdx);
+        gRenderThreadPhase.store(RenderThreadPhase::Present, std::memory_order_release);
         presentSurface(getActiveSurface());
         if (sProf) {
             const double tProfPresent1 = nowMs();
@@ -11355,7 +11943,8 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         // 必须在 present fence signal 之后才 flush 延迟删除对象，确保所有 GPU 工作（含 flip）完成后再释放资源，避免 CORRUPTION。
         dbgLogDebug("renderThread: post-present qf=%llu openList=%d",
                     static_cast<unsigned long long>(gCtx.queueFenceValue), gOpenListCount.load());
-        if (gOpenListCount == 0) flushPendingDeletes();
+        gRenderThreadPhase.store(RenderThreadPhase::Retire, std::memory_order_release);
+        flushPendingDeletes();
 
         // 步骤 8：本帧结束。submitDone 已在 present **之前**置位（多帧飞行），这里不再重复置位。
         dbgLogDebug("renderThread: frame done, looping back");
@@ -11369,7 +11958,7 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
 // 渲染线程对象（外部可访问，供 destroySurface 调用）。
 std::thread gRenderThread;
 bool gRenderRunning = false;
-CommandContext* gAsyncRenderCtx = nullptr;
+std::atomic<CommandContext*> gAsyncRenderCtx{nullptr};
 bool gAsyncOwnsPresent = false;
 
 // 多帧飞行：等待所有已提交帧完成 Present。上一帧 Present 通常早已完成 → 通常 0ms；渲染线程落后则在此短暂阻塞（GetCurrentBackBufferIndex
@@ -11444,6 +12033,7 @@ bool initAsyncRenderer(UINT) {
     }
 
     gAsyncRenderCtx = nullptr;
+    gAsyncSubmitSucceeded.store(false, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lk(gPresentMtx);
         gSubmittedFrames = 0;
@@ -11494,22 +12084,23 @@ void destroyAsyncRenderer() {
     dbgLogInfo("destroyAsyncRenderer: done");
 }
 
-mcdr::Result<void> asyncRenderBeginFrame(CommandContext* ctx) {
+mcdr::Result<bool> asyncRenderBeginFrame(CommandContext* ctx) {
+    if (!ctx) return mcdr::err("asyncRenderBeginFrame", "async submit: null context");
+    if (gAsyncRenderCtx != nullptr) {
+        return mcdr::err("asyncRenderBeginFrame", "async submit: previous frame pending");
+    }
     if (!gRenderRunning) {
         // 渲染线程未运行 → 本帧必然走 SYNC 路径，Java 侧 present() 必须真正执行 Present，因此清除上一帧遗留的所有权标记。
         gAsyncOwnsPresent = false;
-        return mcdr::err("asyncRenderBeginFrame", "asyncRenderBeginFrame: renderer not running");
+        return false;
     }
     if (getActiveSurface() == nullptr) {
         // 初始化阶段无 surface（窗口未创建），回退到同步路径。
-        dbgLogInfo("asyncRenderBeginFrame: no active surface, fallback sync");
         gAsyncOwnsPresent = false;
-        return mcdr::err("asyncRenderBeginFrame", "asyncRenderBeginFrame: no active surface, fallback sync");
-    }
-    if (gAsyncRenderCtx != nullptr) {
-        return mcdr::err("asyncRenderBeginFrame", "asyncRenderBeginFrame: previous frame not complete");
+        return false;
     }
     gAsyncRenderCtx = ctx;
+    gAsyncSubmitSucceeded.store(false, std::memory_order_release);
     // 新一帧开始，撤销上一帧的 Present 所有权标记。本帧稍后由渲染线程 present 后重新置 true；走 SYNC fallback 时标记保持 false，Java 侧照常 Present。
     gAsyncOwnsPresent = false;
     ResetEvent(gEvtRecordingReady);
@@ -11518,39 +12109,52 @@ mcdr::Result<void> asyncRenderBeginFrame(CommandContext* ctx) {
     SetEvent(gEvtBeginFrame);
     dbgLogDebug("asyncBeginFrame: signaled ctx=%p prevFence=%llu",
                 reinterpret_cast<void*>(ctx), static_cast<unsigned long long>(ctx->prevFenceValue));
-    return {};
+    return true;
 }
 
-mcdr::Result<void> asyncRenderWaitComplete(CommandContext* ctx, UINT64 timeoutMs) {
-    (void)ctx;
+mcdr::Result<bool> asyncRenderWaitComplete(CommandContext* ctx, UINT64 timeoutMs) {
     if (!gRenderRunning) {
         return mcdr::err("asyncRenderWaitComplete", "asyncRenderWaitComplete: renderer not running");
     }
+    if (!ctx || gAsyncRenderCtx.load(std::memory_order_acquire) != ctx) {
+        return mcdr::err("asyncRenderWaitComplete", "async submit: context mismatch");
+    }
     DWORD r = WaitForSingleObject(gEvtSubmitDone, static_cast<DWORD>(timeoutMs));
     if (r == WAIT_OBJECT_0) {
+        const bool succeeded = gAsyncSubmitSucceeded.load(std::memory_order_acquire);
         gAsyncRenderCtx = nullptr;
-        dbgLogDebug("asyncRenderWaitComplete: OK timeout=%llu", static_cast<unsigned long long>(timeoutMs));
-        return {};
+        if (!succeeded) return mcdr::err("asyncRenderWaitComplete", "asyncRenderWaitComplete: submit failed");
+        return true;
     }
-    // 超时只是降级（调用方回退同步路径），所以是 warning 而不是 error。
-    dbgLogWarn("asyncRenderWaitComplete: TIMEOUT timeout=%llu", static_cast<unsigned long long>(timeoutMs));
-    return mcdr::err("asyncRenderWaitComplete", "asyncRenderWaitComplete: timeout");
+    if (r == WAIT_TIMEOUT) return false;
+    return mcdr::err("asyncRenderWaitComplete", "async submit: completion wait failed");
 }
 
 bool asyncRenderIsRecordingReady(CommandContext* ctx) {
-    (void)ctx;
-    if (!gRenderRunning) return false;
+    if (!gRenderRunning || !ctx || gAsyncRenderCtx.load(std::memory_order_acquire) != ctx) return false;
     // 用 0 timeout 查询 RECORDING_READY（非阻塞）。
     DWORD r = WaitForSingleObject(gEvtRecordingReady, 0);
     return r == WAIT_OBJECT_0;
 }
 
 bool asyncRenderWaitRecordingReady(CommandContext* ctx, UINT64 timeoutMs) {
-    (void)ctx;
-    if (!gRenderRunning) return false;
+    if (!gRenderRunning || !ctx || gAsyncRenderCtx.load(std::memory_order_acquire) != ctx) return false;
     // 阻塞等待渲染线程发出 RECORDING_READY（每帧一开始就置位，正常为微秒级）。直接用 WaitForSingleObject 取代 Java 的 sleep(1) 轮询：
     // 1ms 休眠会带来调度器/timer 粒度级别的固定开销，而本等待在帧关键路径上。
+    const auto before = gRenderThreadPhase.load(std::memory_order_acquire);
+    const double started = nowMs();
     DWORD r = WaitForSingleObject(gEvtRecordingReady, static_cast<DWORD>(timeoutMs));
+    const double elapsed = nowMs() - started;
+    if (elapsed > 100.0) {
+        dbgLogWarn("async submit: ready wait %.1f ms (phase=%u/%u)", elapsed,
+            static_cast<unsigned>(before),
+            static_cast<unsigned>(gRenderThreadPhase.load(std::memory_order_acquire)));
+    }
+    if (r != WAIT_OBJECT_0) {
+        dbgLogWarn("async submit: ready timeout (phase=%u busy=%d)",
+            static_cast<unsigned>(gRenderThreadPhase.load(std::memory_order_acquire)),
+            gRenderThreadBusy.load(std::memory_order_acquire) ? 1 : 0);
+    }
     return r == WAIT_OBJECT_0;
 }
 
@@ -11561,13 +12165,18 @@ UINT currentDrawFrameSlot(CommandContext* ctx) {
     return static_cast<UINT>(ctx->fenceValue % kDrawHeapSections);
 }
 
-void asyncSendCommandsReady(CommandContext* ctx) {
-    (void)ctx;
-    if (!gRenderRunning) return;
+bool asyncSendCommandsReady(CommandContext* ctx) {
+    if (!gRenderRunning || !ctx || gAsyncRenderCtx.load(std::memory_order_acquire) != ctx ||
+        gRenderThreadPhase.load(std::memory_order_acquire) != RenderThreadPhase::AwaitCommands) return false;
     SetEvent(gEvtCommandsReady);
+    return true;
 }
 
-void clearAsyncRenderCtx() { gAsyncRenderCtx = nullptr; }
+void clearAsyncRenderCtx() {
+    if (!gRenderRunning || WaitForSingleObject(gEvtSubmitDone, 0) == WAIT_OBJECT_0) {
+        gAsyncRenderCtx = nullptr;
+    }
+}
 
 }  // namespace d3d12_mc
 

@@ -42,7 +42,8 @@ extern "C" {
 // 13 -> 14：mcdr_dx12NrdDenoise 多一个 resetHistory（1 = 这一帧丢历史）。
 // 14 -> 15：新增 mcdr_dx12DlssdEval（DLSS-D 逐帧求值，走 Streamline）。
 // 15 -> 16：mcdr_dx12DlssdEval 多一个 constants（slSetConstants 的 72 个浮点）。
-#define MCDR_ABI_VERSION 23u
+// 23 -> 24: native RT frame context, trace resources and material-guide recording.
+#define MCDR_ABI_VERSION 47u
 
 // Same value at runtime, so a stale Java constant fails at load time, not at first draw.
 MCDR_API uint32_t MCDR_CALL mcdrABIVersion(void);
@@ -843,6 +844,10 @@ MCDR_API void MCDR_CALL mcdr_dx12WriteTimestamp(mcdr_command_ctx* ctx, mcdr_quer
 MCDR_API uint64_t MCDR_CALL mcdr_dx12ReadQueryValue(mcdr_query_pool* pool, int32_t index);
 MCDR_API int32_t MCDR_CALL mcdr_dx12ReadQueryValues(mcdr_query_pool* pool, int32_t start, int32_t count,
                                                     int64_t* out);
+MCDR_API int32_t MCDR_CALL mcdr_dx12QueueQueryValues(mcdr_command_ctx* ctx, mcdr_query_pool* pool,
+                                                    int32_t start, int32_t count);
+MCDR_API int32_t MCDR_CALL mcdr_dx12TryReadQueryValues(mcdr_query_pool* pool, int32_t start, int32_t count,
+                                                      int64_t* out);
 
 // Async renderer control channel.
 MCDR_API void MCDR_CALL mcdr_dx12InitAsyncRenderer(int32_t workerCount);
@@ -973,6 +978,380 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12DispatchRays(
     int32_t hitCount, mcdr_object* const* srvs, int32_t srvCount, mcdr_object* const* uavs,
     int32_t uavCount, const int32_t* constants, int32_t constantCount, mcdr_object* cbv,
     uint64_t cbvOffset, int32_t width, int32_t height);
+
+typedef struct mcdr_rt_frame_program {
+    const void* rayDxil;
+    int64_t rayBytes;
+    const void* guideDxil;
+    int64_t guideBytes;
+    const void* exposureDxil;
+    int64_t exposureBytes;
+    const void* motionDxil;
+    int64_t motionBytes;
+    const void* packDxil;
+    int64_t packBytes;
+    const void* signalDxil;
+    int64_t signalBytes;
+    const void* remodulateDxil;
+    int64_t remodulateBytes;
+    const void* compositeDxil;
+    int64_t compositeBytes;
+    const void* environmentDxil;
+    int64_t environmentBytes;
+} mcdr_rt_frame_program;
+
+typedef struct mcdr_rt_geometry_desc {
+    uint64_t worldEpoch;
+    uint64_t geometryRevision;
+    uint64_t materialRevision;
+    uint64_t reuseGeometry;
+    uint64_t reuseMaterials;
+    const void* records;
+    int64_t recordBytes;
+    const void* vertices;
+    int64_t vertexBytes;
+    const void* indices;
+    int64_t indexBytes;
+    const void* materials;
+    int64_t materialBytes;
+    const void* quads;
+    int64_t quadBytes;
+} mcdr_rt_geometry_desc;
+
+typedef struct mcdr_rt_geometry_output {
+    uint64_t snapshotId;
+    mcdr_object* records;
+    mcdr_object* vertices;
+    mcdr_object* indices;
+    mcdr_object* materials;
+    mcdr_object* quads;
+    uint64_t byteCount;
+} mcdr_rt_geometry_output;
+
+typedef struct mcdr_rt_geometry_content {
+    uint64_t vertexIdentity;
+    uint64_t indexIdentity;
+    uint64_t quadIdentity;
+    const void* vertices;
+    int64_t vertexBytes;
+    const void* indices;
+    int64_t indexBytes;
+    const void* quads;
+    int64_t quadBytes;
+} mcdr_rt_geometry_content;
+
+typedef struct mcdr_rt_geometry_delta_desc {
+    uint64_t worldEpoch;
+    uint64_t geometryRevision;
+    uint64_t materialRevision;
+    uint64_t baseSnapshot;
+    uint64_t reuseMaterials;
+    const void* records;
+    int64_t recordBytes;
+    const mcdr_rt_geometry_content* contents;
+    uint32_t contentCount;
+    uint32_t reserved;
+    const void* materials;
+    int64_t materialBytes;
+    uint64_t vertexCapacity;
+    uint64_t indexCapacity;
+    uint64_t quadCapacity;
+} mcdr_rt_geometry_delta_desc;
+
+typedef struct mcdr_rt_geometry_delta_output {
+    uint64_t snapshotId;
+    mcdr_object* records;
+    mcdr_object* vertices;
+    mcdr_object* indices;
+    mcdr_object* materials;
+    mcdr_object* quads;
+    uint64_t byteCount;
+    uint64_t uploadedBytes;
+    uint64_t uploadCapacity;
+} mcdr_rt_geometry_delta_output;
+
+typedef struct mcdr_rt_geometry_memory {
+    uint64_t gpuBytes;
+    uint64_t uploadBytes;
+} mcdr_rt_geometry_memory;
+
+typedef struct mcdr_rt_acceleration_output {
+    uint64_t snapshotId;
+    mcdr_object* acceleration;
+    mcdr_object* instances;
+    uint64_t byteCount;
+    uint32_t instanceCount;
+    uint32_t blasCount;
+    uint32_t buildCount;
+    uint32_t ready;
+    uint64_t blasMicros;
+    uint64_t peakBuildMicros;
+    uint64_t tlasMicros;
+    uint64_t scratchBytes;
+} mcdr_rt_acceleration_output;
+
+typedef struct mcdr_rt_section_version {
+    uint64_t node;
+    uint32_t layer;
+    uint32_t version;
+} mcdr_rt_section_version;
+
+typedef struct mcdr_rt_output_support {
+    uint64_t node;
+    uint32_t layer;
+    uint32_t version;
+    uint32_t flags;
+    uint32_t reserved;
+    float minimumX;
+    float minimumY;
+    float minimumZ;
+    float maximumX;
+    float maximumY;
+    float maximumZ;
+} mcdr_rt_output_support;
+
+typedef struct mcdr_rt_scene_desc {
+    uint64_t worldEpoch;
+    uint64_t snapshotId;
+    uint64_t liveRevision;
+    const mcdr_rt_section_version* sections;
+    uint32_t sectionCount;
+    uint32_t reserved;
+    uint64_t frameId;
+    const mcdr_rt_output_support* outputs;
+    uint32_t outputCount;
+    uint32_t outputMode;
+} mcdr_rt_scene_desc;
+
+typedef struct mcdr_rt_scene_output {
+    uint64_t snapshotId;
+    uint64_t accelerationId;
+    uint64_t pendingSnapshotId;
+    uint64_t pendingAccelerationId;
+    uint64_t sceneRevision;
+    uint64_t geometryRevision;
+    uint64_t materialRevision;
+    uint64_t byteCount;
+    mcdr_rt_acceleration_output active;
+    mcdr_rt_acceleration_output candidate;
+    uint64_t coverageFlags;
+} mcdr_rt_scene_output;
+
+typedef struct mcdr_rt_frame_desc {
+    uint64_t frameId;
+    uint64_t worldEpoch;
+    uint64_t sceneRevision;
+    uint64_t materialRevision;
+    uint64_t snapshotId;
+    int32_t width;
+    int32_t height;
+    uint64_t accelerationId;
+    uint64_t gbufferRevision;
+    const void* constants;
+    uint32_t constantBytes;
+    float depthScale;
+    int64_t frameNanos;
+    int32_t exposureMode;
+    float exposureEv;
+    float exposureSpeed;
+    uint32_t resetExposure;
+    uint32_t signalEncoding;
+    float jitterDeltaX;
+    float jitterDeltaY;
+    float denoisingRange;
+    float contentJitterX;
+    float contentJitterY;
+} mcdr_rt_frame_desc;
+
+typedef struct mcdr_rt_frame_output {
+    uint64_t frameId;
+    uint64_t snapshotId;
+    mcdr_object* direct;
+    mcdr_object* indirect;
+    mcdr_object* aux;
+    mcdr_object* specular;
+    mcdr_object* specularGrazing;
+    mcdr_object* constants;
+    uint64_t byteCount;
+    mcdr_object* exposure;
+    mcdr_object* motion;
+    mcdr_object* packedNormalRoughness;
+    mcdr_object* viewZ;
+    mcdr_object* diffuseSignal;
+    mcdr_object* specularSignal;
+    mcdr_object* specularHitDistance;
+} mcdr_rt_frame_output;
+
+typedef struct mcdr_rt_gbuffer_output {
+    uint64_t revision;
+    uint64_t resourceRevision;
+    int64_t frameNanos;
+    int32_t width;
+    int32_t height;
+    mcdr_object* albedo;
+    mcdr_object* specular;
+    mcdr_object* normalRoughness;
+    mcdr_object* emissive;
+    mcdr_object* linearDepth;
+    mcdr_object* depth;
+    uint64_t byteCount;
+} mcdr_rt_gbuffer_output;
+
+typedef struct mcdr_rt_gbuffer_program {
+    const void* msData;
+    uint64_t msLen;
+    const void* psData;
+    uint64_t psLen;
+    const mcdr_pipeline_binding_desc* bindings;
+    int32_t bindingCount;
+    int32_t cullEnabled;
+    int32_t polygonMode;
+    uint32_t _pad0;
+} mcdr_rt_gbuffer_program;
+
+typedef struct mcdr_rt_gbuffer_batch {
+    uint64_t program;
+    mcdr_object* vertices;
+    int64_t vertexOffset;
+    mcdr_object* sections;
+    int64_t sectionsOffset;
+    int64_t sectionsLength;
+    mcdr_object* meshlets;
+    int64_t meshletsOffset;
+    int64_t meshletsLength;
+    int32_t meshletCount;
+    int32_t bindingCount;
+    const mcdr_binding_slot* bindings;
+    int32_t projectionBinding;
+    uint32_t _pad0;
+} mcdr_rt_gbuffer_batch;
+
+typedef struct mcdr_rt_gbuffer_replay {
+    uint64_t revision;
+    const mcdr_rt_gbuffer_batch* batches;
+    int32_t batchCount;
+    uint32_t projectionFloatCount;
+    const float* projection;
+    float cameraOffsetX;
+    float cameraOffsetY;
+    float cameraOffsetZ;
+    uint32_t _pad0;
+} mcdr_rt_gbuffer_replay;
+
+typedef struct mcdr_rt_denoise_desc {
+    uint64_t frameId;
+    uint64_t historyGeneration;
+    uint64_t historyFrame;
+    uint64_t planRevision;
+    int32_t outputWidth;
+    int32_t outputHeight;
+    const float* nrdMatrices;
+    uint32_t nrdFloatCount;
+    uint32_t slFloatCount;
+    const float* slConstants;
+} mcdr_rt_denoise_desc;
+
+typedef struct mcdr_rt_denoise_output {
+    uint64_t frameId;
+    uint64_t snapshotId;
+    mcdr_object* diffuse;
+    mcdr_object* specular;
+    uint64_t byteCount;
+    uint32_t encoding;
+    uint32_t dispatchCount;
+} mcdr_rt_denoise_output;
+
+typedef struct mcdr_rt_transaction_desc {
+    mcdr_rt_frame_desc trace;
+    mcdr_rt_denoise_desc denoise;
+    uint64_t liveRevision;
+    const void* spatial;
+    int64_t spatialBytes;
+    mcdr_object* source;
+    int32_t upscaler;
+    int32_t debugMode;
+    mcdr_query_pool* timestamps;
+    int32_t firstTimestamp;
+    uint32_t reserved;
+} mcdr_rt_transaction_desc;
+
+typedef struct mcdr_rt_transaction_output {
+    mcdr_rt_frame_output trace;
+    mcdr_rt_denoise_output denoise;
+    mcdr_rt_denoise_output upscale;
+    mcdr_rt_denoise_output composite;
+    uint32_t fallbackFlags;
+    uint32_t recorded;
+    uint32_t timestampMask;
+    uint32_t reserved;
+} mcdr_rt_transaction_output;
+
+enum {
+    MCDR_RT_FALLBACK_RAW = 1,
+    MCDR_RT_FALLBACK_NRD = 2,
+    MCDR_RT_FALLBACK_NO_SR = 4
+};
+
+MCDR_API uint64_t MCDR_CALL mcdr_dx12CreateRtFrame(const mcdr_rt_frame_program* program);
+MCDR_API uint64_t MCDR_CALL mcdr_dx12CreateRtWorkGraphFrame(const mcdr_rt_frame_program* program);
+MCDR_API int32_t MCDR_CALL mcdr_dx12ReleaseRtFrame(uint64_t frame);
+MCDR_API uint64_t MCDR_CALL mcdr_dx12CreateRtGBufferProgram(const mcdr_rt_gbuffer_program* program);
+MCDR_API int32_t MCDR_CALL mcdr_dx12CreateRtGeometrySnapshot(mcdr_command_ctx* ctx,
+    const mcdr_rt_geometry_desc* desc, mcdr_rt_geometry_output* output);
+MCDR_API int32_t MCDR_CALL mcdr_dx12ReleaseRtGeometrySnapshot(uint64_t snapshot);
+MCDR_API int32_t MCDR_CALL mcdr_dx12CreateRtGeometryDelta(mcdr_command_ctx* ctx,
+    const mcdr_rt_geometry_delta_desc* desc, mcdr_rt_geometry_delta_output* output);
+MCDR_API int32_t MCDR_CALL mcdr_dx12GetRtGeometryMemory(mcdr_rt_geometry_memory* output);
+MCDR_API int32_t MCDR_CALL mcdr_dx12GetRtAccelerationBudget(uint64_t* values, int32_t valueCount);
+MCDR_API int32_t MCDR_CALL mcdr_dx12SetRtManagedMemoryBudget(uint64_t bytes);
+MCDR_API int32_t MCDR_CALL mcdr_dx12GetRtManagedMemoryBudget(uint64_t* values, int32_t valueCount);
+MCDR_API uint64_t MCDR_CALL mcdr_dx12CreateRtAcceleration(uint64_t snapshot, uint64_t reuse);
+MCDR_API int32_t MCDR_CALL mcdr_dx12ReleaseRtAcceleration(uint64_t acceleration);
+MCDR_API int32_t MCDR_CALL mcdr_dx12PrepareRtAcceleration(mcdr_command_ctx* ctx,
+    uint64_t acceleration, mcdr_rt_acceleration_output* output);
+MCDR_API int32_t MCDR_CALL mcdr_dx12FilterRtAcceleration(mcdr_command_ctx* ctx,
+    uint64_t acceleration, const uint64_t* invalidSections, uint32_t count, mcdr_rt_acceleration_output* output);
+MCDR_API uint64_t MCDR_CALL mcdr_dx12RtAccelerationMemory(uint64_t first, uint64_t second);
+MCDR_API uint64_t MCDR_CALL mcdr_dx12CreateRtScene(void);
+MCDR_API int32_t MCDR_CALL mcdr_dx12ReleaseRtScene(uint64_t scene);
+MCDR_API int32_t MCDR_CALL mcdr_dx12PrepareRtScene(mcdr_command_ctx* ctx,
+    uint64_t scene, const mcdr_rt_scene_desc* desc, mcdr_rt_scene_output* output);
+MCDR_API int32_t MCDR_CALL mcdr_dx12PrepareRtSceneTargets(mcdr_command_ctx* ctx,
+    uint64_t scene, const mcdr_rt_scene_desc* desc, const uint64_t* targets, uint32_t targetCount,
+    mcdr_rt_scene_output* output);
+MCDR_API int32_t MCDR_CALL mcdr_dx12GetRtSceneStats(uint64_t scene, uint64_t* values, int32_t valueCount);
+MCDR_API int32_t MCDR_CALL mcdr_dx12GetRtSceneCaptureDemands(uint64_t scene, uint64_t* values, int32_t valueCount);
+MCDR_API int32_t MCDR_CALL mcdr_dx12SetRtSceneWorkBudget(uint64_t scene, uint64_t cpuMicros,
+                                                        uint64_t gpuMicros, uint64_t triangles);
+MCDR_API int32_t MCDR_CALL mcdr_dx12GetRtSceneWorkBudget(uint64_t scene, uint64_t* values, int32_t valueCount);
+MCDR_API int32_t MCDR_CALL mcdr_dx12ReleaseRtGBufferProgram(uint64_t program);
+MCDR_API int32_t MCDR_CALL mcdr_dx12RtFrameBeginGBuffer(mcdr_command_ctx* ctx, uint64_t frame,
+    int64_t frameNanos, int32_t width, int32_t height, mcdr_rt_gbuffer_output* output);
+MCDR_API int32_t MCDR_CALL mcdr_dx12RtFrameEndGBuffer(mcdr_command_ctx* ctx, uint64_t frame,
+    uint64_t revision, int32_t success);
+MCDR_API int32_t MCDR_CALL mcdr_dx12RtFrameReplayGBuffer(mcdr_command_ctx* ctx, uint64_t frame,
+    const mcdr_rt_gbuffer_replay* replay);
+MCDR_API uint64_t MCDR_CALL mcdr_dx12RtCaptureGBuffer(mcdr_command_ctx* ctx, uint64_t capture,
+    int64_t frameNanos, const mcdr_rt_gbuffer_batch* batch);
+MCDR_API int32_t MCDR_CALL mcdr_dx12RtReleaseGBufferCapture(mcdr_command_ctx* ctx, uint64_t capture);
+MCDR_API int32_t MCDR_CALL mcdr_dx12RtFrameReplayCapturedGBuffer(mcdr_command_ctx* ctx, uint64_t frame,
+    uint64_t capture, const mcdr_rt_gbuffer_replay* replay);
+MCDR_API int32_t MCDR_CALL mcdr_dx12RtFrameSetSpatial(mcdr_command_ctx* ctx, uint64_t frame,
+    uint64_t frameId, uint64_t worldEpoch, uint64_t liveRevision, const void* data, int64_t bytes);
+MCDR_API int32_t MCDR_CALL mcdr_dx12RtFrame(mcdr_command_ctx* ctx, uint64_t frame,
+    const mcdr_rt_frame_desc* desc, mcdr_rt_frame_output* output);
+MCDR_API int32_t MCDR_CALL mcdr_dx12RtFrameReblur(mcdr_command_ctx* ctx, uint64_t frame, uint64_t frameId);
+MCDR_API int32_t MCDR_CALL mcdr_dx12RtFrameDenoise(mcdr_command_ctx* ctx, uint64_t frame,
+    const mcdr_rt_denoise_desc* desc, mcdr_rt_denoise_output* output);
+MCDR_API int32_t MCDR_CALL mcdr_dx12RtFrameUpscale(mcdr_command_ctx* ctx, uint64_t frame,
+    uint64_t frameId, int32_t backend, mcdr_rt_denoise_output* output);
+MCDR_API int32_t MCDR_CALL mcdr_dx12RtFrameComposite(mcdr_command_ctx* ctx, uint64_t frame,
+    uint64_t frameId, mcdr_object* source, int32_t debugMode, mcdr_rt_denoise_output* output);
+MCDR_API int32_t MCDR_CALL mcdr_dx12RtFrameTransaction(mcdr_command_ctx* ctx, uint64_t frame,
+    const mcdr_rt_transaction_desc* desc, mcdr_rt_transaction_output* output);
+MCDR_API int32_t MCDR_CALL mcdr_dx12RtFrameTransactionLighting(mcdr_command_ctx* ctx, uint64_t frame,
+    const mcdr_rt_transaction_desc* desc, const void* lighting, int64_t lightingBytes,
+    mcdr_rt_transaction_output* output);
 
 // ---- Mesh shaders: amplification/mesh pipeline + HLSL->DXIL compilation --------
 // Mesh shaders are unreachable through D3DCompile (SM 5.1 ceiling), so native compiles them with

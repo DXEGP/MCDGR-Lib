@@ -6,6 +6,9 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+
+enum class McdrDlssRecordingState : int32_t { Pending, Submitted, Cancelled, SubmissionFailed };
 
 // 一帧 RR 的输入。roughness 为 null 时按 packed 处理（normal 指向打包后的法线-粗糙度纹理），
 // 非空时按 unpacked 处理（normal 与 roughness 两张独立纹理）。
@@ -23,6 +26,8 @@ struct mcdr_dlssd_frame {
     void* exposure = nullptr;
     void* completionFence = nullptr;
     uint64_t completionValue = 0;
+    std::shared_ptr<void> recording;
+    McdrDlssRecordingState (*recordingState)(const void*) = nullptr;
     float preExposure = 1.0f;
     float exposureScale = 1.0f;
     const float* constants = nullptr;
@@ -38,6 +43,6 @@ struct mcdr_dlssd_frame {
 // outText 最多写 capacity 字节，内容是一行诊断（成功与失败都会写，便于一次性看清原因）。
 extern "C" int32_t mcdr_dlssd_eval(const mcdr_dlssd_frame* frame, char* outText, int32_t capacity);
 extern "C" int32_t mcdr_dlss_sr_eval(const mcdr_dlssd_frame* frame, char* outText, int32_t capacity);
-extern "C" int32_t mcdr_rt_prepare_exposure(int32_t rr, int32_t manual, void* completionFence,
-    uint64_t completionValue, char* outText, int32_t capacity);
+extern "C" int32_t mcdr_rt_prepare_exposure(int32_t rr, int32_t manual,
+    const mcdr_dlssd_frame* frame, char* outText, int32_t capacity);
 extern "C" void mcdr_rt_reset_exposure();

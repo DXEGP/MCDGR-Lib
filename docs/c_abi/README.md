@@ -10,7 +10,7 @@
 
 ### 1.1 契约：`include\mcdr_abi.h`
 
-全库只有一个对外头文件 [`include\mcdr_abi.h`](../../include/mcdr_abi.h)（1182 行，208 处 `MCDR_CALL`，其中 205 个是真实导出）。它的存在不是为了方便，而是硬约束：**C 语言链接的实体不能从 C++ 模块导出**。所以 Kotlin 侧 [`MCDR_ABI.kt`](../../../Illusion/src/main/kotlin/dev/nts/expdxr/d3d12/extern/MCDR_ABI.kt) 必须能按普通 C 头去理解这些符号，模块化只发生在 DLL 内部。
+全库只有一个对外头文件 [`include\mcdr_abi.h`](../../include/mcdr_abi.h)（1182 行，208 处 `MCDR_CALL`，其中 205 个是真实导出）。它的存在不是为了方便，而是硬约束：**C 语言链接的实体不能从 C++ 模块导出**。所以 Kotlin 侧 [`MCDR_ABI.kt`](../../../Illusion/src/main/kotlin/io/github/dxegp/d3d12/extern/MCDR_ABI.kt) 必须能按普通 C 头去理解这些符号，模块化只发生在 DLL 内部。
 
 ```c
 #define MCDR_API  __declspec(dllexport)   // MCDR_EXPORTS 定义时；否则 dllimport
@@ -397,8 +397,8 @@ abi_common → abi_meta → abi_device → abi_command → abi_pipeline → abi_
 | 3 | 实现模块入口 | 同模块的实现单元：`MCDR\src\core\d3d12_device.cpp`、`src\core\d3d12_surface.cpp`、`src\advanced\d3d12_mesh_base.cpp` 等 | 必须是同一模块单元；返回 `std::expected<T, mcdr::Error>` 或 `mcdr::Result<...>` |
 | 4 | 写适配导出 | `MCDR\src\c_abi\abi_<family>.cpp` | 用现成前言，不要重复 `#include`；校验 → 填 POD → 调模块 → `failWith*` 收尾 |
 | 5 | 登记布局 | `MCDR\src\c_abi\abi_meta.cpp` 的 `layoutTable()` | 每个镜像字段一行 `MCDR_FIELD(T, F)`，**包括 `_padN`**；漏一个 → JVM 侧 `verify` abort |
-| 6 | 加 Kotlin 镜像 | `Illusion\src\main\kotlin\dev\nts\expdxr\d3d12\extern\MCDR_Layout.kt` | `MemoryLayout.structLayout(...)` + `<NAME>_FIELD` 常量（经 `offset(layout, field)`）；字段名与 `mcdr_abi.h` 逐字一致 |
-| 7 | 绑定 FFM 句柄 | `Illusion\src\main\kotlin\dev\nts\expdxr\d3d12\extern\MCDR_ABI.kt` | `private var MH_something: MethodHandle? = null`，在绑定块里 `MH_something = skip("mcdr_dx12Something", fd(MCDRLayout.I32, MCDRLayout.PTR))`（可选功能用 `skipOptional`），再包一个 `fun D3D12Something(...)` |
+| 6 | 加 Kotlin 镜像 | `Illusion\src\main\kotlin\io\github\dxegp\d3d12\extern\MCDR_Layout.kt` | `MemoryLayout.structLayout(...)` + `<NAME>_FIELD` 常量（经 `offset(layout, field)`）；字段名与 `mcdr_abi.h` 逐字一致 |
+| 7 | 绑定 FFM 句柄 | `Illusion\src\main\kotlin\io\github\dxegp\d3d12\extern\MCDR_ABI.kt` | `private var MH_something: MethodHandle? = null`，在绑定块里 `MH_something = skip("mcdr_dx12Something", fd(MCDRLayout.I32, MCDRLayout.PTR))`（可选功能用 `skipOptional`），再包一个 `fun D3D12Something(...)` |
 | 8 | 构建验证 | `MSBuild MCDR.vcxproj /p:Configuration=Release /p:Platform=x64` | 构建成功后 JVM 侧 `compileKotlin`；运行时 `verifyABI()` 会把 native 的 (name, offset, size) 表与 `MCDRLayout` 双向比对 |
 
 第 6、7 步的两条细节：
@@ -502,8 +502,8 @@ JVM 侧（相对仓库根）：
 
 | 路径 | 作用 |
 | --- | --- |
-| [`MCDR_ABI.kt`](../../../Illusion/src/main/kotlin/dev/nts/expdxr/d3d12/extern/MCDR_ABI.kt) | `Linker.nativeLinker().downcallHandle` + `MethodHandle` 句柄表 + 各 `D3D12Xxx()` 包装 |
-| [`MCDR_Layout.kt`](../../../Illusion/src/main/kotlin/dev/nts/expdxr/d3d12/extern/MCDR_Layout.kt) | `MCDRLayout`：每个跨界 struct 的 `MemoryLayout` 镜像与 `verify()` |
+| [`MCDR_ABI.kt`](../../../Illusion/src/main/kotlin/io/github/dxegp/d3d12/extern/MCDR_ABI.kt) | `Linker.nativeLinker().downcallHandle` + `MethodHandle` 句柄表 + 各 `D3D12Xxx()` 包装 |
+| [`MCDR_Layout.kt`](../../../Illusion/src/main/kotlin/io/github/dxegp/d3d12/extern/MCDR_Layout.kt) | `MCDRLayout`：每个跨界 struct 的 `MemoryLayout` 镜像与 `verify()` |
 
 相邻主题：
 
