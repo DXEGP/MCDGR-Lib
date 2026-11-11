@@ -4,7 +4,7 @@
 // 由 surface 单元在创建 swapchain 时消费，还要被 DLSS 单元读去填
 // `sl::DLSSOptions::colorBuffersHDR`。surface 与 DLSS 分属「模块单元」与
 // 「普通 TU」，模块 purview 里的定义无法被普通 TU 链接，因此状态放在一个普通
-// 翻译单元（src\core\d3d12_hdr_state.cpp）里，经这组 C 链接函数共享。
+// 翻译单元 src/render/presentation/d3d12_hdr_state.cpp 里，经这组 C 链接函数共享。
 #pragma once
 
 #include <stdint.h>

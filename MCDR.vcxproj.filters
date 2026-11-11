@@ -1,60 +1,237 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
-    <Filter Include="源文件">
-      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
-      <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
-    </Filter>
     <Filter Include="模块接口">
-      <UniqueIdentifier>{1B0E6B6E-9F0C-4C4E-9A5E-3D2C7A61F0A1}</UniqueIdentifier>
-      <Extensions>cppm;ixx</Extensions>
+      <UniqueIdentifier>{3ba00031-dae7-55d3-9192-4c02792be0d4}</UniqueIdentifier>
     </Filter>
-    <Filter Include="资源文件">
-      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
-      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+    <Filter Include="模块接口\backend">
+      <UniqueIdentifier>{7897b3f0-d91b-5890-8ed7-79f81306d963}</UniqueIdentifier>
     </Filter>
-    <Filter Include="头文件">
-      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
-      <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
+    <Filter Include="模块接口\backend\command">
+      <UniqueIdentifier>{8936bac7-9842-5273-816a-db8d934cae50}</UniqueIdentifier>
     </Filter>
-    <!-- Directory parity with src\: c_abi = the C ABI adapter units (feature-named),
-         core = the D3D12 implementation units, advanced = the mesh/pipeline extras.
-         Module interface units live under the 模块接口 mirror of the same tree. -->
-    <Filter Include="源文件\C ABI">
-      <UniqueIdentifier>{b8919655-d25e-4191-a289-61a1fdc3c32b}</UniqueIdentifier>
+    <Filter Include="模块接口\backend\device">
+      <UniqueIdentifier>{71a488f9-cdef-567e-986b-f6997756e891}</UniqueIdentifier>
     </Filter>
-    <Filter Include="模块接口\C ABI">
-      <UniqueIdentifier>{96779ab9-d6ef-4dda-9db5-fdbb9751f2c7}</UniqueIdentifier>
+    <Filter Include="模块接口\backend\memory">
+      <UniqueIdentifier>{2cf6a884-cb1b-5d70-833a-5825a7c8d23a}</UniqueIdentifier>
     </Filter>
-    <Filter Include="模块接口\Core">
-      <UniqueIdentifier>{a3f5c1d2-6b47-4e18-9c05-2d7e8f41b903}</UniqueIdentifier>
+    <Filter Include="模块接口\c_abi">
+      <UniqueIdentifier>{1e9cddcd-b8f6-5b4e-baf5-22db44689e2c}</UniqueIdentifier>
     </Filter>
-    <Filter Include="模块接口\Advanced">
-      <UniqueIdentifier>{652db859-1451-4f1d-8aec-b9940681597a}</UniqueIdentifier>
+    <Filter Include="模块接口\diagnostics">
+      <UniqueIdentifier>{2bd02cc2-d346-5e48-a774-f3a18227610f}</UniqueIdentifier>
     </Filter>
-    <Filter Include="源文件\Advanced">
-      <UniqueIdentifier>{36c3c217-6495-40f3-9ce2-a8de941d223c}</UniqueIdentifier>
+    <Filter Include="模块接口\render">
+      <UniqueIdentifier>{b61697c3-23fd-5353-b1d4-56c9ca7e6e6a}</UniqueIdentifier>
     </Filter>
-    <Filter Include="源文件\Core">
-      <UniqueIdentifier>{c14e8a72-5d36-4b90-a7f1-8e62d3b40a55}</UniqueIdentifier>
+    <Filter Include="模块接口\render\terrain">
+      <UniqueIdentifier>{2a9338e4-0c74-5308-86a8-53a514995f44}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件">
+      <UniqueIdentifier>{1b943cab-81e7-5d3c-a9bd-64b5c82f9574}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\backend">
+      <UniqueIdentifier>{0d388321-e9d8-5757-b4d9-e6a6a639a75e}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\backend\command">
+      <UniqueIdentifier>{3cee9748-bc30-5358-a2d2-868ec5785a2b}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\backend\device">
+      <UniqueIdentifier>{c710b4a5-0fe4-5936-b23f-16ac0429b670}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\backend\memory">
+      <UniqueIdentifier>{0c6863f6-6b43-5c8f-b1a6-61c9c5bd632b}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\backend\shader">
+      <UniqueIdentifier>{5fcb3a59-914a-5782-88df-fdd332727f9e}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\c_abi">
+      <UniqueIdentifier>{fbbd9454-1f1b-5df3-8c44-3e0ada871fac}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\diagnostics">
+      <UniqueIdentifier>{4229a954-a1c1-5cc4-9888-ab97c187ccc6}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\platform">
+      <UniqueIdentifier>{ef7dcd9b-00e1-5232-be9c-2c72f378886b}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\render">
+      <UniqueIdentifier>{c56e741e-7fc3-518e-80ac-9ad53c907129}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\render\antialiasing">
+      <UniqueIdentifier>{8aefcf68-fd76-5908-a108-502945c55ef7}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\render\config">
+      <UniqueIdentifier>{ff9a0e53-3cfc-55b0-8605-52572ca887fe}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\render\presentation">
+      <UniqueIdentifier>{6211d847-dfab-5922-a031-a738812754be}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\render\reconstruction">
+      <UniqueIdentifier>{768c4853-9375-5559-9ee8-e852f32fcc46}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\render\terrain">
+      <UniqueIdentifier>{d0f2b4ff-b8ed-58d0-847a-ec74dc7ff788}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\render\antialiasing\smaa_luts.cpp">
+      <Filter>源文件\render\antialiasing</Filter>
+    </ClCompile>
+    <ClCompile Include="src\module\c_abi\mcdr_abi_common.cppm">
+      <Filter>模块接口\c_abi</Filter>
+    </ClCompile>
+    <ClCompile Include="src\module\diagnostics\mcdr_error.cppm">
+      <Filter>模块接口\diagnostics</Filter>
+    </ClCompile>
+    <ClCompile Include="src\module\backend\memory\d3d12_descriptor_allocator.cppm">
+      <Filter>模块接口\backend\memory</Filter>
+    </ClCompile>
+    <ClCompile Include="src\module\backend\memory\d3d12_async_descriptor.cppm">
+      <Filter>模块接口\backend\memory</Filter>
+    </ClCompile>
+    <ClCompile Include="src\module\backend\command\d3d12_async_fence.cppm">
+      <Filter>模块接口\backend\command</Filter>
+    </ClCompile>
+    <ClCompile Include="src\module\backend\command\d3d12_async_executor.cppm">
+      <Filter>模块接口\backend\command</Filter>
+    </ClCompile>
+    <ClCompile Include="src\module\backend\command\d3d12_async_bundle.cppm">
+      <Filter>模块接口\backend\command</Filter>
+    </ClCompile>
+    <ClCompile Include="src\module\backend\device\mcdr_device.cppm">
+      <Filter>模块接口\backend\device</Filter>
+    </ClCompile>
+    <ClCompile Include="src\module\render\terrain\d3d12_mesh.cppm">
+      <Filter>模块接口\render\terrain</Filter>
+    </ClCompile>
+    <ClCompile Include="src\c_abi\abi_common.cpp">
+      <Filter>源文件\c_abi</Filter>
+    </ClCompile>
+    <ClCompile Include="src\c_abi\abi_meta.cpp">
+      <Filter>源文件\c_abi</Filter>
+    </ClCompile>
+    <ClCompile Include="src\c_abi\abi_device.cpp">
+      <Filter>源文件\c_abi</Filter>
+    </ClCompile>
+    <ClCompile Include="src\c_abi\abi_command.cpp">
+      <Filter>源文件\c_abi</Filter>
+    </ClCompile>
+    <ClCompile Include="src\c_abi\abi_pipeline.cpp">
+      <Filter>源文件\c_abi</Filter>
+    </ClCompile>
+    <ClCompile Include="src\c_abi\abi_draw.cpp">
+      <Filter>源文件\c_abi</Filter>
+    </ClCompile>
+    <ClCompile Include="src\c_abi\abi_mesh.cpp">
+      <Filter>源文件\c_abi</Filter>
+    </ClCompile>
+    <ClCompile Include="src\c_abi\abi_surface.cpp">
+      <Filter>源文件\c_abi</Filter>
+    </ClCompile>
+    <ClCompile Include="src\c_abi\abi_async.cpp">
+      <Filter>源文件\c_abi</Filter>
+    </ClCompile>
+    <ClCompile Include="src\c_abi\abi_sr.cpp">
+      <Filter>源文件\c_abi</Filter>
+    </ClCompile>
+    <ClCompile Include="src\c_abi\abi_framegen.cpp">
+      <Filter>源文件\c_abi</Filter>
+    </ClCompile>
+    <ClCompile Include="src\platform\dllmain.cpp">
+      <Filter>源文件\platform</Filter>
+    </ClCompile>
+    <ClCompile Include="src\backend\memory\d3d12_descriptor_allocator.cpp">
+      <Filter>源文件\backend\memory</Filter>
+    </ClCompile>
+    <ClCompile Include="src\diagnostics\d3d12_diagnostics.cpp">
+      <Filter>源文件\diagnostics</Filter>
+    </ClCompile>
+    <ClCompile Include="src\diagnostics\d3d12_pix.cpp">
+      <Filter>源文件\diagnostics</Filter>
+    </ClCompile>
+    <ClCompile Include="src\backend\shader\d3d12_shader.cpp">
+      <Filter>源文件\backend\shader</Filter>
+    </ClCompile>
+    <ClCompile Include="src\render\antialiasing\d3d12_postprocess.cpp">
+      <Filter>源文件\render\antialiasing</Filter>
+    </ClCompile>
+    <ClCompile Include="src\backend\device\d3d12_device.cpp">
+      <Filter>源文件\backend\device</Filter>
+    </ClCompile>
+    <ClCompile Include="src\render\presentation\d3d12_surface.cpp">
+      <Filter>源文件\render\presentation</Filter>
+    </ClCompile>
+    <ClCompile Include="src\render\reconstruction\d3d12_sr.cpp">
+      <Filter>源文件\render\reconstruction</Filter>
+    </ClCompile>
+    <ClCompile Include="src\render\presentation\d3d12_framegen.cpp">
+      <Filter>源文件\render\presentation</Filter>
+    </ClCompile>
+    <ClCompile Include="src\render\reconstruction\d3d12_fsr.cpp">
+      <Filter>源文件\render\reconstruction</Filter>
+    </ClCompile>
+    <ClCompile Include="src\render\reconstruction\d3d12_xess.cpp">
+      <Filter>源文件\render\reconstruction</Filter>
+    </ClCompile>
+    <ClCompile Include="src\render\presentation\d3d12_xessfg.cpp">
+      <Filter>源文件\render\presentation</Filter>
+    </ClCompile>
+    <ClCompile Include="src\render\presentation\d3d12_fsffg.cpp">
+      <Filter>源文件\render\presentation</Filter>
+    </ClCompile>
+    <ClCompile Include="src\platform\d3d12_window_host.cpp">
+      <Filter>源文件\platform</Filter>
+    </ClCompile>
+    <ClCompile Include="src\render\presentation\d3d12_hdr_state.cpp">
+      <Filter>源文件\render\presentation</Filter>
+    </ClCompile>
+    <ClCompile Include="src\render\config\d3d12_rt_state.cpp">
+      <Filter>源文件\render\config</Filter>
+    </ClCompile>
+    <ClCompile Include="src\render\presentation\d3d12_surface_opts_state.cpp">
+      <Filter>源文件\render\presentation</Filter>
+    </ClCompile>
+    <ClCompile Include="src\backend\memory\d3d12_async_descriptor.cpp">
+      <Filter>源文件\backend\memory</Filter>
+    </ClCompile>
+    <ClCompile Include="src\backend\command\d3d12_async_fence.cpp">
+      <Filter>源文件\backend\command</Filter>
+    </ClCompile>
+    <ClCompile Include="src\diagnostics\d3d12_rtx_probe.cpp">
+      <Filter>源文件\diagnostics</Filter>
+    </ClCompile>
+    <ClCompile Include="src\render\reconstruction\d3d12_dlss.cpp">
+      <Filter>源文件\render\reconstruction</Filter>
+    </ClCompile>
+    <ClCompile Include="src\render\terrain\d3d12_mesh_base.cpp">
+      <Filter>源文件\render\terrain</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Clang">
+      <UniqueIdentifier>{290ccbfd-679b-4539-b160-436dd406c8ce}</UniqueIdentifier>
     </Filter>
     <Filter Include="Git">
       <UniqueIdentifier>{65e87141-94df-4d6f-bb84-3d6c7ad16cd0}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Git\GitHub Workflow">
+      <UniqueIdentifier>{d1d639b8-87f2-45d0-83ce-a5b66263bf1b}</UniqueIdentifier>
+    </Filter>
     <Filter Include="vcpkg">
       <UniqueIdentifier>{67ad78c8-1db5-475f-846a-c5c05be7adbe}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="头文件">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
     </Filter>
     <Filter Include="文档">
       <UniqueIdentifier>{5ee6661a-0203-4fdb-a269-1728a26b5f2e}</UniqueIdentifier>
     </Filter>
-    <Filter Include="Clang">
-      <UniqueIdentifier>{290ccbfd-679b-4539-b160-436dd406c8ce}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="Git\GitHub Workflow">
-      <UniqueIdentifier>{d1d639b8-87f2-45d0-83ce-a5b66263bf1b}</UniqueIdentifier>
-    </Filter>
     <Filter Include="解决方案">
       <UniqueIdentifier>{a2e5ce29-54df-41f7-b36e-8c6c7a16533e}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="资源文件">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
@@ -126,115 +303,5 @@
     <ClInclude Include="include\mcdr_window_host.h">
       <Filter>头文件</Filter>
     </ClInclude>
-  </ItemGroup>
-  <ItemGroup>
-    <ClCompile Include="src\module\c_abi\mcdr_abi_common.cppm">
-      <Filter>模块接口\C ABI</Filter>
-    </ClCompile>
-    <ClCompile Include="src\module\core\mcdr_error.cppm">
-      <Filter>模块接口\Core</Filter>
-    </ClCompile>
-    <ClCompile Include="src\module\core\d3d12_descriptor_allocator.cppm">
-      <Filter>模块接口\Core</Filter>
-    </ClCompile>
-    <ClCompile Include="src\module\core\d3d12_async_descriptor.cppm">
-      <Filter>模块接口\Core</Filter>
-    </ClCompile>
-    <ClCompile Include="src\module\core\d3d12_async_fence.cppm">
-      <Filter>模块接口\Core</Filter>
-    </ClCompile>
-    <ClCompile Include="src\module\core\d3d12_async_executor.cppm">
-      <Filter>模块接口\Core</Filter>
-    </ClCompile>
-    <ClCompile Include="src\module\core\d3d12_async_bundle.cppm">
-      <Filter>模块接口\Core</Filter>
-    </ClCompile>
-    <ClCompile Include="src\module\core\mcdr_device.cppm">
-      <Filter>模块接口\Core</Filter>
-    </ClCompile>
-    <ClCompile Include="src\module\advanced\d3d12_mesh.cppm">
-      <Filter>模块接口\Advanced</Filter>
-    </ClCompile>
-    <ClCompile Include="src\c_abi\abi_common.cpp">
-      <Filter>源文件\C ABI</Filter>
-    </ClCompile>
-    <ClCompile Include="src\c_abi\abi_meta.cpp">
-      <Filter>源文件\C ABI</Filter>
-    </ClCompile>
-    <ClCompile Include="src\c_abi\abi_device.cpp">
-      <Filter>源文件\C ABI</Filter>
-    </ClCompile>
-    <ClCompile Include="src\c_abi\abi_command.cpp">
-      <Filter>源文件\C ABI</Filter>
-    </ClCompile>
-    <ClCompile Include="src\c_abi\abi_pipeline.cpp">
-      <Filter>源文件\C ABI</Filter>
-    </ClCompile>
-    <ClCompile Include="src\c_abi\abi_draw.cpp">
-      <Filter>源文件\C ABI</Filter>
-    </ClCompile>
-    <ClCompile Include="src\c_abi\abi_mesh.cpp">
-      <Filter>源文件\C ABI</Filter>
-    </ClCompile>
-    <ClCompile Include="src\c_abi\abi_surface.cpp">
-      <Filter>源文件\C ABI</Filter>
-    </ClCompile>
-    <ClCompile Include="src\c_abi\abi_async.cpp">
-      <Filter>源文件\C ABI</Filter>
-    </ClCompile>
-    <ClCompile Include="src\c_abi\abi_sr.cpp">
-      <Filter>源文件\C ABI</Filter>
-    </ClCompile>
-    <ClCompile Include="src\core\dllmain.cpp">
-      <Filter>源文件\Core</Filter>
-    </ClCompile>
-    <ClCompile Include="src\core\d3d12_descriptor_allocator.cpp">
-      <Filter>源文件\Core</Filter>
-    </ClCompile>
-    <ClCompile Include="src\core\d3d12_device.cpp">
-      <Filter>源文件\Core</Filter>
-    </ClCompile>
-    <ClCompile Include="src\core\d3d12_surface.cpp">
-      <Filter>源文件\Core</Filter>
-    </ClCompile>
-    <ClCompile Include="src\core\d3d12_sr.cpp">
-      <Filter>源文件\Core</Filter>
-    </ClCompile>
-    <ClCompile Include="src\core\d3d12_fsr.cpp">
-      <Filter>源文件\Core</Filter>
-    </ClCompile>
-    <ClCompile Include="src\core\d3d12_xess.cpp">
-      <Filter>源文件\Core</Filter>
-    </ClCompile>
-    <ClCompile Include="src\core\d3d12_async_descriptor.cpp">
-      <Filter>源文件\Core</Filter>
-    </ClCompile>
-    <ClCompile Include="src\core\d3d12_async_fence.cpp">
-      <Filter>源文件\Core</Filter>
-    </ClCompile>
-    <ClCompile Include="src\advanced\d3d12_mesh_base.cpp">
-      <Filter>源文件\Advanced</Filter>
-    </ClCompile>
-    <ClCompile Include="src\advanced\d3d12_dlss.cpp">
-      <Filter>源文件\Advanced</Filter>
-    </ClCompile>
-    <ClCompile Include="src\advanced\smaa_luts.cpp">
-      <Filter>源文件\Advanced</Filter>
-    </ClCompile>
-    <ClCompile Include="src\advanced\d3d12_rtx_probe.cpp">
-      <Filter>源文件\Advanced</Filter>
-    </ClCompile>
-    <ClCompile Include="src\core\d3d12_hdr_state.cpp">
-      <Filter>源文件\Core</Filter>
-    </ClCompile>
-    <ClCompile Include="src\core\d3d12_rt_state.cpp">
-      <Filter>源文件\Advanced</Filter>
-    </ClCompile>
-    <ClCompile Include="src\core\d3d12_surface_opts_state.cpp">
-      <Filter>源文件\Core</Filter>
-    </ClCompile>
-    <ClCompile Include="src\core\d3d12_window_host.cpp">
-      <Filter>源文件</Filter>
-    </ClCompile>
   </ItemGroup>
 </Project>
