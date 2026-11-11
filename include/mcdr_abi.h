@@ -143,7 +143,7 @@ typedef struct mcdr_fence_mgr mcdr_fence_mgr;
 // recorder. Replaces bType/bBuf/bOff/bLen/bView.
 typedef struct mcdr_binding_slot {
     int32_t type;          // 0 = CBV, 1 = SRV (texture view), 2 = SRV (texel buffer)
-    int32_t texelFormat;   // type 2 only: GpuFormat ordinal
+    int32_t texelFormat;   // type 2: GpuFormat ordinal, -1 = RAW SRV (offset aligned to 4 bytes)
     mcdr_object* buffer;        // type 0/2 only
     mcdr_object* view;          // type 1 only
     int64_t offset;        // type 0/2 only

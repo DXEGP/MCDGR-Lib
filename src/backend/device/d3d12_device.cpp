@@ -5038,6 +5038,38 @@ mcdr::Result<void> setIndexBuffer(CommandContext* ctx, Dx12Object* buffer, int i
     return {};
 }
 
+namespace {
+
+mcdr::Result<D3D12_SHADER_RESOURCE_VIEW_DESC> bufferSrvDescription(
+    const Dx12Object* buffer, long long offset, long long length, int texelFormat) {
+    if (offset < 0 || length <= 0 || offset > buffer->size || length > buffer->size - offset) {
+        return mcdr::err("bufferSrvDescription", "Buffer SRV range is invalid");
+    }
+    const bool raw = texelFormat == -1;
+    D3D12_SHADER_RESOURCE_VIEW_DESC description{};
+    description.Format = raw ? DXGI_FORMAT_R32_TYPELESS : toDxgiFormat(texelFormat);
+    if (description.Format == DXGI_FORMAT_UNKNOWN) {
+        return mcdr::err("bufferSrvDescription", "Buffer SRV format is unsupported");
+    }
+    const UINT elementBytes = raw ? 4u : std::max<UINT>(1u, blockSizeFor(description.Format));
+    if (offset % elementBytes != 0 || (!raw && length % elementBytes != 0)) {
+        return mcdr::err("bufferSrvDescription", "Buffer SRV offset or length is unaligned");
+    }
+    const UINT64 elementCount = (static_cast<UINT64>(length) + elementBytes - 1) / elementBytes;
+    if (elementCount > UINT_MAX || static_cast<UINT64>(offset) + elementCount * elementBytes
+            > buffer->resource->GetDesc().Width) {
+        return mcdr::err("bufferSrvDescription", "Buffer SRV exceeds its allocation");
+    }
+    description.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    description.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    description.Buffer.FirstElement = static_cast<UINT64>(offset) / elementBytes;
+    description.Buffer.NumElements = static_cast<UINT>(elementCount);
+    description.Buffer.Flags = raw ? D3D12_BUFFER_SRV_FLAG_RAW : D3D12_BUFFER_SRV_FLAG_NONE;
+    return description;
+}
+
+}
+
 mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindings) {
     if (!ctx || !ctx->listOpen) {
         return mcdr::err("pushDescriptors", "pushDescriptors: no open command list");
@@ -5245,18 +5277,9 @@ mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBi
                 transitionBufferTo(ctx, b.buffer,
                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                                        | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-                D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-                srv.Format = toDxgiFormat(b.texelFormat);
-                if (srv.Format == DXGI_FORMAT_UNKNOWN) {
-                    return mcdr::err("pushDescriptors", "pushDescriptors: unsupported texel buffer format "
-                                                            + std::to_string(b.texelFormat));
-                }
-                srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-                srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                UINT elementBytes = std::max<UINT>(1u, blockSizeFor(srv.Format));
-                srv.Buffer.FirstElement = static_cast<UINT>(b.offset / elementBytes);
-                srv.Buffer.NumElements = static_cast<UINT>(b.length / elementBytes);
-                gCtx.device->CreateShaderResourceView(b.buffer->resource.Get(), &srv, dst);
+                auto description = bufferSrvDescription(b.buffer, b.offset, b.length, b.texelFormat);
+                if (!description) return std::unexpected(description.error());
+                gCtx.device->CreateShaderResourceView(b.buffer->resource.Get(), &description.value(), dst);
                 ++srvIdx;
                 break;
             }
@@ -5362,18 +5385,9 @@ mcdr::Result<void> writeBufferSRVToDrawHeap(UINT slot, Dx12Object* buf, long lon
     if (!buf || buf->kind != Dx12Object::Kind::Buffer || !buf->resource) {
         return mcdr::err("writeBufferSRVToDrawHeap", "writeBufferSRVToDrawHeap: invalid buffer");
     }
-    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Format = toDxgiFormat(texelFormat);
-    if (srv.Format == DXGI_FORMAT_UNKNOWN) {
-        return mcdr::err("writeBufferSRVToDrawHeap", "writeBufferSRVToDrawHeap: unsupported texel buffer format "
-                                                         + std::to_string(texelFormat));
-    }
-    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    UINT elementBytes = std::max<UINT>(1u, blockSizeFor(srv.Format));
-    srv.Buffer.FirstElement = static_cast<UINT>(static_cast<UINT64>(offset) / elementBytes);
-    srv.Buffer.NumElements = static_cast<UINT>(static_cast<UINT64>(length) / elementBytes);
-    gCtx.device->CreateShaderResourceView(buf->resource.Get(), &srv, drawHeapCpuSlot(slot));
+    auto description = bufferSrvDescription(buf, offset, length, texelFormat);
+    if (!description) return std::unexpected(description.error());
+    gCtx.device->CreateShaderResourceView(buf->resource.Get(), &description.value(), drawHeapCpuSlot(slot));
     return {};
 }
 
