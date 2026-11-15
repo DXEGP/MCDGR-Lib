@@ -1,11 +1,6 @@
-// abi_framegen.cpp — P295：帧生成（FG）抽象层的 C ABI 适配单元（模块 mcdr.abi.common）
-//
-// 与 `abi_sr.cpp`（P271）同形：只校验参数、填表、把调用交给 `mcdr.d3d12.device` 里的
-// 注册表（`src\core\d3d12_framegen.cpp`）。**这里不许出现任何厂商名** —— 加 FSR-FG /
-// XeSS-FG 时本文件应当一行都不用改（P272 对 SR 已经验证过这条分层纪律）。
-//
-// 资源指针约定与 SR 段一致：一律是 JVM 创建的纹理句柄（`mcdr_object*`），不是
-// `ID3D12Resource*`；解包发生在模块侧。
+// abi_framegen.cpp — frame-generation C ABI adapter, module mcdr.abi.common: validate, fill the POD
+// table, forward to the registry in src\advanced\d3d12_framegen.cpp (resource args are JVM handles).
+// 见 docs\advanced\framegen.md
 
 module;
 
@@ -27,18 +22,17 @@ void MCDR_CALL mcdr_dx12FgSetConstants(const mcdr_fg_constants* constants)
     fgSetFrameConstants(constants);
 }
 
-// P293：记录期望后端。不建也不销毁 —— 重建在下一帧的 fgEnsureProvider 里，与 P280 同构。
+// Records the wanted backend only; the rebuild happens in the next frame's fgEnsureProvider.
 int32_t MCDR_CALL mcdr_dx12FgPick(int32_t backend) {
     return fgPickBackend(backend);
 }
 
-// P293：能力面。`available` 才是结论，返回值只表示"这张表填好了"。
+// `available` is the verdict; the return value only means the table was filled.
 int32_t MCDR_CALL mcdr_dx12FgQueryCaps(int32_t backend, mcdr_fg_caps* out) {
     if (out == nullptr) {
         return -1;
     }
-    // 0..3 之外一律 -1：注册表内部也会挡，但这里先挡一层，免得非法 id 把表填成
-    // "unknown backend" 却返回成功（调用方会当成"表有效"）。
+    // 0..3 之外一律 -1：非法 id 若填成 "unknown backend" 再返回成功，调用方会当成表有效。
     if (backend < MCDR_FG_BACKEND_NONE || backend > MCDR_FG_BACKEND_XESSFG) {
         return -1;
     }
@@ -46,8 +40,8 @@ int32_t MCDR_CALL mcdr_dx12FgQueryCaps(int32_t backend, mcdr_fg_caps* out) {
     return 1;
 }
 
-// P293：设期望值。**只记录**，真正的 slDLSSGSetOptions 在渲染线程的下一次 present 前
-// 下发（SL 官方文档 §6 明确说选项在下一次 Present 生效，跨线程调用会落到不确定的那次）。
+// Records the wanted mode only: the real slDLSSGSetOptions goes out on the render thread
+// before the next present, so a cross-thread call would land on an undefined frame.
 int32_t MCDR_CALL mcdr_dx12FgSetMode(const mcdr_fg_dispatch* desc) {
     if (desc == nullptr) {
         return -1;
@@ -55,13 +49,12 @@ int32_t MCDR_CALL mcdr_dx12FgSetMode(const mcdr_fg_dispatch* desc) {
     return fgSetMode(*desc);
 }
 
-// P293c：上一次 Present 真正提交的帧数（1 = 没插帧）。老入口
-// `mcdr_dx12GetDlssgPresented` 读到的是同一个数（两者都落到 provider->presented()）。
+// Frames actually presented last time (1 = no interpolation).
 int32_t MCDR_CALL mcdr_dx12FgPresented(void) {
     return fgPresented();
 }
 
-// P293：一行状态文本。与 mcdr_dx12SrQuery 一样走 writeString（NUL 结尾 + 返回长度）。
+// One-line status text via writeString: (NULL,0) probes size+1, a short buffer is not an error.
 int32_t MCDR_CALL mcdr_dx12FgStatus(char* note, int32_t noteCap) {
     if (noteCap < 0 || (noteCap > 0 && note == nullptr)) {
         return -1;
@@ -74,26 +67,22 @@ int32_t MCDR_CALL mcdr_dx12FgStatus(char* note, int32_t noteCap) {
     return mcdr::abi::writeString(text, note, noteCap);
 }
 
-// P300：把「期望 / 链 / 是否真的有一个活着的后端 / 重建次数」压进一个 int32 返回。
-// 存在理由：P300 的回滚会在 native 侧把期望的 mode 清成 0，而 JVM 的 `options.txt` 仍然写着
-// 「开」—— 界面就会说假话。让 JVM 读一个整数比让它解析 `mcdr_dx12FgStatus` 的文本可靠。
-// 位布局写在 `include\mcdr_abi.h` 的声明处（那是唯一契约），这里不做二次解释。
+// Packs wanted / chain / backend-alive / rebuild-count into one int32 (bit layout in
+// include\mcdr_abi.h): a rollback clears the wanted mode while the JVM's options file still says "on".
 int32_t MCDR_CALL mcdr_dx12FgState(void) {
     return fgStatePacked();
 }
 
-// P305c：UI 纹理（用户的裁决 = GUI 合成目标当 UI 纹理）。
+// UI texture: the GUI composition target (a JVM texture handle).
 void MCDR_CALL mcdr_dx12FgSetUiTexture(void* object) { fgSetUiTexture(object); }
 
-// P306ac：hudless 呈现开关与"UI 由谁合成"的查询。语义全在 `mcdr_abi.h` 的声明处，
-// 这一层只做转发（P272 的纪律：abi 文件里不出现任何厂商名）。
+// Hudless-present switch and "who composites the UI" query; semantics live in mcdr_abi.h.
 void MCDR_CALL mcdr_dx12FgSetUiComposition(int32_t enabled) { fgSetUiComposition(enabled); }
 int32_t MCDR_CALL mcdr_dx12FgUiCompositionReady(void) { return fgUiCompositionReady(); }
 
-// P305ag：DLSS 超分路径的逐帧 tag 桥（**内部**，JVM 不调）。
-// 为什么要在 C ABI 里绕一下：`d3d12_dlss.cpp` 是普通翻译单元、不 import 设备模块，直接声明
-// 模块函数会踩 `d3d12_mesh_base.cpp` 记录过的"模块私有名 vs 公共名"链接坑。这里只过 POD，
-// 类型全都落在 C ABI 上，两侧修饰名一致。
+// Internal (JVM never calls it): the DLSS path's per-frame tag bridge. src\advanced\d3d12_dlss.cpp is
+// a plain TU that cannot name module types, so only PODs travel here and both mangled names agree.
+// 见 docs\c_abi\README.md §3.2
 void MCDR_CALL mcdr_fgTagDlssInputs(void* cmdList, void* color, int32_t colorState, void* depth,
                                     int32_t depthState, void* motionVectors, int32_t motionVectorState) {
     FgFrameInputs in{};

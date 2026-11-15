@@ -1,8 +1,9 @@
-// abi_pipeline.cpp — graphics pipeline creation/destruction
+// abi_pipeline.cpp — graphics pipeline creation/destruction.
 //
-// Group: graphics pipelines (originally abi_bridge_p4.cpp).
-// 合并自：abi_bridge_p4.cpp
-//
+// The descriptor is a real struct (mcdr_pipeline_desc) whose layout the JVM mirrors with
+// MemoryLayout and verifies through mcdrABILayout(), so there is nothing to unpack here.
+// 见 docs\c_abi\README.md §3.2
+
 module;
 
 #include "_d3d12_module_prelude.h"
@@ -20,34 +21,9 @@ import mcdr.d3d12.async_fence;
 
 using namespace d3d12_mc;
 
-// ===========================================================================
-// 本文件是合并后的 C ABI 适配单元，按**功能**命名（不再按移植阶段 pX）。
-// 共享前言（prelude / mcdr_abi.h / 各模块 import）统一放在文件顶部，下面每一段
-// 保留原单元的文件头注释与代码本体，内容逐字节未改。
-// ===========================================================================
-
-// ---------------------------------------------------------------------------
-// 来源单元：abi_bridge_p4.cpp
-// ---------------------------------------------------------------------------
-
-// abi_pipeline.cpp — graphics pipeline creation/destruction.（合并自 abi_bridge_p4.cpp）
-//
-// Replaces jni_bridge_p4.cpp (172 lines). That file's entire body was a
-// hand-written little-endian unpacker for the packed descriptor ByteBuffer the
-// Java side built with putInt/putU8. Because the blob carried no field
-// identifiers, every offset was a magic number on both sides and a single
-// mis-ordered field silently produced a wrong pipeline; the semantic names even
-// had to travel in a separate trailing section and were re-associated with
-// their input elements by array index.
-//
-// Here the descriptor is a real struct (mcdr_pipeline_desc) whose layout the
-// Java side mirrors with MemoryLayout.structLayout and whose offsets are
-// verified at load time by mcdrABILayout(). There is nothing left to unpack.
-
 namespace {
 
-// Bounds the old unpacker enforced inline. Kept as named constants because they
-// are the contract with createGraphicsPipeline(), not incidental limits.
+// Contract with createGraphicsPipeline(), not incidental limits.
 constexpr int32_t kMaxColorTargets = 8;
 constexpr int32_t kMaxInputElements = 64;
 constexpr int32_t kMaxPipelineBindings = 64;
@@ -71,9 +47,7 @@ PipelinePtr* MCDR_CALL mcdr_dx12CreateGraphicsPipeline(const mcdr_pipeline_desc*
     d3d12_mc::PipelineDesc d;
 
     // --- shader bytecode ---------------------------------------------------
-    // The old path went through NewDirectByteBuffer + GetDirectBufferAddress,
-    // which rejected heap buffers with a bare stderr line. A null/length
-    // mismatch is now an explicit, reportable error.
+    // A null pointer with a non-zero length is an explicit, reportable error.
     if (desc->vsLen < 0 || (desc->vsLen > 0 && desc->vsData == nullptr)) {
         return failWithPtr<PipelinePtr>(kCreate, "vsData/vsLen mismatch");
     }
@@ -143,10 +117,8 @@ PipelinePtr* MCDR_CALL mcdr_dx12CreateGraphicsPipeline(const mcdr_pipeline_desc*
         dst.offset = src.offset;
         dst.stride = src.stride;
         dst.stepRate = src.stepRate;
-        // NULL or "" keeps std::string empty, which createGraphicsPipeline()
-        // already understands as "fall back to TEXCOORD". This is the field the
-        // packed Java blob could not express at all: it had to ship the names in
-        // a separate trailing section and hope the ordering matched.
+        // An empty semanticName stays empty, which createGraphicsPipeline() reads as
+        // "fall back to TEXCOORD".
         if (src.semanticName != nullptr && src.semanticName[0] != '\0') {
             dst.semanticName = src.semanticName;
         }
@@ -168,8 +140,7 @@ PipelinePtr* MCDR_CALL mcdr_dx12CreateGraphicsPipeline(const mcdr_pipeline_desc*
 
     const auto r = d3d12_mc::createGraphicsPipeline(d);
     if (!r) {
-        // The old bridge printed err to stderr and returned 0, so Java only ever
-        // saw "pipeline handle is 0". The message now survives the boundary.
+        // The message crosses the boundary; Java used to see only a null handle.
         return failWithPtr<PipelinePtr>(kCreate, r.error().message);
     }
     return static_cast<PipelinePtr*>(*r);

@@ -1,8 +1,5 @@
-// abi_surface.cpp — DXGI swapchain surface: create/configure/acquire/blit/present, back-buffer handles, pixel readback
-//
-// Group: DXGI surface (originally abi_bridge_p5.cpp).
-// 合并自：abi_bridge_p5.cpp
-//
+// abi_surface.cpp - DXGI swapchain surface: create/configure/acquire/blit/present, back-buffer handles, pixel readback
+
 module;
 
 #include "_d3d12_module_prelude.h"
@@ -10,10 +7,10 @@ module;
 module mcdr.abi.common;
 
 #include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
-#include "mcdr_dlss_impl.h"  // P291e: mcdr_dlss_output_state()（DLSS 输出纹理的真实状态）
-#include "mcdr_hdr_state.h"  // P198: 建链时实际用掉的 HDR 模式（普通 TU 的 C 状态）
-#include "mcdr_rt_state.h"  // P117: 光追可见性分层总开关（普通 TU 的 C 状态）
-#include "mcdr_surface_opts_state.h"  // P251: 交换链建链选项（普通 TU 的 C 状态）
+#include "mcdr_dlss_impl.h"  // mcdr_dlss_output_state()：DLSS 输出纹理的真实状态
+#include "mcdr_hdr_state.h"  // 建链时实际用掉的 HDR 模式（普通 TU 的 C 状态）
+#include "mcdr_rt_state.h"  // 光追可见性分层总开关（普通 TU 的 C 状态）
+#include "mcdr_surface_opts_state.h"  // 交换链建链选项（普通 TU 的 C 状态）
 
 import mcdr.d3d12.device;
 import mcdr.d3d12.mesh;
@@ -26,37 +23,9 @@ import mcdr.error;
 
 using namespace d3d12_mc;
 
-// ===========================================================================
-// 本文件是合并后的 C ABI 适配单元，按**功能**命名（不再按移植阶段 pX）。
-// 共享前言（prelude / mcdr_abi.h / 各模块 import）统一放在文件顶部，下面每一段
-// 保留原单元的文件头注释与代码本体，内容逐字节未改。
-// ===========================================================================
-
-// ---------------------------------------------------------------------------
-// 来源单元：abi_bridge_p5.cpp
-// ---------------------------------------------------------------------------
-
-// abi_surface.cpp — DXGI swapchain surface entry points.（合并自 abi_bridge_p5.cpp）
-//
-// Replaces jni_bridge_p5.cpp (438 lines). Two things changed beyond the
-// mechanical translation:
-//
-//  1. The two 3x3 pixel-readback functions were 150 lines of near-duplicate
-//     staging/allocator/command-list setup between them. They now share one
-//     file-local readbackSamples36() helper, which also means they share one
-//     cached staging resource instead of two. The observable behaviour is
-//     identical: same size guard, same 256-byte pitch alignment, same sampling
-//     coordinates, same raw 0-255 byte values, same 36-int output layout.
-//
-//  2. Failures report through mcdrLastError() instead of returning a Java null
-//     array; the diagnostic stderr lines the source project relied on are kept
-//     verbatim so existing log captures still work.
-
 namespace {
 
-// 把被调方的 Result 失败原因折进本函数的纯文本诊断串（不带 "where: " 前缀，
-// 下游 failWith 自己补前缀），成功则原样继续。readbackSamples36 的 err 出参
-// 保持纯文本，是为了不改变这些既有诊断字符串的内容。
+// 把 Result 失败原因折进纯文本诊断串（不带 "where: " 前缀，failWith 自己补），成功返回 1。
 int32_t bindErr(const mcdr::Result<void>& r, std::string& err) {
     if (!r) {
         err = r.error().message;
@@ -65,14 +34,11 @@ int32_t bindErr(const mcdr::Result<void>& r, std::string& err) {
     return 1;
 }
 
-// Reads a 3x3 sample grid out of `res` and writes 9 pixels x RGBA as 36 ints.
-// Values are the raw bytes (0-255), not normalised — matching the original.
-// P291e：`fromState` 必须是这张纹理**当前真实所处的状态**。原来写死 COMMON，只对
-// "建完就没被 GPU 写过"的纹理成立；被 DLSS 写过的输出纹理在帧末停在 COPY_SOURCE
-// （d3d12_dlss.cpp:2758）或 UNORDERED_ACCESS（:2783，FG 开时），按 COMMON 转过去是
-// 状态不匹配的非法 barrier，取回的内容未定义 —— 实测恒为 0，于是"全黑"判据一直是
-// 在拿垃圾做决定（2026-10-27 用户 m01721 的抖动就是这么来的：DLSS 输出明明正常，
-// 却被熔断成永久线性 blit）。
+// Reads a 3x3 sample grid out of `res`; writes 9 pixels x RGBA as 36 ints, raw bytes 0-255.
+// `fromState` 必须是这张纹理**当前真实所处的状态**：写死 COMMON 时，被 GPU 写过的纹理（停在
+// COPY_SOURCE / UNORDERED_ACCESS）会得到非法 barrier，读回内容未定义（恒为 0）。
+// pitch 按 D3D12_TEXTURE_DATA_PITCH_ALIGNMENT（256B）上对齐；Map 前必须等到 queue fence，
+// 否则读到的是上一帧内容。
 int32_t readbackSamples36(ID3D12Resource* res, UINT w, UINT h, UINT bpp, DXGI_FORMAT fbFmt,
                           D3D12_RESOURCE_STATES fromState, D3D12_RESOURCE_STATES finalState,
                           int32_t* out, std::string& err) {
@@ -170,7 +136,7 @@ int32_t readbackSamples36(ID3D12Resource* res, UINT w, UINT h, UINT bpp, DXGI_FO
     void* ptr = nullptr;
     if (FAILED(staging->Map(0, nullptr, &ptr))) {
         const HRESULT rr2 = ctx.device ? ctx.device->GetDeviceRemovedReason() : E_FAIL;
-        dbgLogError("readbackSamples36: Map failed fmt=%d %ux%u removedReason=0x%08X", static_cast<int>(fbFmt),
+        dbgLogError("readback: map failed fmt=%d %ux%u reason=0x%08X", static_cast<int>(fbFmt),
                     w, h, static_cast<unsigned>(rr2));
         err = "staging Map failed";
         return 0;
@@ -207,8 +173,7 @@ mcdr_surface* MCDR_CALL mcdr_dx12CreateSurface(uint64_t hwnd) {
 }
 
 int32_t MCDR_CALL mcdr_dx12SurfacePresentModes(int32_t* out, int32_t cap) {
-    // Returns the TOTAL number of modes so a caller can size-then-retry; only
-    // min(cap, total) entries are written.
+// Returns the TOTAL mode count so a caller can size-then-retry; only min(cap, total) are written.
     const std::vector<int> modes = surfacePresentModes();
     const int32_t total = static_cast<int32_t>(modes.size());
     if (out) {
@@ -223,8 +188,7 @@ int32_t MCDR_CALL mcdr_dx12SurfacePresentModes(int32_t* out, int32_t cap) {
 int32_t MCDR_CALL mcdr_dx12ConfigureSurface(mcdr_surface* surface, int32_t width, int32_t height,
                                             int32_t presentMode) {
     if (const auto r = configureSurface(surface, width, height, presentMode); !r) {
-        // A failed configure is exactly the surfaceIsInvalid -> frozen-picture
-        // root cause, so it must reach dx12-native.log rather than only stderr.
+// A failed configure freezes the picture, so it must reach dx12-native.log rather than only stderr.
         d3d12_mc::dbgLogError("dx12ConfigureSurface FAILED %dx%d mode=%d: %s", width, height, presentMode,
                          r.error().message.c_str());
         return mcdr::abi::failWith("mcdr_dx12ConfigureSurface", r.error().message);
@@ -233,7 +197,7 @@ int32_t MCDR_CALL mcdr_dx12ConfigureSurface(mcdr_surface* surface, int32_t width
     return 1;
 }
 
-// P196：真独占全屏开关。26.3 的 SDL 独占只改显示模式，DXGI 侧需要显式 SetFullscreenState。
+// 真独占全屏：SDL 独占只改显示模式，DXGI 侧必须显式 SetFullscreenState。
 int32_t MCDR_CALL mcdr_dx12SetExclusiveFullscreen(mcdr_surface* surface, int32_t on) {
     if (const auto r = setExclusiveFullscreen(surface, on != 0); !r) {
         // 非致命：驱动/覆盖层拒绝时画面仍可走窗口化，记 WARN 即可，不要升级成 ERROR。
@@ -248,64 +212,50 @@ int32_t MCDR_CALL mcdr_dx12AcquireSurface(mcdr_surface* surface) {
     if (const auto r = acquireSurface(surface); !r) {
         return mcdr::abi::failWith("mcdr_dx12AcquireSurface", r.error().message);
     }
-    // Once per frame: an unconditional stderr + file flush here was a real cost,
-    // so it is DEBUG level (needs DX12_LOG_VERBOSE=1).
+// Once per frame: DEBUG level only (needs DX12_LOG_VERBOSE=1); an stderr+file flush here is costly.
     d3d12_mc::dbgLogDebug("acquireSurface: ok surface=%p", static_cast<void*>(surface));
     return 1;
 }
 
 void MCDR_CALL mcdr_dx12BlitSurface(mcdr_command_ctx* ctx, mcdr_surface* surface, mcdr_object* texture) {
     if (const auto r = blitSurface(ctx, surface, texture); !r) {
-        // P95 可观测性：blit 失败时 surface->blittedThisFrame 仍为 false，presentSurface()
-        // 会跳过这一帧的 Present（不会 flip 到未写入的 back buffer）。failVoid 只把原因写进
-        // lastError / [mcdr] sink，这里额外按次数在 [dx12] sink 打点，便于把"跳帧"与
-        // "blit 失败"在日志里对上（两个 sink 分开写，只 grep 一个会得到"没有错误"的假象）。
+// blit 失败时 surface->blittedThisFrame 仍为 false，presentSurface() 会跳过这一帧的 Present（不会
+// flip 到未写入的 back buffer）；这里额外在 [dx12] sink 打点，别只 grep 一个 sink。
         static unsigned long long blitFailures = 0;
         ++blitFailures;
         mcdr::abi::failVoid("mcdr_dx12BlitSurface", r.error().message);
         if (blitFailures <= 5 || blitFailures % 60 == 0) {
             d3d12_mc::dbgLogWarn(
-                "dx12BlitSurface: failure #%llu — present will be skipped for this frame",
+                "blit failure #%llu, present skipped",
                 blitFailures);
         }
         return;
     }
-    // 每帧成功路径：级别降到 debug（INFO 下曾占 16k 行/45s）。
+// 每帧成功路径：必须 debug 级，INFO 会刷爆日志。
     d3d12_mc::dbgLogDebug("blitSurface: ok ctx=%p surface=%p texture=%p", static_cast<void*>(ctx),
                          static_cast<void*>(surface), static_cast<void*>(texture));
 }
 
 void MCDR_CALL mcdr_dx12PresentSurface(mcdr_surface* surface) {
-    // P33 + P61 duplicate-Present fix. Under the async path the render thread has
-    // already called presentSurface() after submitCommandList and set
-    // gAsyncOwnsPresent; a second Present flips the swapchain twice, so one
-    // frame's back buffer is never rendered into and the window flickers colours.
-    // Checking gAsyncOwnsPresent alone is not enough (P61): the Java side no longer
-    // blocks on the render thread after submit(), so GpuSurface.present() can run
-    // before that flag is set, and the main thread's Present would then race the
-    // render thread's ExecuteCommandLists/Present on the same swapchain ->
-    // DEVICE_REMOVED 0x887A0005. gAsyncRenderCtx is set by asyncRenderBeginFrame
-    // and cleared only by the next frame's settle, so a non-null value proves the
-    // render thread owns this frame's Present.
+// present 只能发生一次：异步路径下渲染线程已 Present 过（gAsyncOwnsPresent），且 gAsyncRenderCtx
+// 非空证明本帧的 Present 归渲染线程所有 —— 主线程再 Present 会双 flip 并和渲染线程的
+// ExecuteCommandLists/Present 竞争同一交换链 → DEVICE_REMOVED 0x887A0005。
     if (gAsyncOwnsPresent || gAsyncRenderCtx != nullptr) {
         gAsyncOwnsPresent = false;
-        d3d12_mc::dbgLogDebug("dx12PresentSurface: skipped (async render thread owns present) surface=%p",
+        d3d12_mc::dbgLogDebug("present skipped: render thread owns surface=%p",
                               static_cast<void*>(surface));
         return;
     }
     presentSurface(surface);
-    // The real result (ok / OCCLUDED / MODE_CHANGED / FAILED) is logged inside
-    // presentSurface(); logging "ok" here unconditionally used to mask an
-    // OCCLUDED/MODE_CHANGED result, which is what made MC misjudge suboptimal.
+// 真实结果（ok / OCCLUDED / MODE_CHANGED / FAILED）由 presentSurface() 自己记录。
 }
 
 uint64_t MCDR_CALL mcdr_dx12GetBackBufferHandle(mcdr_surface* surface) {
     return static_cast<uint64_t>(getBackBufferHandle(surface));
 }
 
-// P291e：两个公开导出共用这一段。`fromState` 由调用方给出**这张纹理当前的真实状态**
-// （见 readbackSamples36 上方注释）；读回之后恢复成同一个状态，所以对 native 内部的
-// 状态跟踪没有净影响。
+// 两个公开导出共用：`fromState` 由调用方给出这张纹理当前的真实状态，读回后恢复成同一状态，
+// 对 native 内部的状态跟踪没有净影响。
 static int32_t readbackTexturePixelsCore(mcdr_object* texture, int32_t* out, int32_t fromState,
                                          const char* fn) {
     if (!out) {
@@ -356,11 +306,9 @@ static int32_t readbackTexturePixelsCore(mcdr_object* texture, int32_t* out, int
             fbFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
             break;
     }
-    // P235：1 字节格式（R8_*）在原实现里落进 default 分支（bpp=4 + RGBA8 足迹），
-    // 拷贝足迹与源格式不兼容 ⇒ CopyTextureRegion 判非法 ⇒ 设备被移除 ⇒ staging 的
-    // Map 失败（2026-10-25 SRI 自检实测）。只给 R8 家族开一条专用分支：
-    // bpp=1、足迹格式 = 源格式。其余格式保持原有映射不动 —— 改成"一律用源格式"
-    // 会让 compute 自检的 RGBA8 读回变成全 0（同一实测轮次），原因未查明，不冒险。
+// 只给 R8 家族开专用分支：bpp=1、足迹格式 = 源格式。R8 落进 default（bpp=4 + RGBA8 足迹）会因
+// 拷贝足迹与源格式不兼容被 CopyTextureRegion 判非法 → 设备移除。其余格式保持原映射不动 ——
+// 改成"一律用源格式"会让 compute 自检的 RGBA8 读回变成全 0。
     if (td.Format == DXGI_FORMAT_R8_UNORM || td.Format == DXGI_FORMAT_R8_UINT
         || td.Format == DXGI_FORMAT_R8_SNORM || td.Format == DXGI_FORMAT_R8_SINT) {
         bpp = 1;
@@ -385,24 +333,20 @@ int32_t MCDR_CALL mcdr_dx12ReadbackTexturePixels(mcdr_object* texture, int32_t* 
                                      "mcdr_dx12ReadbackTexturePixels");
 }
 
-// P291e：已知起始状态版本。给"被 GPU 写过、当前不在 COMMON"的纹理用 —— 典型场景是
-// DLSS 的输出纹理（帧末停在 COPY_SOURCE 或 UNORDERED_ACCESS）。状态传错读回的就是
-// 未定义内容，所以调用方必须先问 native 这张纹理现在在哪（例如
-// `mcdr_dx12DlssOutputState`），不要凭猜。
+// 已知起始状态版本：给"被 GPU 写过、当前不在 COMMON"的纹理用（典型是 DLSS 输出）。状态传错
+// 读回的就是未定义内容，调用方先用 mcdr_dx12DlssOutputState 问清楚，不要凭猜。
 int32_t MCDR_CALL mcdr_dx12ReadbackTexturePixelsIn(mcdr_object* texture, int32_t fromState,
                                                    int32_t* out) {
     return readbackTexturePixelsCore(texture, out, fromState, "mcdr_dx12ReadbackTexturePixelsIn");
 }
 
-// P291e：DLSS 输出纹理当前所处的状态（D3D12_RESOURCE_STATES 数值）。
-// 0 (COMMON) = 这一帧没有输出纹理/未知，调用方不要据此采样。
+// DLSS 输出纹理当前所处的状态（D3D12_RESOURCE_STATES 数值）。
+// 0 (COMMON) = 这一帧没有输出纹理 / 未知，调用方不要据此采样。
 int32_t MCDR_CALL mcdr_dx12DlssOutputState(void) { return mcdr_dlss_output_state(); }
 
 void MCDR_CALL mcdr_dx12DumpTextureToFile(mcdr_object* texture, const char* tag) {
-    // Reuses dbgReadbackTexturePixels (waitIdle + its own command list +
-    // dbgDumpPixelsToFile writing dx12_dump_<tag>.bmp plus an ASCII thumbnail).
-    // The texture must be in COMMON state (i.e. outside a render pass) or the
-    // barrier validation fails.
+// 走 dbgReadbackTexturePixels（waitIdle + 自己的命令列表，写 dx12_dump_<tag>.bmp 与 ASCII 缩略图）。
+// 纹理必须在 COMMON 状态（render pass 之外），否则 barrier 校验失败。
     dbgReadbackTexturePixels(texture, (tag && *tag) ? tag : "tex");
 }
 
@@ -412,21 +356,22 @@ int32_t MCDR_CALL mcdr_dx12IsSurfaceSuboptimal(mcdr_surface* surface) {
 
 void MCDR_CALL mcdr_dx12SetHdrMode(int32_t mode) { setHdrMode(mode); }
 
-// P117: 光追可见性分层总开关。此刻只做状态存储与日志，G-Buffer/采样的创建在 device 侧。
+// 光追可见性分层总开关：此刻只做状态存储与日志，G-Buffer/采样的创建在 device 侧。
 void MCDR_CALL mcdr_dx12SetRaytracingMode(int32_t mode) {
     mcdr_rt_state_set_mode(mode);
     dbgLog("raytracing mode=%d (0=off 1=ao 2=ao_shadows 3=full)", static_cast<int>(mode));
 }
 
-// P251: 交换链建链选项（allowTearing / presentChild）。只写进程状态，下次建链生效。
+// Swapchain options (allow tearing / present child window): state only, applied when the chain is
+// created again.
 void MCDR_CALL mcdr_dx12SetSwapchainOptions(int32_t allowTearing, int32_t forcePresentChild) {
     mcdr_surface_opts_set_allow_tearing(allowTearing);
     mcdr_surface_opts_set_force_present_child(forcePresentChild);
-    dbgLogInfo("swapchain options: allowTearing=%d presentChild=%d (applies on next swapchain creation)",
+    dbgLogInfo("swapchain: allowTearing=%d presentChild=%d",
                static_cast<int>(allowTearing), static_cast<int>(forcePresentChild));
 }
 
-// P198: 建链时实际用掉的 HDR 模式（-1 = 还没建过链），JVM 侧据此提示“需要重启”。
+// 建链时实际用掉的 HDR 模式（-1 = 还没建过链），JVM 侧据此提示需要重启。
 int32_t MCDR_CALL mcdr_dx12GetHdrAppliedMode(void) { return mcdr_hdr_state_applied_mode(); }
 
 void MCDR_CALL mcdr_dx12DestroySurface(mcdr_surface* surface) { destroySurface(surface); }
@@ -446,9 +391,8 @@ int32_t MCDR_CALL mcdr_dx12ReadbackSurfacePixels(mcdr_surface* surface, int32_t*
     }
     int idx = s->currentImageIndex;
     if (idx < 0 || idx >= static_cast<int>(s->backBuffers.size())) {
-        // present() resets currentImageIndex to -1, and GetCurrentBackBufferIndex()
-        // would then report the NEXT frame's buffer, which has not been written
-        // yet (an all-zero false black screen) — hence the lastBlitIndex fallback.
+// present() 会把 currentImageIndex 复位成 -1，此时 GetCurrentBackBufferIndex() 报的是下一帧
+// 的 buffer（还没写入，读回全 0 的假黑屏）—— 故回退到 lastBlitIndex。
         if (s->lastBlitIndex >= 0 && s->lastBlitIndex < static_cast<int>(s->backBuffers.size())) {
             idx = s->lastBlitIndex;
         } else {
@@ -465,14 +409,12 @@ int32_t MCDR_CALL mcdr_dx12ReadbackSurfacePixels(mcdr_surface* surface, int32_t*
     const UINT h = bd.Height;
     dbgLogDebug("readback surf=0x%p idx=%d w=%u h=%u", static_cast<void*>(s), idx, w, h);
     std::string err;
-    // The back buffer is always R8G8B8A8_UNORM, and after the copy it must go back
-    // to PRESENT (not COMMON) or the next Present fails.
-    // P291e：Present 之后 back buffer 就停在 PRESENT，barrier 的 StateBefore 必须照实写。
+// back buffer 恒为 R8G8B8A8_UNORM；拷贝后必须回 PRESENT（不是 COMMON），否则下次 Present 失败。
     if (!readbackSamples36(bb, w, h, 4, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_PRESENT,
                            D3D12_RESOURCE_STATE_PRESENT, out, err)) {
         return mcdr::abi::failWith("mcdr_dx12ReadbackSurfacePixels", err);
     }
-    dbgLogInfo("readback %ux%u center=(%d,%d)=(%d,%d,%d,%d) corners=%d black=%d", w,
+    dbgLogInfo("readback %ux%u center(%d,%d)=%d,%d,%d,%d corners=%d black=%d", w,
                h, static_cast<int>(w) / 2, static_cast<int>(h) / 2, out[(4 * 3 + 4) + 0],
                out[(4 * 3 + 4) + 1], out[(4 * 3 + 4) + 2], out[(4 * 3 + 4) + 3],
                (out[0] != 0 || out[1] != 0 || out[2] != 0) ? 1 : 0,
