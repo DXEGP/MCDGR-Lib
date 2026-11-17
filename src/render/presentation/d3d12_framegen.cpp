@@ -25,8 +25,11 @@ module;
 // FG 的两个既有 C 入口（`mcdr_dlss_set_fg_mode` / `mcdr_dlss_fg_presented`）与 Reflex 的
 // 可用性查询，都在这份头里。P293 不搬它们，只调它们。
 #include "mcdr_dlss_impl.h"
+#include <optional>
 
 module mcdr.d3d12.device;
+
+import mcdr.render.oit;
 
 namespace d3d12_mc {
 
@@ -80,8 +83,45 @@ struct FgRegistry {
     std::string lastReason;
     mcdr_fg_constants constants{};
     bool hasConstants = false;
-    // P305c：UI 纹理（GUI 合成目标）的 `Dx12Object*`，nullptr = 没有。
-    void* uiTexture = nullptr;
+    enum class TicketState { Invalidated, Accepted, Queued, Presented };
+    struct CameraReceipt {
+        FgPresentTicket ticket;
+        TicketState state = TicketState::Invalidated;
+        mcdr_frame_identity identity{};
+        uint64_t historyGeneration = 0;
+        uint64_t providerGeneration = 0;
+        double anchor[3]{};
+        CommandContext* context = nullptr;
+        std::weak_ptr<void> recording;
+        ComPtr<ID3D12Fence> fence;
+        UINT64 fenceValue = 0;
+        bool valid = false;
+        FgFrameInputs facts{};
+    };
+    CameraReceipt pendingCamera;
+    CameraReceipt committedCamera;
+    uint64_t cameraGeneration = 1;
+    uint64_t frameSerial = 0;
+    FgPresentTicket activeFrame;
+    mcdr_frame_identity activeIdentity{};
+    mcdr_frame_settings activeSettings{};
+    uint64_t activeHistoryGeneration = 0;
+    uint32_t activeColorEncoding = 0;
+    bool frameStarted = false;
+    bool providerStarted = false;
+    bool guiReady = false;
+    bool resetPending = false;
+    // Keep both the pool-wrapper lease and the COM resource. Never replay a borrowed
+    // Dx12Object*: a world reset/resize may have closed its JVM owner meanwhile.
+    std::shared_ptr<void> uiLease;
+    ComPtr<ID3D12Resource> uiTexture;
+    struct RecordingUse {
+        ComPtr<ID3D12Fence> fence;
+        UINT64 value = 0;
+        std::weak_ptr<void> recording;
+        bool submitted = false;
+    };
+    std::vector<RecordingUse> recordings;
     // P306ac：hudless 呈现模式（1 = present 的世界层不含 UI，UI 由 provider 合成）。
     // 与 `uiTexture` 同一条纪律：期望值，provider 建成后回放。
     int32_t uiComposition = 0;
@@ -115,11 +155,43 @@ struct FgRegistry {
     bool warnedNotUsable = false;
     // P300：后端已建成、但能力位后来掉成不可用的连续帧数（见 fgAfterPresent 的回滚段）。
     uint64_t unavailableFrames = 0;
+    struct PreparedMode {
+        uint64_t token = 0;
+        mcdr_fg_dispatch description{};
+        uint64_t cameraGeneration = 0;
+        std::unique_ptr<IFrameGenProvider> provider;
+    };
+    std::optional<PreparedMode> preparedMode;
+    uint64_t nextPreparationToken = 1;
 };
 
 FgRegistry& registry() {
     static FgRegistry s;
     return s;
+}
+
+bool invalidateCameraLocked(FgRegistry& state) {
+    ++state.cameraGeneration;
+    state.pendingCamera.state = FgRegistry::TicketState::Invalidated;
+    state.pendingCamera = {};
+    state.committedCamera = {};
+    state.hasConstants = false;
+    if (state.provider) state.provider->discardFrameInputs();
+    return state.applied != MCDR_FG_BACKEND_DLSSG || mcdr_dlss_invalidate_inputs() == 1;
+}
+
+bool recordingComplete(const FgRegistry::RecordingUse& use) {
+    if (use.recording.expired()) return true; // abandoned list, no GPU submission
+    const UINT64 completed = use.fence ? use.fence->GetCompletedValue() : 0;
+    // UINT64_MAX signals device removal, not successful GPU completion.
+    return use.submitted && completed != UINT64_MAX && completed >= use.value;
+}
+
+bool recordingsCompleteLocked(FgRegistry& s) {
+    std::erase_if(s.recordings, recordingComplete);
+    if (s.recordings.empty()) return true;
+    s.lastReason = "FG input recording still live";
+    return false;
 }
 
 // P304：链归属的一个**无锁快照**。
@@ -188,12 +260,71 @@ public:
             appliedFrames_ = desiredFrames_;
             applied_ = true;
         }
+        if (desiredMode_ == 0) (void)mcdr_dlss_invalidate_inputs();
     }
 
     void afterPresent() override {
-        // P296 起这里仍然没有必须做的事：插帧发生在 SL 的 Present 内部，我们这一侧
-        // 只需要在下一帧读 `presented()`。留空是**有意**的，不是还没写。
+        historyAccepted_ = mcdr_dlss_fg_after_present() == 1;
     }
+
+    void discardFrameInputs() override { historyAccepted_ = false; }
+
+    FgInputAcceptance tagFrameInputs(const FgFrameInputs& inputs) override {
+        historyAccepted_ = false;
+        mcdr_dlss_set_fg_mode(desiredMode_, desiredFrames_);
+        mcdr_dlss_input input{};
+        input.renderWidth = inputs.renderWidth;
+        input.renderHeight = inputs.renderHeight;
+        input.targetWidth = inputs.displayWidth;
+        input.targetHeight = inputs.displayHeight;
+        input.pInOutput = static_cast<mcdr_object*>(inputs.pColorOutput);
+        input.pInDepth = static_cast<mcdr_object*>(inputs.pDepth);
+        input.pInMotionVectors = static_cast<mcdr_object*>(inputs.pMotionVectors);
+        mcdr_dlss_constants camera{};
+        std::copy_n(inputs.currentViewProjection, 16, camera.viewProjection);
+        std::copy_n(inputs.previousViewProjection, 16, camera.prevViewProjection);
+        std::copy_n(inputs.projection, 16, camera.projection);
+        camera.jitterOffsetX = inputs.jitterX;
+        camera.jitterOffsetY = inputs.jitterY;
+        camera.mvecScaleX = inputs.mvScaleX / inputs.renderWidth;
+        camera.mvecScaleY = inputs.mvScaleY / inputs.renderHeight;
+        camera.cameraPosX = inputs.cameraPosition[0];
+        camera.cameraPosY = inputs.cameraPosition[1];
+        camera.cameraPosZ = inputs.cameraPosition[2];
+        camera.cameraRightX = inputs.cameraRight[0];
+        camera.cameraRightY = inputs.cameraRight[1];
+        camera.cameraRightZ = inputs.cameraRight[2];
+        camera.cameraUpX = inputs.cameraUp[0];
+        camera.cameraUpY = inputs.cameraUp[1];
+        camera.cameraUpZ = inputs.cameraUp[2];
+        camera.cameraFwdX = inputs.cameraForward[0];
+        camera.cameraFwdY = inputs.cameraForward[1];
+        camera.cameraFwdZ = inputs.cameraForward[2];
+        camera.cameraNear = inputs.cameraNear;
+        camera.cameraFar = inputs.cameraFar;
+        camera.cameraFovRadians = inputs.cameraVerticalFov;
+        camera.cameraAspectRatio = static_cast<float>(inputs.displayWidth) / inputs.displayHeight;
+        camera.depthInverted = 1;
+        camera.cameraMotionIncluded = 1;
+        camera.reset = constants_.resetHistory != 0 ? 1u : 0u;
+        auto* context = recordingContextForCommandList(inputs.cmdList);
+        const auto transition = [](void* rawContext, void* rawResource, int32_t target) {
+            transitionTo(static_cast<CommandContext*>(rawContext),
+                static_cast<ID3D12Resource*>(rawResource), D3D12_RESOURCE_STATE_COMMON,
+                static_cast<D3D12_RESOURCE_STATES>(target));
+        };
+        const int result = mcdr_dlss_submit_display_frame(inputs.cmdList, &input, &camera,
+            static_cast<int32_t>(inputs.colorState), static_cast<int32_t>(inputs.depthState),
+            static_cast<int32_t>(inputs.motionVectorState), inputs.pUi,
+            static_cast<int32_t>(inputs.uiState), inputs.realFrameId,
+            inputs.motionVectorsDilated ? 1u : 0u, inputs.frameTimeDeltaMs, transition, context);
+        return result == 1 ? FgInputAcceptance::Accepted :
+            result == 0 ? FgInputAcceptance::Skipped : FgInputAcceptance::Failed;
+    }
+
+    void setFrameConstants(const mcdr_fg_constants& constants) override { constants_ = constants; }
+
+    bool historyAcceptedAfterPresent() const override { return historyAccepted_; }
 
     int32_t presented() const override { return mcdr_dlss_fg_presented(); }
 
@@ -207,6 +338,7 @@ public:
         // P213e：**必须显式下发 eOff**，否则 SL 还在插帧，界面却已经说关了。
         // P213c：`mcdr_dlss_set_fg_mode(0, …)` 内部会把 presented 复位成 1。
         mcdr_dlss_set_fg_mode(0, desiredFrames_ < 1 ? 1 : desiredFrames_);
+        (void)mcdr_dlss_invalidate_inputs();
         desiredMode_ = 0;
         appliedMode_ = 0;
         applied_ = false;
@@ -219,6 +351,8 @@ private:
     int32_t appliedMode_ = 0;
     int32_t appliedFrames_ = 1;
     bool applied_ = false;
+    bool historyAccepted_ = false;
+    mcdr_fg_constants constants_{};
 };
 
 }  // namespace
@@ -233,17 +367,6 @@ void fillDlssGCaps(mcdr_fg_caps& out) {
     const bool dlssReady = mcdr_dlss_available() != 0;
     const bool streamline = mcdr_dlss_streamline_requested() != 0;
     const bool reflexReady = mcdr_reflex_available() != 0;
-    // P300（补 P281 的已知缺口）：DLSS-G 的 HUDless 与 ScalingOutputColor 都来自 SL 的超分输出，
-    // 所以超分一旦被 pick 成 FSR/XeSS，插帧就没有输入可拿，SL 会静默不插。界面挡住了这条，
-    // 配置文件挡不住（`[sr] backend` 与 `[dlss] framegen` 是两个独立键）—— 所以在这里判。
-    // 判据用「用户选的那家」优先，`active` 只作为没选过时的兜底：
-    // 比例 100% 时 FSR / XeSS 根本不跑（日志 `xess did not run this frame`），但 DLSS 也已经
-    // stand down（`P108: standing down: the SR backend in options.txt is XESS`）—— 按 active
-    // 判会把「选了 XESS 但本帧没跑」当成「没超分」然后放行 DLSS-G，那是假的。
-    const int32_t srSelected = srSelectedBackend();
-    const int32_t srActive = srActiveBackend();
-    const int32_t srBackend = srSelected != MCDR_SR_BACKEND_NONE ? srSelected : srActive;
-    const bool srIsDlss = srBackend == MCDR_SR_BACKEND_NONE || srBackend == MCDR_SR_BACKEND_DLSS;
 
     out.runtimeLoaded = dlssReady ? 1 : 0;
     out.deviceSupported = streamline ? 1 : 0;
@@ -251,10 +374,8 @@ void fillDlssGCaps(mcdr_fg_caps& out) {
     out.chainCompatible = streamline ? 1 : 0;
     // 帧生成依赖 Reflex：SDK 会因为 Reflex 不是 On 而静默禁用插帧（P213）。
     out.needsReflex = 1;
-    // DLSS-G 的 HUDless 复用 SR 的输出（P213 用同一次 slSetTagForFrame 提交），
-    // 不需要调用方再喂一份；UI 也由 SL 在 Present 路径上合成。
-    out.needsUiResource = 0;
-    out.needsHudless = 0;
+    out.needsUiResource = 1;
+    out.needsHudless = 1;
     // SL 自己管被 tag 的资源状态（官方 ProgrammingGuideDLSS_G §5.2），我们不替它转。
     out.transitionsInputs = 0;
     // P225：自己算帧数并 clamp 到 1..5（slDLSSGGetState 的 numFramesToGenerateMax）。
@@ -264,7 +385,7 @@ void fillDlssGCaps(mcdr_fg_caps& out) {
     // P298：DLSS-G 的低延迟方案就是 Reflex（而且不是"可选"—— FG 依赖它，见 needsReflex）。
     out.latencyProvider = MCDR_FG_LATENCY_REFLEX;
 
-    const bool available = dlssReady && streamline && reflexReady && srIsDlss;
+    const bool available = dlssReady && streamline && reflexReady;
     out.available = available ? 1 : 0;
 
     if (!dlssReady) {
@@ -275,9 +396,6 @@ void fillDlssGCaps(mcdr_fg_caps& out) {
         // P298：必须说清"是 Reflex 挡住了"，不能只说 unavailable —— 否则人只会去查 FG 本身。
         // （note 只有 28 B，这句话必须压到 27 字符以内。）
         writeNote(out.note, sizeof(out.note), "needs Reflex, unavailable");
-    } else if (!srIsDlss) {
-        // 同理：说清"是超分后端不对"，否则人会去查 DLSS-G 本身。
-        writeNote(out.note, sizeof(out.note), "needs SR=DLSS");
     } else if (!available) {
         writeNote(out.note, sizeof(out.note), "unavailable");
     } else {
@@ -296,6 +414,10 @@ std::unique_ptr<IFrameGenProvider> makeDlssGProvider() {
 int32_t fgPickBackend(int32_t backendId) {
     FgRegistry& s = registry();
     std::lock_guard<std::mutex> lk(s.mutex);
+    if (s.preparedMode.has_value()) {
+        s.lastReason = "FG backend selection is blocked by a pending preparation";
+        return 0;
+    }
     if (!validBackendId(backendId)) {
         s.lastReason = "unknown frame generation backend id";
         return 0;
@@ -360,8 +482,7 @@ void fgFillCaps(int32_t backendId, mcdr_fg_caps& out) {
 
 // 调用方必须已持锁（`fgEnsureProvider` 与 `fgSetMode` 都会走到这里，别在这里再锁一次，
 // std::mutex 不可重入）。
-// P306m：注册表里的 uiTexture 存的是 Dx12Object* 句柄，provider 只认 ID3D12Resource*，
-// 解包函数定义在文件后部（fgSetUiTexture 旁），这里先声明。
+// Incoming wrappers are unwrapped only while their owner/lease is live.
 ID3D12Resource* unwrapDx12Resource(void* object);
 int32_t ensureProviderLocked(FgRegistry& s) {
     const int32_t target = s.picked;
@@ -371,6 +492,10 @@ int32_t ensureProviderLocked(FgRegistry& s) {
     }
     if (s.provider != nullptr && s.applied == target) {
         return 1;
+    }
+    if (s.frameStarted) {
+        s.lastReason = "frame generation backend change is waiting for display frame completion";
+        return 0;
     }
     // 链已经被另一家接管时**不允许热切换**。代理链的引用在 surface 手里：旧 provider 一销毁，
     // 到下一帧 acquire 之前那一次 Present 就会走一条已经没有上下文的链（实测 FFX 侧返回
@@ -390,7 +515,12 @@ int32_t ensureProviderLocked(FgRegistry& s) {
         // 绑在代理链上，不解包就 shutdown，代理链会留在 `IDXGISwapChain` 里；
         // 新后端再包一次 = 双重包装，实测 FFX 直接返回
         // `FFX_API_RETURN_ERROR_RUNTIME_ERROR` (0x3)。
-        s.provider->unwrapSwapChain();
+        invalidateCameraLocked(s);
+        if (!recordingsCompleteLocked(s) || !s.provider->waitForPreviousFrame() ||
+            !s.provider->tryUnwrapSwapChain()) {
+            s.rebuildPending = true;
+            return 0;
+        }
         s.provider->shutdown();
         s.provider.reset();
         s.applied = MCDR_FG_BACKEND_NONE;
@@ -440,17 +570,14 @@ int32_t ensureProviderLocked(FgRegistry& s) {
     }
 
     s.applied = target;
+    invalidateCameraLocked(s);
     s.provider = std::move(made);
     // P305al：JVM 在启动早期就把 UI 纹理与帧常量推过来了（那时还没有 provider，注册表
     // 只把它们存进 `uiTexture` / `constants`）。新建的 provider 是白纸，必须回放一次，
     // 否则 UI 合成永远拿不到纹理（实测 breadcrumb 里 `ui=null`），tag 出去的 HUDless
     // 帧也就没人合成 HUD。
-    if (s.hasConstants) {
-        s.provider->setFrameConstants(s.constants);
-    }
     if (s.uiTexture != nullptr) {
-        // P306m：`s.uiTexture` 存的是 `Dx12Object*` 句柄，provider 要资源指针。
-        s.provider->setUiTexture(unwrapDx12Resource(s.uiTexture));
+        s.provider->setUiTexture(s.uiTexture.Get(), s.uiLease);
     }
     // P306ac：hudless 呈现模式也是"期望状态"，新建的 provider 默认是关的，必须回放。
     // 顺序在 `setUiTexture` 之后：先有纹理、再开模式，provider 才可能在同一帧里注册 UI。
@@ -487,6 +614,10 @@ int32_t fgEnsureProvider(void) {
 int32_t fgSetMode(const mcdr_fg_dispatch& desc) {
     FgRegistry& s = registry();
     std::lock_guard<std::mutex> lk(s.mutex);
+    if (s.preparedMode.has_value()) {
+        s.lastReason = "FG configuration preparation is pending";
+        return 0;
+    }
     if (desc.backend != MCDR_FG_BACKEND_NONE) {
         if (!validBackendId(desc.backend)) {
             return -1;
@@ -495,12 +626,10 @@ int32_t fgSetMode(const mcdr_fg_dispatch& desc) {
         // FSR-FG / XeSS-FG 走应用原生链并被 SDK 包装，两家的资源契约与链要求都不同。
         // 这里只拆旧的、不建新的：新的由下面 `ensureProviderLocked` 建，链重建统一在帧首做。
         if (s.provider != nullptr && s.applied != desc.backend) {
-            s.provider->shutdown();
-            s.provider.reset();
-            s.applied = MCDR_FG_BACKEND_NONE;
-            s.ensureTryAt = 0;
-            s.rebuildPending = true;
-            s.lastReason.clear();
+            // A settings-thread call cannot destroy a context used by an open
+            // recording or by the surface's SDK-owned swap chain.
+            s.lastReason = "restart to switch FG";
+            return 0;
         }
         // P305ab：显式指定优先。门面在 XeSS-FG/FSR-FG 的 available=0 时会把 backend 算成 DLSS-G，
         // 若让它无条件覆盖 picked，自测钩子强制选中的后端在 FG 打开的瞬间就被抹掉（P305aa）。
@@ -519,6 +648,11 @@ int32_t fgSetMode(const mcdr_fg_dispatch& desc) {
     const int32_t beforeMode = s.desiredMode;
     const int32_t beforeChainMode = s.chainMode;
     s.desiredMode = desc.mode;
+    s.resetPending = s.resetPending || desc.mode == 0 || desc.reset != 0;
+    if (!s.frameStarted && s.resetPending) {
+        invalidateCameraLocked(s);
+        s.resetPending = false;
+    }
     s.desiredFrames = desc.numFrames < 1 ? 1 : desc.numFrames;
     logStateChange(s, "desiredMode", beforeMode, s.desiredMode);
     // mode=0 是"关"：即使现在没有生效后端也必须成功，否则界面关不掉一个半建成的后端。
@@ -530,14 +664,14 @@ int32_t fgSetMode(const mcdr_fg_dispatch& desc) {
         logStateChange(s, "chainMode", beforeChainMode, s.chainMode);
         return 1;
     }
-    if (s.provider == nullptr && ensureProviderLocked(s) == 0) {
+    if (!s.frameStarted && s.provider == nullptr && ensureProviderLocked(s) == 0) {
         s.lastResult = 0;
         // 不挂重建请求：后端都还没建成，没有链要改。`fgBeforePresent` 会按 ensureTryAt 重试，
         // 成功的那一刻再挂重建（那时才真的要从"关的链"换成"开的链"）。
         s.ensureTryAt = s.appFrameId + ENSURE_RETRY_FRAMES;
         return 0;
     }
-    const bool ok = s.provider->setMode(desc);
+    const bool ok = s.frameStarted || (s.provider && s.provider->setMode(desc));
     s.lastResult = ok ? 1 : 0;
     if (!ok) {
         return s.lastResult;
@@ -572,6 +706,130 @@ int32_t fgSetMode(const mcdr_fg_dispatch& desc) {
     return s.lastResult;
 }
 
+int32_t fgPrepareMode(const mcdr_fg_dispatch& description, uint64_t* token) {
+    if (token == nullptr) return MCDR_FG_PREPARE_INVALID_ARGUMENT;
+    *token = 0;
+    if (!waitForPendingPresents(2'000)) return MCDR_FG_PREPARE_NOT_READY;
+    FgRegistry& state = registry();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!validBackendId(description.backend) || description.mode < 0 ||
+        description.mode > 2 || description.numFrames < 1 || description.numFrames > 5 ||
+        (description.mode != 0 && (description.displayWidth <= 0 || description.displayHeight <= 0)))
+        return MCDR_FG_PREPARE_INVALID_ARGUMENT;
+    if (state.preparedMode.has_value() || state.frameStarted || !recordingsCompleteLocked(state)) {
+        state.lastReason = "FG preparation requires a completed display frame";
+        return MCDR_FG_PREPARE_NOT_READY;
+    }
+    if (state.provider != nullptr && !state.provider->waitForPreviousFrame()) {
+        state.lastReason = "FG previous frame has not retired";
+        return MCDR_FG_PREPARE_NOT_READY;
+    }
+    const bool wantsWrapper = description.backend == MCDR_FG_BACKEND_FSRFG ||
+        description.backend == MCDR_FG_BACKEND_XESSFG;
+    const bool matchingWrapper =
+        (description.backend == MCDR_FG_BACKEND_FSRFG && state.chainOwner == MCDR_FG_CHAIN_FSR_WRAP) ||
+        (description.backend == MCDR_FG_BACKEND_XESSFG && state.chainOwner == MCDR_FG_CHAIN_XESS_WRAP);
+    if (description.mode != 0 &&
+        ((wantsWrapper && !matchingWrapper) ||
+            (state.provider != nullptr && state.applied != description.backend))) {
+        state.lastReason = "restart to switch FG";
+        return MCDR_FG_PREPARE_RESTART_REQUIRED;
+    }
+    FgRegistry::PreparedMode candidate{};
+    if (description.mode != 0) {
+        IFrameGenProvider* provider = state.provider.get();
+        if (provider == nullptr) {
+            std::unique_ptr<IFrameGenProvider> made;
+            switch (description.backend) {
+                case MCDR_FG_BACKEND_DLSSG: made = makeDlssGProvider(); break;
+                case MCDR_FG_BACKEND_FSRFG: made = makeFsrFgProvider(); break;
+                case MCDR_FG_BACKEND_XESSFG: made = makeXessFgProvider(); break;
+                default: break;
+            }
+            if (made == nullptr) {
+                state.lastReason = "FG SDK provider factory failed";
+                return MCDR_FG_PREPARE_REJECTED;
+            }
+            mcdr_fg_caps available{};
+            made->fillCaps(available);
+            if (available.available == 0) {
+                state.lastReason = available.note;
+                return MCDR_FG_PREPARE_REJECTED;
+            }
+            candidate.provider = std::move(made);
+            provider = candidate.provider.get();
+        }
+        mcdr_fg_caps capabilities{};
+        provider->fillCaps(capabilities);
+        if (capabilities.available == 0 ||
+            (description.mode == 1 && description.numFrames > capabilities.maxGeneratedFrames)) {
+            state.lastReason = "FG SDK resources or requested frame count are unavailable";
+            return MCDR_FG_PREPARE_REJECTED;
+        }
+        if (description.backend == MCDR_FG_BACKEND_DLSSG) {
+            uint32_t maxFrames = 0;
+            const int32_t prepared = mcdr_dlss_prepare_fg(
+                description.mode, description.numFrames,
+                static_cast<uint32_t>(description.displayWidth),
+                static_cast<uint32_t>(description.displayHeight),
+                static_cast<uint32_t>(description.displayWidth),
+                static_cast<uint32_t>(description.displayHeight), &maxFrames);
+            if (prepared != MCDR_FG_PREPARE_READY) {
+                state.lastReason = prepared == MCDR_FG_PREPARE_NOT_READY
+                    ? "DLSS-G previous Present inputs are still in use"
+                    : "DLSS-G SDK rejected the requested frame count, dynamic mode, or display extent";
+                return prepared;
+            }
+        }
+    }
+    candidate.description = description;
+    candidate.cameraGeneration = state.cameraGeneration;
+    candidate.token = state.nextPreparationToken++;
+    if (candidate.token == 0) candidate.token = state.nextPreparationToken++;
+    *token = candidate.token;
+    state.preparedMode = std::move(candidate);
+    return MCDR_FG_PREPARE_READY;
+}
+
+int32_t fgCommitPreparedConfiguration(uint64_t token, uint64_t srToken, int32_t antiAliasing) {
+    FgRegistry& state = registry();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (antiAliasing < 0 || antiAliasing > 3 || !state.preparedMode.has_value() ||
+        state.preparedMode->token != token) return -1;
+    if (state.frameStarted || state.cameraGeneration != state.preparedMode->cameraGeneration ||
+        !recordingsCompleteLocked(state)) {
+        state.lastReason = "FG prepared configuration became stale";
+        return 0;
+    }
+    const int32_t committed = srCommitPreparedProvider(srToken);
+    if (committed != 1) return committed;
+    const auto description = state.preparedMode->description;
+    if (state.preparedMode->provider != nullptr) {
+        state.provider = std::move(state.preparedMode->provider);
+        state.applied = description.backend;
+        state.chainOwner = MCDR_FG_CHAIN_APP_NATIVE;
+    }
+    state.preparedMode.reset();
+    state.picked = description.mode == 0
+        ? (state.provider != nullptr ? state.applied : MCDR_FG_BACKEND_NONE)
+        : description.backend;
+    state.desiredMode = description.mode;
+    state.desiredFrames = description.numFrames;
+    state.resetPending = state.resetPending || description.mode == 0 || description.reset != 0;
+    (void)setAntiAliasing(antiAliasing == 3 ? 0 : antiAliasing);
+    (void)setDlssEnabled(srActiveBackend() == MCDR_SR_BACKEND_DLSS ? 1 : 0);
+    state.lastReason.clear();
+    return 1;
+}
+
+int32_t fgAbortPreparedMode(uint64_t token) {
+    FgRegistry& state = registry();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.preparedMode.has_value() || state.preparedMode->token != token) return -1;
+    state.preparedMode.reset();
+    return 1;
+}
+
 bool fgChainRebuildPending(void) {
     FgRegistry& s = registry();
     std::lock_guard<std::mutex> lk(s.mutex);
@@ -581,6 +839,7 @@ bool fgChainRebuildPending(void) {
 void fgNoteChainRebuildDone(int32_t ownerAfterRebuild, int32_t ok, const char* reason) {
     FgRegistry& s = registry();
     std::lock_guard<std::mutex> lk(s.mutex);
+    invalidateCameraLocked(s);
     // 无论成功失败都撤销请求：失败时重挂请求会在每帧 acquire 里反复尝试同一次注定失败
     // 的重建（例如独占全屏），那是死循环；等下次用户改开关自然会再挂一次。
     s.rebuildPending = false;
@@ -600,9 +859,10 @@ void fgNoteChainRebuildDone(int32_t ownerAfterRebuild, int32_t ok, const char* r
     logStateChange(s, "chainMode", beforeChainMode, s.chainMode);
 }
 
-void fgAbortWrapAfterFailure(const char* reason) {
+bool fgAbortWrapAfterFailure(const char* reason) {
     FgRegistry& s = registry();
     std::lock_guard<std::mutex> lk(s.mutex);
+    invalidateCameraLocked(s);
     // P306af 实测（2026-10-28 19:51）：从 FSR 包链热切到 XeSS 时，`InitFromSwapChain` 会在
     // 同一个 HWND 上建它自己的链，而旧链刚被放开、DWM 还没交还 HWND，于是
     // `sdk[3] Failed to create swap chain: 0x887a0001`。wrap 失败之后应用链已经没了
@@ -612,6 +872,12 @@ void fgAbortWrapAfterFailure(const char* reason) {
     // 这里把状态退回"没有帧生成"：期望清零、链归属记回原生、provider 拆掉，再把原因写进
     // `lastReason`（界面读它）。调用方随后按"不需要包装"重建一条纯应用链。
     if (s.provider != nullptr) {
+        if (!recordingsCompleteLocked(s) || !s.provider->waitForPreviousFrame() ||
+            !s.provider->tryUnwrapSwapChain()) {
+            s.lastReason = "FG teardown pending after wrap failure";
+            s.rebuildPending = true;
+            return false;
+        }
         s.provider->shutdown();
         s.provider.reset();
     }
@@ -629,66 +895,259 @@ void fgAbortWrapAfterFailure(const char* reason) {
     }
     logStateChange(s, "desiredMode", beforeMode, s.desiredMode);
     dbgLogWarn("%s", reason == nullptr ? "frame generation could not take the swap chain" : reason);
+    return true;
 }
 
-void fgFrameStart(void) {
-    FgRegistry& s = registry();
-    std::lock_guard<std::mutex> lk(s.mutex);
-    // P305ah：帧首钩子（XeSS-FG 的 XeLL marker 需要它）。不加锁做别的事：这里只在
-    // `acquireSurface` 里被调一次，provider 的 frameStart() 只推进一个帧号 + 发一条
-    // marker，都是几十纳秒级的操作。
-    if (s.provider != nullptr) {
-        s.provider->frameStart();
-    }
-}
-
-void fgBeforePresent(void) {
-    FgRegistry& s = registry();
-    std::lock_guard<std::mutex> lk(s.mutex);
-    // P297：appFrameId 在**进 provider 之前**加，这样 provider 在 beforePresent 里看到的
-    // 就是本帧的号（顺序反了会差一帧，将来 FSR/XeSS-FG 对不齐 present id 时很难查）。
-    ++s.appFrameId;
-    // P296 实测缺口（2026-10-27 13:06）：期望是"开"但后端还没建成（启动早期 Reflex 尚未解析、
-    // 或运行库比插件晚加载）时，按 ENSURE_RETRY_FRAMES 的节奏重试。成功后立刻把期望的 mode 下发，
-    // 并挂一次链重建 —— 因为现在的链是"按关的状态"建的。
-    if (s.provider == nullptr && s.desiredMode != 0 && s.appFrameId >= s.ensureTryAt) {
-        s.ensureTryAt = s.appFrameId + ENSURE_RETRY_FRAMES;
-        if (ensureProviderLocked(s) == 1) {
-            mcdr_fg_dispatch d{};
-            d.backend = s.picked;
-            d.mode = s.desiredMode;
-            d.numFrames = s.desiredFrames;
-            (void)s.provider->setMode(d);
-            // P305af：只在"确实还缺包装链"时挂重建（策略见 fgSetMode 末尾）。
-            const bool wantsWrap = s.picked == MCDR_FG_BACKEND_FSRFG || s.picked == MCDR_FG_BACKEND_XESSFG;
-            const bool chainIsWrap = s.chainOwner == MCDR_FG_CHAIN_FSR_WRAP ||
-                                     s.chainOwner == MCDR_FG_CHAIN_XESS_WRAP;
-            if (wantsWrap && !chainIsWrap) {
-                s.rebuildPending = true;
+int beginDisplayFrameRecording(void* context) {
+    auto* recording = static_cast<CommandContext*>(context);
+    if (recording && (!recording->listOpen || !recording->commandList || recording->submissionFailed.load()))
+        return -1;
+    if (!waitForPendingPresents(2000)) return -1;
+    auto& s = registry();
+    {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        std::erase_if(s.recordings, recordingComplete);
+        for (const auto& use : s.recordings) {
+            if (!use.submitted && !use.recording.expired()) {
+                s.lastReason = "previous display input recording has not been submitted or discarded";
+                return -1;
             }
-            dbgLogInfo("frame generation became usable lazily: backend=%d mode=%d frames=%d "
-                       "(provider created on the render thread, chain rebuild queued)",
-                       s.picked, s.desiredMode, s.desiredFrames);
+        }
+        if (s.provider && !s.provider->waitForPreviousFrame()) return -1;
+        if (s.frameStarted || s.pendingCamera.valid || s.resetPending) invalidateCameraLocked(s);
+        oit::discardResolved(s.activeFrame.context, s.activeFrame.realFrameId, s.activeFrame.fenceValue);
+        s.resetPending = false;
+        s.frameStarted = false;
+        s.providerStarted = false;
+        s.activeFrame = {};
+        s.activeIdentity = {};
+        s.guiReady = false;
+        if (s.provider == nullptr && s.desiredMode != 0 && s.appFrameId >= s.ensureTryAt) {
+            s.ensureTryAt = s.appFrameId + ENSURE_RETRY_FRAMES;
+            if (ensureProviderLocked(s) == 1) {
+                const bool wantsWrap = s.picked == MCDR_FG_BACKEND_FSRFG || s.picked == MCDR_FG_BACKEND_XESSFG;
+                const bool chainIsWrap = s.chainOwner == MCDR_FG_CHAIN_FSR_WRAP ||
+                                         s.chainOwner == MCDR_FG_CHAIN_XESS_WRAP;
+                if (wantsWrap && !chainIsWrap) s.rebuildPending = true;
+                dbgLogInfo("frame generation became usable at display frame begin: backend=%d mode=%d frames=%d",
+                    s.picked, s.desiredMode, s.desiredFrames);
+            }
         }
     }
-    if (s.provider != nullptr) {
-        s.provider->beforePresent();
+    if (auto* surface = getActiveSurface()) {
+        if (auto prepared = prepareDisplayPresentChain(surface, context); !prepared) {
+            dbgLogError("fg: display frame begin failed: %s", prepared.error().message.c_str());
+            return -1;
+        }
     }
+    std::lock_guard<std::mutex> lock(s.mutex);
+    s.activeFrame = {++s.frameSerial, 0, s.cameraGeneration, context, 0};
+    if (auto receipt = beginDisplayPresentReceipt(s.activeFrame); !receipt) {
+        s.activeFrame = {};
+        return -1;
+    }
+    s.frameStarted = true;
+    if (s.provider) {
+        mcdr_fg_dispatch mode{};
+        mode.backend = s.applied;
+        mode.mode = s.desiredMode;
+        mode.numFrames = s.desiredFrames;
+        if (!s.provider->setMode(mode)) {
+            invalidateCameraLocked(s);
+            s.frameStarted = false;
+            return -1;
+        }
+        s.provider->frameStart();
+        s.providerStarted = true;
+    }
+    return 1;
 }
 
-void fgAfterPresent(void) {
+bool fgDisplayFrameStarted() {
+    auto& state = registry();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return state.frameStarted;
+}
+
+int fgAttachWorldFrame(void* context, const mcdr_vanilla_frame_input& frame) {
+    if (!fgDisplayFrameStarted() && beginDisplayFrameRecording(context) != 1) return -1;
+    auto& state = registry();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if ((state.activeFrame.context && state.activeFrame.context != context) ||
+        state.activeIdentity.realFrameId != 0) return -1;
+    state.activeFrame.context = context;
+    state.activeFrame.realFrameId = frame.identity.realFrameId;
+    state.activeIdentity = frame.identity;
+    state.activeSettings = frame.settings;
+    state.activeHistoryGeneration = frame.historyGeneration;
+    attachDisplayPresentIdentity(context, frame.identity, frame.historyGeneration);
+    state.activeColorEncoding = frame.colorEncoding;
+    return 1;
+}
+
+int fgMarkGuiReady(void* context, const mcdr_frame_identity& identity) {
+    auto& state = registry();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.frameStarted || state.activeFrame.context != context || state.guiReady ||
+        state.activeIdentity.worldEpoch != identity.worldEpoch ||
+        state.activeIdentity.realFrameId != identity.realFrameId ||
+        state.activeIdentity.configVersion != identity.configVersion ||
+        state.activeIdentity.resourceVersion != identity.resourceVersion) return -1;
+    state.guiReady = true;
+    return 1;
+}
+
+bool fgDisplayFrameQueued(void* context) {
+    auto& state = registry();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return state.frameStarted && state.activeFrame.context == context && state.activeFrame.fenceValue != 0;
+}
+
+FgPresentTicket fgCurrentDisplayFrameTicket() {
+    auto& state = registry();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return state.frameStarted ? state.activeFrame : FgPresentTicket{};
+}
+
+FgPresentTicket fgDisplayFrameTicket(void* context) {
+    auto& state = registry();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return state.frameStarted && state.activeFrame.context == context ? state.activeFrame : FgPresentTicket{};
+}
+
+bool fgDisplayFrameCurrent(const FgPresentTicket& ticket) {
+    auto& state = registry();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return ticket.serial != 0 && state.frameStarted && state.activeFrame == ticket;
+}
+
+FgPresentTicket fgDisplayGuideTicket(void* context) {
+    auto& state = registry();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.frameStarted || !state.providerStarted || !state.provider || !state.guiReady ||
+        state.activeFrame.context != context || state.activeFrame.fenceValue != 0 ||
+        state.activeFrame.realFrameId == 0 || state.pendingCamera.valid ||
+        state.activeFrame.providerGeneration != state.cameraGeneration) return {};
+    return state.activeFrame;
+}
+
+void fgNoteRecordingSubmitted(CommandContext* context, UINT64 fenceValue) {
+    auto& state = registry();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    for (auto& use : state.recordings)
+        if (use.fence.Get() == context->fence.Get() && use.value == fenceValue) use.submitted = true;
+}
+
+mcdr::Result<FgPresentTicket> fgQueueDisplayFrame(CommandContext* context, UINT64 fenceValue) {
+    auto& state = registry();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.frameStarted || (state.activeFrame.context && state.activeFrame.context != context))
+        return FgPresentTicket{};
+    auto ticket = state.activeFrame;
+    ticket.context = context;
+    ticket.fenceValue = fenceValue;
+    if (state.pendingCamera.valid) {
+        auto& receipt = state.pendingCamera;
+        if (receipt.state != FgRegistry::TicketState::Accepted || receipt.context != context ||
+            receipt.fenceValue != fenceValue || receipt.recording.expired() ||
+            receipt.ticket.serial != ticket.serial || receipt.providerGeneration != state.cameraGeneration) {
+            invalidateCameraLocked(state);
+        } else {
+            ticket = receipt.ticket;
+            receipt.state = FgRegistry::TicketState::Queued;
+        }
+    }
+    if (ticket.realFrameId != 0 && oit::queuePresented(context, ticket.realFrameId, ticket.fenceValue) < 0)
+        return mcdr::err("display.history", "OIT history does not match the submitted display frame");
+    state.activeFrame = ticket;
+    queueDisplayPresentReceipt(ticket, MCDR_SUBMISSION_SUBMITTED);
+    return ticket;
+}
+
+void fgAbortDisplayFrame(void* context) {
+    auto& state = registry();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if ((!state.frameStarted || state.activeFrame.context != context) &&
+        (!state.pendingCamera.valid || state.pendingCamera.context != context)) return;
+    if (state.activeFrame.context == context)
+        oit::discardResolved(context, state.activeFrame.realFrameId, state.activeFrame.fenceValue);
+    invalidateCameraLocked(state);
+    state.frameStarted = false;
+    state.providerStarted = false;
+    state.activeFrame = {};
+    state.activeIdentity = {};
+    state.guiReady = false;
+}
+
+void fgAbortDisplayFrame(const FgPresentTicket& ticket) {
+    auto& state = registry();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (ticket.serial == 0 || !state.frameStarted || state.activeFrame != ticket) return;
+    oit::discardResolved(ticket.context, ticket.realFrameId, ticket.fenceValue);
+    invalidateCameraLocked(state);
+    state.frameStarted = false;
+    state.providerStarted = false;
+    state.activeFrame = {};
+    state.activeIdentity = {};
+    state.guiReady = false;
+}
+
+void fgBeforePresent(const FgPresentTicket& ticket) {
+    auto& state = registry();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    ++state.appFrameId;
+    if (!state.frameStarted || ticket != state.activeFrame) return;
+    if (state.provider && state.providerStarted) state.provider->beforePresent();
+}
+
+DisplayHistoryPublication fgAfterPresent(const FgPresentTicket& ticket, int32_t presentSucceeded) {
+    DisplayHistoryPublication publication;
     FgRegistry& s = registry();
     std::lock_guard<std::mutex> lk(s.mutex);
     // P297：只有真的 Present 过才进这里（`presentSurface` 在没 blit 时提前 return），
     // 所以 presentId 天然等于「真正提交的帧数」，FSR/XeSS-FG 要的就是这个语义。
     ++s.presentId;
-    if (s.provider != nullptr) {
+    if (!s.frameStarted || ticket != s.activeFrame) {
+        oit::discardResolved(ticket.context, ticket.realFrameId, ticket.fenceValue);
+        return publication;
+    }
+    if (presentSucceeded != 0 && ticket.realFrameId != 0) {
+        const int committed = oit::commitPresented(ticket.context, ticket.realFrameId, ticket.fenceValue);
+        if (committed == 1) publication.flags |= MCDR_PRESENT_OIT_HISTORY_PUBLISHED;
+        if (committed < 0) {
+            oit::discardResolved(ticket.context, ticket.realFrameId, ticket.fenceValue);
+            dbgLogError("OIT history: Present publication failed (%d)", committed);
+        }
+    } else {
+        oit::discardResolved(ticket.context, ticket.realFrameId, ticket.fenceValue);
+    }
+    if (s.provider != nullptr && s.providerStarted) {
         s.provider->afterPresent();
     }
-    // P300：能力位从 1 掉到 0 时回滚。典型触发是用户把 SR 后端从 DLSS 换成 FSR/XeSS ——
-    // DLSS-G 的 `ScalingOutputColor` 只能来自 SL 的 SR 输出，换掉之后这个 provider 再也拿不到
-    // 合法输入（P281 记的互斥只在界面上挡住了，配置文件挡不住）。回滚 = 关掉它、清掉期望值，
-    // 并挂一次链重建回到「关」的链；不这么做就是让一个注定失败的 provider 每帧继续折腾。
+    if (presentSucceeded != 0)
+        publication.outputFrameCount = s.provider ? static_cast<uint32_t>(std::max(1, s.provider->presented())) : 1u;
+    if (presentSucceeded != 0 && s.provider && s.pendingCamera.valid &&
+        s.pendingCamera.state == FgRegistry::TicketState::Queued &&
+        s.pendingCamera.ticket == ticket &&
+        s.pendingCamera.fence && s.pendingCamera.fenceValue == ticket.fenceValue &&
+        (!s.pendingCamera.recording.expired() ||
+         (s.pendingCamera.fence && s.pendingCamera.fence->GetCompletedValue() != UINT64_MAX &&
+          s.pendingCamera.fence->GetCompletedValue() >= s.pendingCamera.fenceValue)) &&
+        s.pendingCamera.providerGeneration == s.cameraGeneration &&
+        s.provider->historyAcceptedAfterPresent()) {
+        s.pendingCamera.state = FgRegistry::TicketState::Presented;
+        s.committedCamera = s.pendingCamera;
+        s.committedCamera.facts = {};
+        s.pendingCamera = {};
+        publication.flags |= MCDR_PRESENT_FG_CAMERA_PUBLISHED;
+    } else {
+        invalidateCameraLocked(s);
+    }
+    s.frameStarted = false;
+    s.providerStarted = false;
+    s.activeFrame = {};
+    s.activeIdentity = {};
+    s.guiReady = false;
     // 连续 ROLLBACK_FRAMES 帧都不行才动手；`fillCaps` 每帧问一次是可以的（这一层只读几个原子量
     // 与运行库句柄），将来某家的 caps 查询变贵就该在它自己的 `fillCaps` 里缓存，而不是在这里省。
     if (s.provider != nullptr && s.desiredMode != 0) {
@@ -699,9 +1158,10 @@ void fgAfterPresent(void) {
         } else if (++s.unavailableFrames >= ROLLBACK_FRAMES) {
             const std::string why = live.note[0] != '\0' ? std::string(live.note)
                                                          : std::string("backend reports unavailable");
+            // Keep the provider and SDK context until surface teardown drains
+            // recordings and SDK queues. Present return is not that boundary.
             s.provider->shutdown();
-            s.provider.reset();
-            s.applied = MCDR_FG_BACKEND_NONE;
+            invalidateCameraLocked(s);
             s.desiredMode = 0;
             s.desiredFrames = 1;
             s.lastReason = why;
@@ -766,6 +1226,7 @@ void fgAfterPresent(void) {
                    s.desiredMode, s.desiredFrames, static_cast<unsigned long long>(s.presentId),
                    s.lastReason.empty() ? caps.note : s.lastReason.c_str());
     }
+    return publication;
 }
 
 void fgNoteBackendFrame(uint64_t backendFrameId) {
@@ -783,16 +1244,21 @@ int32_t fgPresented(void) {
 void fgOnResize(int32_t displayWidth, int32_t displayHeight) {
     FgRegistry& s = registry();
     std::lock_guard<std::mutex> lk(s.mutex);
+    invalidateCameraLocked(s);
     if (s.provider != nullptr) {
         s.provider->onResize(displayWidth, displayHeight);
     }
 }
 
-void fgReleaseProviderWithWait(CommandContext* ctx) {
-    // P293 的 DLSS-G provider 不持有设备资源，所以这里没有"等 GPU 追平"的必要；
-    // 语义上仍然提供这个入口，等 P296 把插帧资源搬进 provider 之后在这里加
-    // waitForFenceValue(ctx, ctx->fenceValue, 5s)（P280 的教训：**只等已提交的值，不等 +1**）。
-    static_cast<void>(ctx);
+bool fgReleaseProviderWithWait(CommandContext* ctx) {
+    invalidateFrameGenerationHistory(1);
+    if (ctx != nullptr) {
+        if (ctx->listOpen || ctx->submissionFailed.load()) return false;
+        if (ctx->fenceValue != 0) {
+            auto waited = waitForFenceValue(ctx, ctx->fenceValue, 5'000'000'000ULL);
+            if (!waited) return false;
+        }
+    }
     FgRegistry& s = registry();
     std::lock_guard<std::mutex> lk(s.mutex);
     if (s.provider != nullptr) {
@@ -800,11 +1266,15 @@ void fgReleaseProviderWithWait(CommandContext* ctx) {
         // 再 shutdown。只调 shutdown 会把 xefg/ffx 的 context 泄漏在进程里 —— 下一个 provider
         // 再 `CreateContext` 时 SDK 侧还留着上一条链的 latency-reduction/swapchain 状态，
         // 表现为 `SetEnabled(1)` 返回成功、`GetLastPresentStatus` 却一直报 disabled（实测 1:1 出帧）。
-        s.provider->unwrapSwapChain();
+        if (!recordingsCompleteLocked(s) || !s.provider->waitForPreviousFrame() ||
+            !s.provider->tryUnwrapSwapChain()) return false;
         s.provider->shutdown();
         s.provider.reset();
     }
     s.applied = MCDR_FG_BACKEND_NONE;
+    s.uiTexture.Reset();
+    s.uiLease.reset();
+    s.hasConstants = false;
     // P306x：**不要清 `picked` / `desiredMode`**。这个入口的语义是"surface/设备要重建了"，
     // 不是"用户把帧生成关掉了"。以前在这里把 picked 清成 NONE，后果是：窗口重建（启动早期
     // 常见）之后 FG 永久消失，而界面上还显示着开 —— 实测日志里启动时 XeSS 已经包上了链，
@@ -816,6 +1286,7 @@ void fgReleaseProviderWithWait(CommandContext* ctx) {
     gChainOwnerSnapshot.store(MCDR_FG_CHAIN_APP_NATIVE, std::memory_order_relaxed);
     s.rebuildPending = s.desiredMode != 0 &&
                        (s.picked == MCDR_FG_BACKEND_FSRFG || s.picked == MCDR_FG_BACKEND_XESSFG);
+    return true;
 }
 
 void fgNoteChainOwner(int32_t owner) {
@@ -1001,38 +1472,21 @@ int32_t fgWrapPresentChain(void* device, void* queue, void* appChain, int32_t wi
 }
 
 // 链要销毁/重建之前必须先解包：provider 的 context 绑在那条链上（`InitFromSwapChain` 的行头）。
-void fgUnwrapPresentChain(void) {
+bool fgUnwrapPresentChain(void) {
     FgRegistry& s = registry();
     std::lock_guard<std::mutex> lk(s.mutex);
+    invalidateCameraLocked(s);
     if (s.provider != nullptr) {
-        s.provider->unwrapSwapChain();
+        if (!recordingsCompleteLocked(s) || !s.provider->waitForPreviousFrame() ||
+            !s.provider->tryUnwrapSwapChain()) return false;
     }
+    return true;
 }
-// P305b：每帧一次，把 tag 机会交给 provider。现在 dispatch 里还没有资源句柄（P305c 由 JVM 灌），
-// 所以包装型 provider 只会在这里记一行"到点了但没东西可 tag"，**不做任何 SDK 调用** ——
-// 这正是 kTaggingWired 仍然是 false 的原因。
-// P305c：登记 UI 纹理。注册表持锁保存并同步给 provider —— provider 在 tag 时读它，不回头调注册表。
-void fgSetFrameConstants(const mcdr_fg_constants* constants)
-{
-    if (constants == nullptr)
-    {
-        return;
-    }
-    FgRegistry& s = registry();
-    std::lock_guard<std::mutex> lk(s.mutex);
-    s.constants = *constants;
-    s.hasConstants = true;
-    if (s.provider != nullptr)
-    {
-        s.provider->setFrameConstants(*constants);
-    }
-}
-
 ID3D12Resource* unwrapDx12Resource(void* object) {
     // P306m：JVM 交过来的是 `Dx12Object*`（`D3D12GpuTexture.handle()` 的值），不是
     // `ID3D12Resource*`。之前把包装对象直接当资源传给 `ffxApiGetResourceDX12`，它读
     // `GetDesc()` 时崩在 0x50（hs_err 指向 `ffxApiGetResourceDX12+0x4f` → `applyFrameLocked`）。
-    // 句柄本身仍然按 `void*` 存/回放：包装对象的生命周期由 JVM 侧持有，我们只借用。
+    // Caller must already have acquired a wrapper lease while its owner is live.
     if (object == nullptr) {
         return nullptr;
     }
@@ -1043,10 +1497,15 @@ ID3D12Resource* unwrapDx12Resource(void* object) {
 void fgSetUiTexture(void* object) {
     FgRegistry& s = registry();
     std::lock_guard<std::mutex> lk(s.mutex);
-    s.uiTexture = object;
+    // Acquire while the caller still owns the handle. No stored raw wrapper,
+    // no SEH-based attempt to resurrect an already-freed object.
+    auto lease = retainObjectLease(object);
+    ComPtr<ID3D12Resource> resource = unwrapDx12Resource(object);
     if (s.provider != nullptr) {
-        s.provider->setUiTexture(unwrapDx12Resource(object));
+        s.provider->setUiTexture(resource.Get(), lease);
     }
+    s.uiTexture = std::move(resource);
+    s.uiLease = std::move(lease);
 }
 
 // P306ac：hudless 呈现开关。与 `uiTexture` 一样属于"期望状态"：provider 可能还没建出来
@@ -1068,53 +1527,273 @@ void fgSetUiComposition(int32_t enabled) {
 int32_t fgUiCompositionReady(void) {
     FgRegistry& s = registry();
     std::lock_guard<std::mutex> lk(s.mutex);
-    if (s.provider == nullptr) {
+    const auto& receipt = s.pendingCamera;
+    const bool receiptReady = s.frameStarted && s.providerStarted && s.guiReady && s.provider &&
+        s.uiComposition != 0 && s.activeFrame.context != nullptr && s.activeFrame.serial != 0 &&
+        s.activeFrame.providerGeneration == s.cameraGeneration && receipt.valid &&
+        (receipt.state == FgRegistry::TicketState::Accepted || receipt.state == FgRegistry::TicketState::Queued) &&
+        receipt.ticket.serial == s.activeFrame.serial && receipt.context == s.activeFrame.context &&
+        receipt.ticket.context == s.activeFrame.context && receipt.providerGeneration == s.cameraGeneration &&
+        receipt.ticket.providerGeneration == s.cameraGeneration &&
+        receipt.identity.worldEpoch == s.activeIdentity.worldEpoch &&
+        receipt.identity.realFrameId == s.activeIdentity.realFrameId &&
+        receipt.identity.configVersion == s.activeIdentity.configVersion &&
+        receipt.identity.resourceVersion == s.activeIdentity.resourceVersion &&
+        receipt.ticket.realFrameId == s.activeIdentity.realFrameId &&
+        receipt.historyGeneration == s.activeHistoryGeneration;
+    if (receiptReady && s.provider->uiCompositionReady()) return 1;
+    s.uiComposition = 0;
+    if (s.provider) s.provider->setUiComposition(0);
+    return 0;
+}
+
+void invalidateFrameGenerationHistory(uint32_t reason) {
+    static_cast<void>(reason);
+    auto& state = registry();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    invalidateCameraLocked(state);
+}
+
+bool displayFrameMatchesLocked(const FgRegistry& state, void* context,
+    const mcdr_display_frame_input& frame) {
+    return state.frameStarted && state.guiReady && state.activeFrame.context == context &&
+        state.activeIdentity.worldEpoch == frame.identity.worldEpoch &&
+        state.activeIdentity.realFrameId == frame.identity.realFrameId &&
+        state.activeIdentity.configVersion == frame.identity.configVersion &&
+        state.activeIdentity.resourceVersion == frame.identity.resourceVersion &&
+        state.activeSettings.frameGenerationBackend == frame.frameGenerationBackend &&
+        state.activeSettings.frameGenerationMode == frame.frameGenerationMode &&
+        state.activeSettings.frameGenerationFrames == frame.frameGenerationFrames &&
+        state.activeHistoryGeneration == frame.historyGeneration &&
+        state.activeColorEncoding == frame.colorEncoding;
+}
+
+int checkDisplayFrameGenerationLocked(const FgRegistry& state, void* context,
+    const mcdr_display_frame_input& frame) {
+    if (frame.postCount > 64 || !std::isfinite(frame.frameDeltaMs) || frame.frameDeltaMs < 0 ||
+        (frame.postCount != 0 && (!frame.posts || frame.postStride != sizeof(mcdr_display_post_input)))) {
+        return -1;
+    }
+    if (!displayFrameMatchesLocked(state, context, frame) || state.pendingCamera.valid) return -1;
+    if (frame.frameGenerationMode == 0 || !state.providerStarted) {
         return 0;
     }
-    // provider 自己回答"链已包装 + UI 纹理已交过来"。**不看** `s.uiComposition`：JVM 正是先用这个
-    // 查询决定要不要打开 hudless（P306ac）—— 要求"已打开"会让它永远打不开。
-    // 拿不准就是 0 —— 调用方据此继续走"自己把 UI 合成进 backbuffer"的旧路径，UI 不会整帧消失。
-    return s.provider->uiCompositionReady() ? 1 : 0;
+    if (!state.provider || frame.frameGenerationBackend != static_cast<uint32_t>(state.applied)) {
+        return 0;
+    }
+    if ((frame.flags & 3u) != 1u || frame.frameDeltaMs == 0) {
+        return 0;
+    }
+    for (uint32_t index = 0; index < frame.postCount; ++index) {
+        if (frame.posts[index].kind == 2) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
-FgFrameInputs fgMakeFrameInputs(CommandContext* ctx, const mcdr_sr_dispatch& sr) {
-    FgFrameInputs in{};
-    if (ctx != nullptr) {
-        in.cmdList = ctx->commandList;
-    }
-    // P306v：SR 通用路径给的是 `Dx12Object*`（JVM 的 `D3D12GpuTexture.handle()`），不是
-    // `ID3D12Resource*` —— 三个指针必须先解包，否则 provider 里 `GetDesc()` 会 AV
-    // （实测 `P306 fsr-fg: frame inputs were released under us ... bad=<color>`：FSR 超分
-    // 路径下 FG 一帧输入都拿不到，插帧永远不启动）。DLSS 那条路径走的是
-    // `mcdr_fgTagDlssInputs`，它给的是裸 `ID3D12Resource*`，不经过这里。
-    in.pColorOutput = unwrapDx12Resource(sr.pColorOutput);
-    in.pDepth = unwrapDx12Resource(sr.pDepth);
-    in.pMotionVectors = unwrapDx12Resource(sr.pMotionVectors);
-    in.renderWidth = sr.renderWidth;
-    in.renderHeight = sr.renderHeight;
-    in.displayWidth = sr.displayWidth;
-    in.displayHeight = sr.displayHeight;
-    in.cameraNear = sr.cameraNear;
-    in.cameraFar = sr.cameraFar;
-    in.cameraVerticalFov = sr.cameraVerticalFov;
-    in.frameTimeDeltaMs = sr.frameTimeDeltaMs;
-    in.viewSpaceToMeters = sr.viewSpaceToMetersFactor;
-    // SR 通用路径的契约（P273）：返回时输出已回到 RENDER_TARGET，深度是只读输入，MV 是 SRV。
-    in.colorState = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    in.depthState = D3D12_RESOURCE_STATE_DEPTH_READ;
-    in.motionVectorState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    return in;
+int checkDisplayFramePreparation(void* context, const void* frameCopy, uint32_t frameBytes) {
+    if (!context || !frameCopy || frameBytes != sizeof(mcdr_display_frame_input)) return -1;
+    mcdr_display_frame_input frame{};
+    std::memcpy(&frame, frameCopy, sizeof(frame));
+    auto& state = registry();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return checkDisplayFrameGenerationLocked(state, context, frame);
 }
 
-void fgTagFrameInputs(const FgFrameInputs& inputs) {
-    if (inputs.cmdList == nullptr) {
-        return;
+int skipDisplayFrameGeneration(void* context, const void* frameCopy, uint32_t frameBytes) {
+    if (!context || !frameCopy || frameBytes != sizeof(mcdr_display_frame_input)) return -1;
+    mcdr_display_frame_input frame{};
+    std::memcpy(&frame, frameCopy, sizeof(frame));
+    auto& state = registry();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!displayFrameMatchesLocked(state, context, frame) || state.pendingCamera.valid) return -1;
+    return invalidateCameraLocked(state) ? 0 : -1;
+}
+
+FgInputAcceptance fgTagFrameInputs(FgRegistry& state, FgRegistry::CameraReceipt& receipt,
+    const FgFrameInputs& inputs) {
+    if (!inputs.cmdList) return FgInputAcceptance::Failed;
+    auto* ctx = static_cast<CommandContext*>(recordingContextForCommandList(inputs.cmdList));
+    if (!ctx || !ctx->listOpen || ctx->submissionFailed.load()) {
+        invalidateCameraLocked(state);
+        return FgInputAcceptance::Failed;
     }
-    FgRegistry& s = registry();
-    std::lock_guard<std::mutex> lk(s.mutex);
-    if (s.provider == nullptr) {
-        return;
+    struct RestoreHeap {
+        CommandContext* context;
+        ~RestoreHeap() { restoreDrawHeap(context); }
+    } restore{ctx};
+    if (!state.provider || !receipt.valid || receipt.context != ctx ||
+        receipt.providerGeneration != state.cameraGeneration ||
+        receipt.identity.realFrameId != inputs.realFrameId) {
+        invalidateCameraLocked(state);
+        return FgInputAcceptance::Failed;
     }
-    s.provider->tagFrameInputs(inputs);
+    struct InputLease {
+        std::shared_ptr<void> wrappers;
+        ComPtr<ID3D12Resource> color, depth, motion, ui;
+    };
+    auto lease = std::make_shared<InputLease>();
+    lease->wrappers = inputs.resourceLease;
+    if (!lease->wrappers) {
+        invalidateCameraLocked(state);
+        return FgInputAcceptance::Failed;
+    }
+    lease->color = static_cast<ID3D12Resource*>(inputs.pColorOutput);
+    lease->depth = static_cast<ID3D12Resource*>(inputs.pDepth);
+    lease->motion = static_cast<ID3D12Resource*>(inputs.pMotionVectors);
+    lease->ui = static_cast<ID3D12Resource*>(inputs.pUi);
+    ctx->recordingLeases[ctx->currentListSlot].push_back(lease);
+    auto recording = std::make_shared<int>(0);
+    ctx->recordingLeases[ctx->currentListSlot].push_back(recording);
+    std::erase_if(state.recordings, recordingComplete);
+    state.recordings.push_back({ctx->fence, ctx->fenceValue + 1, recording});
+    FgFrameInputs retained = inputs;
+    retained.resourceLease = lease;
+    const auto normalize = [ctx](void* raw, D3D12_RESOURCE_STATES initial) {
+        const auto current = static_cast<D3D12_RESOURCE_STATES>(
+            resourceSubresourceState(ctx, raw, 0, initial));
+        transitionTo(ctx, static_cast<ID3D12Resource*>(raw), initial, current);
+        return current;
+    };
+    retained.colorState = normalize(retained.pColorOutput, retained.colorState);
+    retained.depthState = normalize(retained.pDepth, retained.depthState);
+    retained.motionVectorState = normalize(retained.pMotionVectors, retained.motionVectorState);
+    retained.uiState = normalize(retained.pUi, retained.uiState);
+    if (ctx->submissionFailed.load()) {
+        invalidateCameraLocked(state);
+        return FgInputAcceptance::Failed;
+    }
+    state.provider->setUiTexture(retained.pUi, lease);
+    state.uiTexture = lease->ui;
+    state.uiLease = lease;
+    state.provider->setFrameConstants(state.constants);
+    const auto acceptance = state.provider->tagFrameInputs(retained);
+    if (acceptance != FgInputAcceptance::Accepted) {
+        invalidateCameraLocked(state);
+        return acceptance;
+    }
+    receipt.state = FgRegistry::TicketState::Accepted;
+    receipt.recording = recording;
+    receipt.fence = ctx->fence;
+    receipt.fenceValue = ctx->fenceValue + 1;
+    receipt.facts = retained;
+    return FgInputAcceptance::Accepted;
+}
+
+int submitDisplayFrameGeneration(void* context, const void* frameCopy, uint32_t frameBytes,
+    const FgFrameInputs& guides) {
+    if (!context || !frameCopy || frameBytes != sizeof(mcdr_display_frame_input)) return -1;
+    mcdr_display_frame_input frame{};
+    std::memcpy(&frame, frameCopy, sizeof(frame));
+    auto* ctx = static_cast<CommandContext*>(context);
+    FgFrameInputs inputs = guides;
+    {
+        auto& state = registry();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        const int readiness = checkDisplayFrameGenerationLocked(state, context, frame);
+        if (readiness != 1) {
+            invalidateCameraLocked(state);
+            return readiness;
+        }
+        if (!ctx->listOpen || ctx->submissionFailed.load() || guides.cmdList != ctx->commandList ||
+            !guides.resourceLease || !guides.pColorOutput || !guides.pDepth ||
+            !guides.pMotionVectors || !guides.pUi || frame.width == 0 || frame.height == 0 ||
+            (frame.current.flags & 1u) == 0 || !std::isfinite(frame.current.nearPlane) ||
+            !std::isfinite(frame.current.farPlane) || !std::isfinite(frame.current.verticalFovRadians) ||
+            !(frame.current.nearPlane > 0) || !(frame.current.farPlane > frame.current.nearPlane) ||
+            !(frame.current.verticalFovRadians > 0) || !(frame.current.verticalFovRadians < 3.141593f) ||
+            !std::isfinite(frame.frameDeltaMs) || !(frame.frameDeltaMs > 0) ||
+            !std::isfinite(frame.viewSpaceToMeters) || !(frame.viewSpaceToMeters > 0) ||
+            guides.renderWidth != static_cast<int32_t>(frame.width) ||
+            guides.renderHeight != static_cast<int32_t>(frame.height)) {
+            invalidateCameraLocked(state);
+            return -1;
+        }
+        const auto& committed = state.committedCamera;
+        const bool compatible = frame.resetReasons == 0 && (frame.flags & 1u) != 0 &&
+            committed.valid && committed.providerGeneration == state.cameraGeneration &&
+            committed.identity.worldEpoch == frame.identity.worldEpoch &&
+            committed.identity.configVersion == frame.identity.configVersion &&
+            committed.identity.resourceVersion == frame.identity.resourceVersion &&
+            committed.identity.realFrameId == frame.previousRealFrameId &&
+            committed.historyGeneration == frame.historyGeneration;
+        FgRegistry::CameraReceipt candidate{};
+        candidate.ticket = {state.activeFrame.serial, frame.identity.realFrameId, state.cameraGeneration,
+            ctx, ctx->fenceValue + 1};
+        candidate.identity = frame.identity;
+        candidate.historyGeneration = frame.historyGeneration;
+        candidate.providerGeneration = state.cameraGeneration;
+        candidate.context = ctx;
+        candidate.valid = true;
+        float currentView[16], previousView[16];
+        std::copy_n(frame.current.viewRotation, 16, currentView);
+        std::copy_n(compatible ? frame.previous.viewRotation : frame.current.viewRotation, 16, previousView);
+        for (uint32_t axis = 0; axis < 3; ++axis) {
+            candidate.anchor[axis] = compatible ? committed.anchor[axis] : frame.current.origin[axis];
+            inputs.cameraPosition[axis] = static_cast<float>(frame.current.origin[axis] - candidate.anchor[axis]);
+            inputs.cameraRight[axis] = frame.current.viewRotation[axis * 4];
+            inputs.cameraUp[axis] = frame.current.viewRotation[axis * 4 + 1];
+            inputs.cameraForward[axis] = -frame.current.viewRotation[axis * 4 + 2];
+        }
+        const auto& previous = compatible ? frame.previous : frame.current;
+        for (uint32_t row = 0; row < 3; ++row) {
+            double currentTranslation = 0, previousTranslation = 0;
+            for (uint32_t axis = 0; axis < 3; ++axis) {
+                currentTranslation -= frame.current.viewRotation[axis * 4 + row] *
+                    (frame.current.origin[axis] - candidate.anchor[axis]);
+                previousTranslation -= previous.viewRotation[axis * 4 + row] *
+                    (previous.origin[axis] - candidate.anchor[axis]);
+            }
+            currentView[12 + row] = static_cast<float>(currentTranslation);
+            previousView[12 + row] = static_cast<float>(previousTranslation);
+        }
+        const auto project = [](const float* projection, const float* view, float* output) {
+            for (uint32_t column = 0; column < 4; ++column)
+                for (uint32_t row = 0; row < 4; ++row) {
+                    float value = 0;
+                    for (uint32_t inner = 0; inner < 4; ++inner)
+                        value += projection[inner * 4 + row] * view[column * 4 + inner];
+                    output[column * 4 + row] = value;
+                }
+        };
+        project(frame.current.projection, currentView, inputs.currentViewProjection);
+        project(previous.projection, previousView, inputs.previousViewProjection);
+        std::copy_n(frame.current.projection, 16, inputs.projection);
+        inputs.displayWidth = static_cast<int32_t>(frame.width);
+        inputs.displayHeight = static_cast<int32_t>(frame.height);
+        inputs.cameraNear = frame.current.nearPlane;
+        inputs.cameraFar = frame.current.farPlane;
+        inputs.cameraVerticalFov = frame.current.verticalFovRadians;
+        inputs.frameTimeDeltaMs = frame.frameDeltaMs;
+        inputs.viewSpaceToMeters = frame.viewSpaceToMeters;
+        inputs.jitterX = 0;
+        inputs.jitterY = 0;
+        inputs.mvScaleX = 1;
+        inputs.mvScaleY = 1;
+        inputs.realFrameId = frame.identity.realFrameId;
+        mcdr_fg_constants constants{};
+        std::copy_n(currentView, 16, constants.view);
+        std::copy_n(frame.current.projection, 16, constants.projection);
+        constants.mvScaleX = 1;
+        constants.mvScaleY = 1;
+        constants.frameRenderTime = frame.frameDeltaMs;
+        constants.resetHistory = compatible ? 0 : 1;
+        mcdr_fg_dispatch mode{};
+        mode.backend = static_cast<int32_t>(frame.frameGenerationBackend);
+        mode.mode = static_cast<int32_t>(frame.frameGenerationMode);
+        mode.numFrames = static_cast<int32_t>(frame.frameGenerationFrames);
+        mode.reset = constants.resetHistory;
+        if (!state.provider->setMode(mode)) {
+            invalidateCameraLocked(state);
+            return -1;
+        }
+        state.constants = constants;
+        state.hasConstants = true;
+        const auto acceptance = fgTagFrameInputs(state, candidate, inputs);
+        if (acceptance == FgInputAcceptance::Accepted) state.pendingCamera = std::move(candidate);
+        return acceptance == FgInputAcceptance::Accepted ? 1 :
+            acceptance == FgInputAcceptance::Skipped ? 0 : -1;
+    }
 }
 }  // namespace d3d12_mc

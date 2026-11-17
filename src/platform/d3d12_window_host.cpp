@@ -79,6 +79,19 @@ void resizeChild(MCDR_WindowHost* host, int width, int height) {
                    SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS | SWP_DEFERERASE);
 }
 
+void paintParentBlack(HWND child) {
+    if (child == nullptr) return;
+    HWND parent = ::GetParent(child);
+    if (parent == nullptr || ::IsWindow(parent) == 0) return;
+    HDC dc = ::GetDC(parent);
+    if (dc == nullptr) return;
+    RECT client{};
+    ::GetClientRect(parent, &client);
+    ::FillRect(dc, &client, static_cast<HBRUSH>(::GetStockObject(BLACK_BRUSH)));
+    ::ReleaseDC(parent, dc);
+    ::GdiFlush();
+}
+
 // 子窗口消息处理：三条"必须" + 第一帧显示。
 LRESULT CALLBACK hostChildProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -234,6 +247,27 @@ void mcdr_host_reveal(MCDR_WindowHost* host) {
     if (host == nullptr || host->child == nullptr) return;
     // 渲染线程调用：投递到窗口线程，避免跨线程 ShowWindow。
     ::PostMessageW(host->child, kMsgReveal, 0, 0);
+}
+
+int32_t mcdr_host_prepare_release(MCDR_WindowHost* host) {
+    if (host == nullptr || host->refs.load(std::memory_order_acquire) != 1) return 0;
+    if (host->child != nullptr && ::IsWindow(host->child) != 0) {
+        // 释放交换链可能等待 GPU / DWM；先隐藏最后一个呈现子窗口，避免旧 backbuffer
+        // 在这段等待期间继续留在屏幕上。真正销毁仍由 mcdr_host_release() 完成。
+        paintParentBlack(host->child);
+        HWND parent = ::GetParent(host->child);
+        if (parent != nullptr && ::IsWindow(parent) != 0) {
+            ::ShowWindow(parent, SW_HIDE);
+            ::SetWindowPos(parent, HWND_BOTTOM, 0, 0, 0, 0,
+                           SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING |
+                               SWP_HIDEWINDOW);
+        }
+        ::ShowWindow(host->child, SW_HIDE);
+        ::SetWindowPos(host->child, HWND_BOTTOM, 0, 0, 0, 0,
+                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING |
+                           SWP_HIDEWINDOW);
+    }
+    return 1;
 }
 
 int32_t mcdr_host_minimized(MCDR_WindowHost* host) {

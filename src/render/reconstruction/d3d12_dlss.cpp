@@ -56,6 +56,7 @@
 // callback types (DlssTransitionFn / DlssQueryStateFn) this unit stores in its state.
 #include "mcdr_dlss_impl.h"
 #include "mcdr_hdr_state.h"  // P197：HDR 激活状态（colorBuffersHDR）
+extern "C" int32_t mcdr_dlss_invalidate_inputs(void);
 import std;
 
 #include "nvsdk_ngx.h"
@@ -122,6 +123,11 @@ namespace
     using DestroyTextureFn = void (*)(void*, void*);
     CreateTextureFn gCreateTexture = nullptr;
     DestroyTextureFn gDestroyTexture = nullptr;
+    using PinTextureFn = int32_t (*)(void*, void*);
+    PinTextureFn gPinTexture = nullptr;
+    using ShutdownStreamlineFn = int32_t (*)(void);
+    ShutdownStreamlineFn gShutdownStreamline = nullptr;
+    std::atomic<bool> gStreamlineInputInvalidationFailed{false};
 
     void logInfo(const char* fmt, ...) {
         if (gLogInfo == nullptr) {
@@ -214,6 +220,10 @@ namespace
         ID3D12Device* device = nullptr;
         NVSDK_NGX_Parameter* params = nullptr;
         NVSDK_NGX_Handle* feature = nullptr;
+        uint32_t srViewport = 0;
+        int32_t srViewportSlot = -1;
+        bool srPrepared = false;
+        std::optional<std::string> preparedFailure;
         ID3D12Resource* depthStencil = nullptr;  // DLSS scratch buffer, DEFAULT heap
         // P108: DLSS must write into a resource created with ALLOW_UNORDERED_ACCESS. The
         // JVM's GUI/present target is created with ALLOW_RENDER_TARGET only (that flag is set
@@ -279,6 +289,7 @@ namespace
         float slEvalOptPreExposure = -1.0f;
         float slEvalOptExposureScale = -1.0f;
         uint32_t slEvalOptQuality = 0xFFFFFFFFu;
+        int32_t slEvalOptPreset = -1;
         bool slEvalOptHdr = false;
 
         ID3D12Resource* mvBuffer = nullptr;      // intermediate for a non-RG16 MV input
@@ -348,6 +359,32 @@ namespace
     };
 
     State s;
+
+    struct SrCandidate {
+        NVSDK_NGX_Parameter* params = nullptr;
+        NVSDK_NGX_Handle* feature = nullptr;
+        mcdr_dlss_input input{};
+        uint32_t quality = 0;
+        int32_t tier = -1;
+        int32_t preset = 0;
+        int32_t flags = 0;
+        uint32_t viewport = 0;
+        int32_t viewportSlot = -1;
+        bool streamline = false;
+        bool viewportTouched = false;
+        bool ready = false;
+        float preExposure = 1.0f;
+        float exposureScale = 1.0f;
+        bool hdr = false;
+        int32_t mode = -1;
+        bool tagsPresent = false;
+    };
+
+    bool gSrViewportSlots[3]{};
+#if MCDR_DLSS_HAVE_STREAMLINE
+    std::optional<sl::Constants> gSrAllocationConstants[3];
+#endif
+    uint32_t gSrCandidateCount = 0;
 
     // -----------------------------------------------------------------------
     // Runtime discovery (see the file-header note). Everything here logs through the
@@ -680,13 +717,19 @@ namespace
         int32_t flags = 0;
         {
             char ae[8] = {};
-            if (::GetEnvironmentVariableA("MCDR_DLSS_AUTOEXPOSURE", ae, sizeof(ae)) > 0 &&
+            if (in.pInExposure == nullptr && ::GetEnvironmentVariableA("MCDR_DLSS_AUTOEXPOSURE", ae, sizeof(ae)) > 0 &&
                 ae[0] == '1') {
                 flags |= static_cast<int32_t>(NVSDK_NGX_DLSS_Feature_Flags_AutoExposure);
             }
         }
         if (in.depthInverted != 0) {
             flags |= static_cast<int32_t>(NVSDK_NGX_DLSS_Feature_Flags_DepthInverted);
+        }
+        auto* colorResource = reinterpret_cast<ID3D12Resource*>(in.pInColor);
+        const DXGI_FORMAT colorFormat = colorResource ? colorResource->GetDesc().Format : DXGI_FORMAT_UNKNOWN;
+        if (colorFormat == DXGI_FORMAT_R16G16B16A16_FLOAT || colorFormat == DXGI_FORMAT_R32G32B32A32_FLOAT ||
+            colorFormat == DXGI_FORMAT_R11G11B10_FLOAT) {
+            flags |= static_cast<int32_t>(NVSDK_NGX_DLSS_Feature_Flags_IsHDR);
         }
         if (in.renderWidth != in.targetWidth || in.renderHeight != in.targetHeight) {
             flags |= static_cast<int32_t>(NVSDK_NGX_DLSS_Feature_Flags_MVLowRes);
@@ -695,6 +738,26 @@ namespace
         // flag comment block above), so tell NGX to cancel it with InJitterOffsetX/Y.
         // P134：MV 改成真实运动后不再置 MVJittered（否则 NGX 会去减一个不存在的 jitter 差）。
         return flags;
+    }
+
+    std::optional<std::string> preparedSrMismatch(const mcdr_dlss_input& in) {
+        if (in.renderWidth != s.renderWidth || in.renderHeight != s.renderHeight)
+            return std::format("prepared render mismatch: actual={}x{}, prepared={}x{}",
+                in.renderWidth, in.renderHeight, s.renderWidth, s.renderHeight);
+        if (in.targetWidth != s.targetWidth || in.targetHeight != s.targetHeight)
+            return std::format("prepared target mismatch: actual={}x{}, prepared={}x{}",
+                in.targetWidth, in.targetHeight, s.targetWidth, s.targetHeight);
+        if (s.requestedQuality != s.effectiveQuality)
+            return std::format("prepared tier mismatch: requested={}, prepared={}",
+                s.requestedQuality, s.effectiveQuality);
+        if (s.requestedPreset != s.effectivePreset)
+            return std::format("prepared preset mismatch: requested={}, prepared={}",
+                s.requestedPreset, s.effectivePreset);
+        const auto flags = computeFeatureFlags(in);
+        if (flags != s.featureFlags)
+            return std::format("prepared flags mismatch: actual=0x{:X}, prepared=0x{:X}",
+                flags, s.featureFlags);
+        return std::nullopt;
     }
     // -----------------------------------------------------------------------
     // Resource helpers (this unit owns no device state, so it creates its own scratch
@@ -975,8 +1038,17 @@ namespace
     }
 
     // 运行时取 interposer 的 slDLSSSetOptions（不引入静态导入，缺 SL 时返回 nullptr）。
-    PFn_SlDLSSSetOptions slDlssSetOptionsFn() {
-        static const PFn_SlDLSSSetOptions fn = []() -> PFn_SlDLSSSetOptions {
+    PFn_SlDLSSSetOptions slDlssSetOptionsFn(bool reset = false) {
+        static PFn_SlDLSSSetOptions fn = nullptr;
+        static bool resolved = false;
+        if (reset) {
+            fn = nullptr;
+            resolved = false;
+            return fn;
+        }
+        if (resolved) return fn;
+        resolved = true;
+        fn = []() -> PFn_SlDLSSSetOptions {
             const std::wstring dir = dlssModuleDirectory();
             if (dir.empty()) return nullptr;
             HMODULE sl = ::LoadLibraryW((dir + L"sl.interposer.dll").c_str());
@@ -1025,8 +1097,42 @@ namespace
     // P291n（用户 m04823）：Streamline 路径的档位解析（定义在 chooseQuality 之后）。
     uint32_t resolveQualityValue(const mcdr_dlss_input& in);
 
+    std::optional<sl::DLSSOptions> srStreamlineOptions(const mcdr_dlss_input& in,
+                                                     uint32_t quality, int32_t preset) {
+        if (preset != 0 && preset != 5 && preset != 6 && preset != 10 &&
+            preset != 11 && preset != 12 && preset != 13) return std::nullopt;
+        auto* color = reinterpret_cast<ID3D12Resource*>(in.pInColor);
+        if (color == nullptr) return std::nullopt;
+        sl::DLSSOptions options{};
+        switch (quality) {
+            case NVSDK_NGX_PerfQuality_Value_DLAA: options.mode = sl::DLSSMode::eDLAA; break;
+            case NVSDK_NGX_PerfQuality_Value_MaxQuality: options.mode = sl::DLSSMode::eMaxQuality; break;
+            case NVSDK_NGX_PerfQuality_Value_Balanced: options.mode = sl::DLSSMode::eBalanced; break;
+            case NVSDK_NGX_PerfQuality_Value_UltraPerformance: options.mode = sl::DLSSMode::eUltraPerformance; break;
+            default: options.mode = sl::DLSSMode::eMaxPerformance; break;
+        }
+        options.outputWidth = static_cast<uint32_t>(in.targetWidth);
+        options.outputHeight = static_cast<uint32_t>(in.targetHeight);
+        options.preExposure = in.preExposure > 0.0f ? in.preExposure : 1.0f;
+        options.exposureScale = in.exposureScale > 0.0f ? in.exposureScale : 1.0f;
+        const auto selected = static_cast<sl::DLSSPreset>(preset);
+        options.dlaaPreset = selected;
+        options.qualityPreset = selected;
+        options.balancedPreset = selected;
+        options.performancePreset = selected;
+        options.ultraPerformancePreset = selected;
+        options.useAutoExposure = sl::Boolean::eFalse;
+        const auto format = color->GetDesc().Format;
+        options.colorBuffersHDR = format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+            format == DXGI_FORMAT_R32G32B32A32_FLOAT || format == DXGI_FORMAT_R11G11B10_FLOAT
+                ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+        options.alphaUpscalingEnabled = sl::Boolean::eFalse;
+        return options;
+    }
+
     // 把本帧几何 + 质量档写进 SL 的 DLSS 选项；失败时告警。
     int32_t streamlineApplyOptions(const mcdr_dlss_input& in) {
+        if (s.srPrepared) return 0;
         const PFn_SlDLSSSetOptions fn = slDlssSetOptionsFn();
         if (fn == nullptr) return -1;
         sl::DLSSOptions opt{};
@@ -1055,7 +1161,7 @@ namespace
             s.slOptExposureScale == opt.exposureScale) {
             return 0;
         }
-        const sl::ViewportHandle viewport(0);
+        const sl::ViewportHandle viewport(s.srViewport);
         const sl::Result r = fn(viewport, opt);
         if (r != sl::Result::eOk) {
             logWarn("DLSS impl=streamline — slDLSSSetOptions result=0x%X (mode=%d, out=%ux%u, "
@@ -1351,12 +1457,13 @@ namespace
         return s.qualityValue;
     }
 
-    void destroyFeature() {
+    bool destroyFeature() {
         if (s.feature != nullptr) {
             const NVSDK_NGX_Result r = NVSDK_NGX_D3D12_ReleaseFeature(s.feature);
             if (NVSDK_NGX_FAILED(r)) {
                 logWarn("NVSDK_NGX_D3D12_ReleaseFeature failed: %s",
                         ngxResultString(r).c_str());
+                return false;
             }
             s.feature = nullptr;
         }
@@ -1366,6 +1473,7 @@ namespace
         s.slOptsApplied = false;
         // P199b: same for the per-frame evaluate path's own option cache.
         s.slEvalOptsValid = false;
+        return true;
     }
 
     // Creates (or recreates) the feature. Requires an OPEN command list — NGX records its
@@ -1470,11 +1578,12 @@ namespace
         // well — NGX bakes the network choice into the feature — so a model change has to rebuild
         // the feature exactly like a tier change. `effectivePreset` is what the live feature got.
         const bool presetChanged = (s.requestedPreset != s.effectivePreset);
-        if (s.featureOk && !sizeChanged && !qualityChanged && !presetChanged) {
+        const bool flagsChanged = s.featureFlags != computeFeatureFlags(in);
+        if (s.featureOk && !sizeChanged && !qualityChanged && !presetChanged && !flagsChanged) {
             return true;
         }
-        if (sizeChanged || qualityChanged || presetChanged) {
-            destroyFeature();
+        if (sizeChanged || qualityChanged || presetChanged || flagsChanged) {
+            if (!destroyFeature()) return false;
             // A new size invalidates the history; a pure tier change does not have to, but the
             // rebuilt feature starts with no history anyway, so reset in both cases.
             s.resetPending = true;
@@ -1880,7 +1989,15 @@ void mcdr_dlss_query(char* note, int32_t noteCap, char* optimal, int32_t optimal
         if (s.disabled) *flagsOut |= 32u;
     }
     if (note != nullptr && noteCap > 0) {
-        if (s.disabled) {
+        if (s.srPrepared && s.preparedFailure) {
+            std::snprintf(note, static_cast<std::size_t>(noteCap), "DLSS %s",
+                s.preparedFailure->c_str());
+        } else if (s.srPrepared && dlssImplStreamline()) {
+            std::snprintf(note, static_cast<std::size_t>(noteCap),
+                "Streamline DLSS prepared: tier=%d preset=%d, render=%dx%d target=%dx%d",
+                s.effectiveQuality, s.effectivePreset, s.renderWidth, s.renderHeight,
+                s.targetWidth, s.targetHeight);
+        } else if (s.disabled) {
             std::snprintf(note, static_cast<std::size_t>(noteCap), "DLSS disabled, %s failed",
                           s.failure.empty() ? "an earlier stage" : s.failure.c_str());
         } else if (!s.initAttempted) {
@@ -1929,6 +2046,13 @@ int32_t mcdr_dlss_create(void* commandList, const mcdr_dlss_input* in, DlssTrans
                          void* tlCtx) {
     if (in == nullptr) {
         return -1;
+    }
+    if (!std::isfinite(in->preExposure) || in->preExposure < 0.0f ||
+        (in->preExposure > 0.0f && !std::isfinite(1.0f / in->preExposure)) ||
+        !std::isfinite(in->exposureScale) || in->exposureScale < 0.0f) return -1;
+    if (s.srPrepared) {
+        s.preparedFailure = preparedSrMismatch(*in);
+        return s.preparedFailure ? 0 : 1;
     }
     if (s.disabled) {
         return -1;
@@ -2102,6 +2226,10 @@ int32_t mcdr_dlss_snapshot_depth(void* commandList, void* depthResource, DlssTra
 
 // P113：最近一帧的 SL frame token（Reflex 的 slReflexSleep 要在 Present 前用它）。
 sl::FrameToken* gLastFrameToken = nullptr;
+uint64_t gStreamlineFrameSerial = 0;
+uint64_t gWorldConstantsFrame = UINT64_MAX;
+uint64_t gDisplayConstantsFrame = UINT64_MAX;
+bool gDisplayInputsAccepted = false;
 
 
     // P113/P115：Reflex 低延迟 + PCL 延迟标记 + 帧率限制器。
@@ -2256,6 +2384,8 @@ sl::FrameToken* gLastFrameToken = nullptr;
         if (!reflexEnabled()) return;
         resolveReflexApi();
         gLastFrameToken = nullptr;
+        ++gStreamlineFrameSerial;
+        gDisplayInputsAccepted = false;
         sl::FrameToken* token = nullptr;
         uint32_t frameIndex = ++gReflex.frameCounter;
         if (gReflex.newFrameToken != nullptr &&
@@ -2353,7 +2483,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
     // P213：帧生成的选项入口（ProgrammingGuideDLSS_G.md §6.0）。
     using PFn_SlDLSSGSetOptions = sl::Result (*)(const sl::ViewportHandle&, const sl::DLSSGOptions&);
     // P213：帧生成的状态查询（读 numFramesActuallyPresented / status，用来验证是否真的在插帧）。
-    using PFn_SlDLSSGGetState = sl::Result (*)(const sl::ViewportHandle&, sl::DLSSGState&, const sl::BaseStructure**);
+    using PFn_SlDLSSGGetState = sl::Result (*)(const sl::ViewportHandle&, sl::DLSSGState&, const sl::DLSSGOptions*);
 
     // P213 阶段 2：帧生成的开关状态。0 = off，1 = on（固定倍率），2 = dynamic。
     // 由 ABI `mcdr_dx12SetDlssgMode` 写入，渲染线程每帧读取。
@@ -2377,11 +2507,63 @@ sl::FrameToken* gLastFrameToken = nullptr;
         PFn_slEvaluateFeature evaluate = nullptr;
     };
 
+    struct StreamlineFgState {
+        int32_t mode = -1;
+        int32_t frames = -1;
+        uint32_t width = 0;
+        uint32_t height = 0;
+    };
+    StreamlineFgState gStreamlineFgState;
+
+    sl::Result clearStreamlineFrameTags(StreamlineEvalApi& api, const sl::FrameToken& token,
+                                        const sl::ViewportHandle& viewport) {
+        const sl::ResourceTag tags[] = {
+            {nullptr, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow},
+            {nullptr, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow},
+            {nullptr, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eOnlyValidNow},
+            {nullptr, sl::kBufferTypeUIColorAndAlpha, sl::ResourceLifecycle::eOnlyValidNow},
+        };
+        return api.setTags(token, viewport, tags, static_cast<uint32_t>(std::size(tags)), nullptr);
+    }
+
+    sl::Result tagStreamlineFrameInputs(StreamlineEvalApi& api, const sl::FrameToken& token,
+                                        const sl::ViewportHandle& viewport,
+                                        ID3D12GraphicsCommandList* cmd,
+                                        const mcdr_dlss_input& in, sl::Resource& depth,
+                                        sl::Resource& motion, sl::Resource& hudless, sl::Resource& ui) {
+        const sl::Extent renderExtent{0, 0, static_cast<uint32_t>(in.renderWidth),
+                                      static_cast<uint32_t>(in.renderHeight)};
+        const sl::Extent displayExtent{0, 0, static_cast<uint32_t>(in.targetWidth),
+                                       static_cast<uint32_t>(in.targetHeight)};
+        // SR must already have written HUDless. These calls record SDK-owned copies on cmd;
+        // wrapper pins must survive execution of cmd, while SL owns the later Present reads.
+        const sl::ResourceTag tags[] = {
+            {&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &renderExtent},
+            {&motion, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow,
+             &renderExtent},
+            {&hudless, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eOnlyValidNow,
+             &displayExtent},
+            {&ui, sl::kBufferTypeUIColorAndAlpha, sl::ResourceLifecycle::eOnlyValidNow,
+             &displayExtent},
+        };
+        return api.setTags(token, viewport, tags, static_cast<uint32_t>(std::size(tags)), cmd);
+    }
+
     // P213：DLSS-G 插件可能比 DLSS 晚加载，所以解析要能重试（见 refreshFgApi）。
     HMODULE gSlInterposer = nullptr;
 
-    StreamlineEvalApi& streamlineEvalApi() {
-        static StreamlineEvalApi api = []() -> StreamlineEvalApi {
+    StreamlineEvalApi& streamlineEvalApi(bool reset = false) {
+        static StreamlineEvalApi api{};
+        static bool resolved = false;
+        if (reset) {
+            api = {};
+            resolved = false;
+            gSlInterposer = nullptr;
+            return api;
+        }
+        if (resolved) return api;
+        resolved = true;
+        api = []() -> StreamlineEvalApi {
             StreamlineEvalApi a{};
             const std::wstring dir = dlssModuleDirectory();
             if (dir.empty()) return a;
@@ -2465,6 +2647,38 @@ sl::FrameToken* gLastFrameToken = nullptr;
         }
         return true;
     }
+    bool makeStreamlineCamera(const mcdr_dlss_constants& camera, uint32_t dilated, sl::Constants& constants) {
+        float inverseCurrent[16], inversePrevious[16], inverseProjection[16];
+        if (!mat4Inverse(camera.viewProjection, inverseCurrent) ||
+            !mat4Inverse(camera.prevViewProjection, inversePrevious) ||
+            !mat4Inverse(camera.projection, inverseProjection)) return false;
+        std::memcpy(&constants.cameraViewToClip, camera.projection, sizeof(camera.projection));
+        std::memcpy(&constants.clipToCameraView, inverseProjection, sizeof(inverseProjection));
+        float clipToPrevious[16], previousToClip[16];
+        mat4Multiply(inverseCurrent, camera.prevViewProjection, clipToPrevious);
+        mat4Multiply(inversePrevious, camera.viewProjection, previousToClip);
+        std::memcpy(&constants.clipToPrevClip, clipToPrevious, sizeof(clipToPrevious));
+        std::memcpy(&constants.prevClipToClip, previousToClip, sizeof(previousToClip));
+        constants.jitterOffset = {camera.jitterOffsetX, camera.jitterOffsetY};
+        constants.mvecScale = {camera.mvecScaleX, camera.mvecScaleY};
+        constants.cameraPos = {camera.cameraPosX, camera.cameraPosY, camera.cameraPosZ};
+        constants.cameraUp = {camera.cameraUpX, camera.cameraUpY, camera.cameraUpZ};
+        constants.cameraRight = {camera.cameraRightX, camera.cameraRightY, camera.cameraRightZ};
+        constants.cameraFwd = {camera.cameraFwdX, camera.cameraFwdY, camera.cameraFwdZ};
+        constants.cameraNear = camera.cameraNear;
+        constants.cameraFar = camera.cameraFar;
+        constants.cameraFOV = camera.cameraFovRadians;
+        constants.cameraAspectRatio = camera.cameraAspectRatio;
+        constants.depthInverted = camera.depthInverted ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+        constants.cameraMotionIncluded = camera.cameraMotionIncluded ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+        constants.motionVectors3D = camera.motionVectors3D ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+        constants.motionVectorsJittered = camera.motionVectorsJittered ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+        constants.reset = camera.reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+        constants.motionVectorsDilated = dilated != 0 ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+        constants.orthographicProjection = sl::Boolean::eFalse;
+        return true;
+    }
+
     // SL 的 DLSS 评价：按 ProgrammingGuideDLSS.md 的顺序 —— tag 资源 → 设选项 → evaluate。
     // eDisableCLStateTracking 下资源状态由我们负责（这里沿用 NGX 路径的同一组状态）。
     // P213：DLSS-G 的函数指针是延迟解析的。插件在第一次 evaluate 之后才 load 时，
@@ -2491,38 +2705,23 @@ sl::FrameToken* gLastFrameToken = nullptr;
 
     }
 
-    // P305ag：把本帧的 SR 产物交给 FG provider（XeSS-FG / FSR-FG 这类包装型后端）。
-    //
-    // 为什么在这里：逐帧 tag 原本只有一个触发点 —— `srEvaluateFrame` 成功后（`d3d12_sr.cpp:413`）。
-    // 而 DLSS 超分走的是本文件的 `mcdr_dlss_evaluate`（普通翻译单元，不 import 设备模块），
-    // `sr.backend = DLSS` 时那条路径根本不执行，XeSS-FG 因此一帧输入都收不到（实机取证：
-    // 4561 帧 tagCalls=0，setEnabled 从未下发）。走 `mcdr_fgTagDlssInputs` 这个只过 POD 的
-    // C ABI 桥，避免模块私有名的修饰名在链接期对不上（见 `d3d12_mesh_base.cpp` 的教训）。
-    //
-    // 状态为什么这么给：`out` 刚从 SR 输出恢复成 RENDER_TARGET（P273 契约），深度/MV 在 SR
-    // 结束时是只读 SRV（SL 自己的 tag 也要求 NON_PIXEL_SHADER_RESOURCE）。给错只是让 SDK
-    // 记错屏障的 Before 值，`TagFrameResource` 会返回错误码并落 breadcrumb（`P305af tag FAILED`）。
-    void tagFrameGenInputsFromDlss(ID3D12GraphicsCommandList* cmd, const mcdr_dlss_input& in) {
-        if (cmd == nullptr) {
-            return;
-        }
-        mcdr_fgTagDlssInputs(cmd, in.pInOutput, static_cast<int32_t>(D3D12_RESOURCE_STATE_RENDER_TARGET),
-                             in.pInDepth,
-                             static_cast<int32_t>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-                             in.pInMotionVectors,
-                             static_cast<int32_t>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
-    }
 
     int32_t streamlineEvaluate(void* commandList, const mcdr_dlss_input& in, DlssTransitionFn tl,
                                void* tlCtx) {
         auto* cmd = static_cast<ID3D12GraphicsCommandList*>(commandList);
-        if (cmd == nullptr) return 0;
+        if (gStreamlineInputInvalidationFailed.load() && mcdr_dlss_invalidate_inputs() != 1)
+            return -1;
+        if (cmd == nullptr) {
+            (void)mcdr_dlss_invalidate_inputs();
+            return gStreamlineInputInvalidationFailed.load() ? -1 : 0;
+        }
         StreamlineEvalApi& api = streamlineEvalApi();
         if (gDlssgMode.load() != 0) {
             refreshFgApi(api);
 
         }
         auto* color = reinterpret_cast<ID3D12Resource*>(in.pInColor);
+        auto* exposure = reinterpret_cast<ID3D12Resource*>(in.pInExposure);
         auto* depth = reinterpret_cast<ID3D12Resource*>(in.pInDepth);
         auto* mv = reinterpret_cast<ID3D12Resource*>(in.pInMotionVectors);
         auto* out = reinterpret_cast<ID3D12Resource*>(in.pInOutput);
@@ -2534,9 +2733,13 @@ sl::FrameToken* gLastFrameToken = nullptr;
                 logWarn("streamline evaluate unavailable — interposer exports or "
                         "slDLSSSetOptions missing");
             }
-            return 0;
+            (void)mcdr_dlss_invalidate_inputs();
+            return gStreamlineInputInvalidationFailed.load() ? -1 : 0;
         }
-        if (color == nullptr || depth == nullptr || mv == nullptr || out == nullptr) return 0;
+        if (color == nullptr || depth == nullptr || mv == nullptr || out == nullptr) {
+            (void)mcdr_dlss_invalidate_inputs();
+            return gStreamlineInputInvalidationFailed.load() ? -1 : 0;
+        }
         // P112：输出目标优先用 JVM 交付的 UAV 纹理（s.externalOutput，见 mcdr_dlss_set_output_texture）。
         // 直接把 GUI 目标（无 UAV 位）标成 kBufferTypeScalingOutputColor，NGX 会报
         // FAIL_RWFlagMissing(0xBAD00009)（SL 日志里是 "[sl.dlss] NGX evaluate feature failed"）。
@@ -2548,18 +2751,25 @@ sl::FrameToken* gLastFrameToken = nullptr;
         // 只有两者都不可用才退化成直接写 GUI 目标。
         ID3D12Resource* outResource = out;
         bool copyBack = false;
+        const bool directOutput = (out->GetDesc().Flags &
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
         const auto fitsTarget = [&in](ID3D12Resource* res) {
             if (res == nullptr) return false;
             const D3D12_RESOURCE_DESC d = res->GetDesc();
             return d.Width == static_cast<UINT64>(in.targetWidth) &&
                    d.Height == static_cast<UINT>(in.targetHeight);
         };
-        if (fitsTarget(s.externalOutput)) {
+        if (!directOutput && fitsTarget(s.externalOutput)) {
             outResource = s.externalOutput;
             copyBack = true;
-        } else if (fitsTarget(s.dlssOutput)) {
+        } else if (!directOutput && fitsTarget(s.dlssOutput)) {
             outResource = s.dlssOutput;
             copyBack = true;
+        }
+        if (outResource == s.dlssOutput &&
+            (gPinTexture == nullptr || gPinTexture(commandList, s.dlssOutputObject) != 1)) {
+            (void)mcdr_dlss_invalidate_inputs();
+            return gStreamlineInputInvalidationFailed.load() ? -1 : 0;
         }
         s.transitionFn = tl;
         s.transitionCtx = tlCtx;
@@ -2569,110 +2779,28 @@ sl::FrameToken* gLastFrameToken = nullptr;
         // DLSS evaluate 落在**同一帧**（文档要求）。没有 frame_begin（例如 Reflex 关闭）时兜底自建。
         sl::FrameToken* token = gLastFrameToken;
         if (token == nullptr) {
-            uint32_t frameIndex = static_cast<uint32_t>(s.submitCount);
+            uint32_t frameIndex = ++gReflex.frameCounter;
             if (api.newFrameToken(token, &frameIndex) != sl::Result::eOk || token == nullptr) return 0;
+            ++gStreamlineFrameSerial;
         }
-        const sl::ViewportHandle viewport(0);
+        const sl::ViewportHandle viewport(s.srViewport);
         gLastFrameToken = token;  // P113：Reflex 在 Present 前要用它
 
         // 1) 相机常量（每帧、尽量早；ProgrammingGuide.md §2.11.1）。没有 JVM 送来的
         //    `mcdr_dlss_constants` 时只能跳过 —— slSetConstants 缺字段 DLSS 会拒绝该帧。
-        if (gCameraConstantsValid) {
-            sl::Constants cnst{};
-            // P118 修（用户报「DLSS 静止不动也有随机拖影」）：这里有三个**传参错误**，每一个都足以
-            // 让 DLSS 在完全静止时每帧取错历史：
-            //   1) 布局：JVM 送的是列主序（JOML `Matrix4f.get(float[])`），而 `sl::Constants` 的
-            //      `float4x4` 明确要求**行主序**（sl_consts.h:183-185）。原来直接 memcpy，等于把
-            //      整组矩阵转置着交给 SL —— 静止时当前/上一帧只差一个 jitter，转置会把这点差异
-            //      映射到错误的 clip 轴上，于是每个像素每帧都多出约半个像素的错误位移 ⇒ 拖影。
-            //   2) `prevClipToClip` 抄成了 `inverse(prevViewProj)`，公式是
-            //      `prevClipToClip = clipToPrevClip.inverse() = inverse(prevViewProj) * viewProj`
-            //      （sl_consts.h:193-199），少了右乘的当前帧矩阵，它根本不是"上一帧 clip → 本帧
-            //      clip"的映射。
-            //   3) 矩阵求逆/相乘用的是本文件的行主序工具（mat4Multiply/mat4Inverse），所以必须先
-            //      把列主序输入转成行主序再做数学，否则连 `clipToPrevClip` 都是转置的。
-            const float* viewProj = gCameraConstants.viewProjection;
-            const float* prevViewProj = gCameraConstants.prevViewProjection;
-            float curVP[16] = {};
-            float prvVP[16] = {};
-            // 列主序 -> 行主序：rowMajor[r*4+c] = colMajor[c*4+r]
-            for (int r = 0; r < 4; ++r) {
-                for (int c = 0; c < 4; ++c) {
-                    curVP[r * 4 + c] = viewProj[c * 4 + r];
-                    prvVP[r * 4 + c] = prevViewProj[c * 4 + r];
-                }
-            }
-            float invCurVP[16] = {};
-            float invPrvVP[16] = {};
-            const bool invOk = mat4Inverse(curVP, invCurVP);
-            const bool invPrevOk = mat4Inverse(prvVP, invPrvVP);
-            // 行主序之后可以直接拷进 sl::float4x4（它就是行主序的 16 个 float）。
-            // P120：`cameraViewToClip` 的语义是 **view->clip**，也就是投影矩阵本身（不是 VP）。
-            // 之前塞 VP，SL 的 depth->view 反投影就多带一层世界平移，深度相关的亚像素修正会随视角
-            // 漂移 —— 用户看到的「静止时随机抖动」。
-            const float* projColMajor = gCameraConstants.projection;
-            float curProj[16] = {};
-            for (int r = 0; r < 4; ++r) {
-                for (int c = 0; c < 4; ++c) {
-                    curProj[r * 4 + c] = projColMajor[c * 4 + r];
-                }
-            }
-            std::memcpy(&cnst.cameraViewToClip, curProj, sizeof(curProj));
-            {
-                float invProj[16] = {};
-                if (mat4Inverse(curProj, invProj)) {
-                    std::memcpy(&cnst.clipToCameraView, invProj, sizeof(invProj));
-                }
-            }
-            if (invOk) {
-                // clipToPrevClip = clipToView * viewToViewPrev * viewToClipPrev
-                //                = inverse(curVP) * prevVP
-                float clipToPrev[16] = {};
-                mat4Multiply(invCurVP, prvVP, clipToPrev);
-                std::memcpy(&cnst.clipToPrevClip, clipToPrev, sizeof(clipToPrev));
-                if (invPrevOk) {
-                    // prevClipToClip 必须是上面那个的逆：inverse(prevVP) * curVP。
-                    // 旧代码写的是 inverse(prevVP)，等于把"上一帧 clip"直接当成"本帧 clip"。
-                    float prevClipToClip[16] = {};
-                    mat4Multiply(invPrvVP, curVP, prevClipToClip);
-                    std::memcpy(&cnst.prevClipToClip, prevClipToClip, sizeof(prevClipToClip));
-                }
-            }
-            cnst.jitterOffset = {gCameraConstants.jitterOffsetX, gCameraConstants.jitterOffsetY};
-            cnst.mvecScale = {gCameraConstants.mvecScaleX, gCameraConstants.mvecScaleY};
-            cnst.cameraPos = {gCameraConstants.cameraPosX, gCameraConstants.cameraPosY,
-                              gCameraConstants.cameraPosZ};
-            cnst.cameraUp = {gCameraConstants.cameraUpX, gCameraConstants.cameraUpY,
-                             gCameraConstants.cameraUpZ};
-            cnst.cameraRight = {gCameraConstants.cameraRightX, gCameraConstants.cameraRightY,
-                                gCameraConstants.cameraRightZ};
-            cnst.cameraFwd = {gCameraConstants.cameraFwdX, gCameraConstants.cameraFwdY,
-                              gCameraConstants.cameraFwdZ};
-            cnst.cameraNear = gCameraConstants.cameraNear;
-            cnst.cameraFar = gCameraConstants.cameraFar;
-            cnst.cameraFOV = gCameraConstants.cameraFovRadians;
-            cnst.cameraAspectRatio = gCameraConstants.cameraAspectRatio;
-            cnst.depthInverted = gCameraConstants.depthInverted ? sl::Boolean::eTrue
-                                                                : sl::Boolean::eFalse;
-            cnst.cameraMotionIncluded = gCameraConstants.cameraMotionIncluded
-                                            ? sl::Boolean::eTrue
-                                            : sl::Boolean::eFalse;
-            cnst.motionVectors3D =
-                gCameraConstants.motionVectors3D ? sl::Boolean::eTrue : sl::Boolean::eFalse;
-            cnst.motionVectorsJittered = gCameraConstants.motionVectorsJittered
-                                             ? sl::Boolean::eTrue
-                                             : sl::Boolean::eFalse;
-            cnst.reset = gCameraConstants.reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
-            // 注意：本版 SDK 的 sl::Constants 没有 renderingGameFrames 字段（文档草稿里有、
-            // sl_consts.h:182 的实际结构没有），所以那一位只能留在 JVM/AI 侧不用。
-            cnst.motionVectorsDilated = sl::Boolean::eFalse;
-            cnst.orthographicProjection = sl::Boolean::eFalse;
-            (void)api.setConstants(cnst, *token, viewport);
-        }
+        if (!gCameraConstantsValid || !api.setConstants || gWorldConstantsFrame == gStreamlineFrameSerial)
+            return -1;
+        sl::Constants constants{};
+        if (!makeStreamlineCamera(gCameraConstants, 0, constants)) return -1;
+        if (s.resetPending || in.reset != 0) constants.reset = sl::Boolean::eTrue;
+        gWorldConstantsFrame = gStreamlineFrameSerial;
+        if (api.setConstants(constants, *token, viewport) != sl::Result::eOk) return -1;
 
-        // 2) 资源 tag（lifecycle 按文档 :143-147：输入/输出 eOnlyValidNow，深度/MV eValidUntilPresent）
-        // 只保留输出这一个 barrier：文档 :155 说资源状态由 SL 管理，输入侧的 transition 没必要，
-        // 还会和 SMAA/GUI 的既有状态重复切；tag 里仍带上资源当前应有的 state（D3D12 下必填）。
+        // Local SR tags do not publish FG inputs or copy the as-yet unwritten SR output.
+        transition(color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (exposure) transition(exposure, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        transition(depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        transition(mv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         transition(outResource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         sl::Resource colorRes(sl::ResourceType::eTex2d, color,
                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -2682,70 +2810,46 @@ sl::FrameToken* gLastFrameToken = nullptr;
                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         sl::Resource outRes(sl::ResourceType::eTex2d, outResource,
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        // P213：HUD-less 必须和其余 tag 在**同一次** slSetTagForFrame 里给出。分成两次调用会让
-        // 后一次覆盖前一次，SL 随后就再也找不到 depth/MV（实测日志：“Failed to find global tag
-        // 'kBufferTypeDepth'”，插帧因此一直不工作）。
-        // HUD-less 用 SR 的输出（窗口尺寸、此后不会被 GUI 写到）；outResource == out 时那张会叠上
-        // UI，不满足“UI 之前”的要求，于是干脆不开 FG。
-        const int32_t fgModeEarly = gDlssgMode.load();
-        const bool wantFg = (fgModeEarly != 0) && (outResource != out) && (api.setFgOptions != nullptr);
-        sl::Resource hudlessRes(sl::ResourceType::eTex2d, outResource,
-                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-        sl::ResourceTag tags[5] = {
-            sl::ResourceTag(&colorRes, sl::kBufferTypeScalingInputColor,
-                            sl::ResourceLifecycle::eOnlyValidNow),
-            sl::ResourceTag(&depthRes, sl::kBufferTypeDepth,
-                            sl::ResourceLifecycle::eValidUntilPresent),
-            sl::ResourceTag(&mvRes, sl::kBufferTypeMotionVectors,
-                            sl::ResourceLifecycle::eValidUntilPresent),
-            sl::ResourceTag(&outRes, sl::kBufferTypeScalingOutputColor,
-                            sl::ResourceLifecycle::eOnlyValidNow),
-            sl::ResourceTag(&hudlessRes, sl::kBufferTypeHUDLessColor,
-                            sl::ResourceLifecycle::eValidUntilPresent),
-        };
-        const uint32_t tagCount = wantFg ? 5u : 4u;
-        const sl::Result tagResult = api.setTags(*token, viewport, tags, tagCount, cmd);
+        sl::Resource exposureRes(sl::ResourceType::eTex2d, exposure,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        const sl::Extent renderExtent{0, 0, static_cast<uint32_t>(in.renderWidth),
+                                      static_cast<uint32_t>(in.renderHeight)};
+        const sl::Extent displayExtent{0, 0, static_cast<uint32_t>(in.targetWidth),
+                                       static_cast<uint32_t>(in.targetHeight)};
+        const sl::Extent exposureExtent{0, 0, 1, 1};
+        std::array<sl::ResourceTag, 5> tags{};
+        uint32_t tagCount = 0;
+        tags[tagCount++] = sl::ResourceTag(&colorRes, sl::kBufferTypeScalingInputColor,
+                                           sl::ResourceLifecycle::eOnlyValidNow, &renderExtent);
+        tags[tagCount++] = sl::ResourceTag(&depthRes, sl::kBufferTypeDepth,
+                                           sl::ResourceLifecycle::eOnlyValidNow, &renderExtent);
+        tags[tagCount++] = sl::ResourceTag(&mvRes, sl::kBufferTypeMotionVectors,
+                                           sl::ResourceLifecycle::eOnlyValidNow, &renderExtent);
+        tags[tagCount++] = sl::ResourceTag(&outRes, sl::kBufferTypeScalingOutputColor,
+                                           sl::ResourceLifecycle::eOnlyValidNow, &displayExtent);
+        if (exposure) {
+            tags[tagCount++] = sl::ResourceTag(&exposureRes, sl::kBufferTypeExposure,
+                                               sl::ResourceLifecycle::eOnlyValidNow, &exposureExtent);
+        }
+        std::array<sl::ResourceTag, 1> absentTags{};
+        uint32_t absentTagCount = 0;
+        if (!exposure) {
+            absentTags[absentTagCount++] = sl::ResourceTag(nullptr, sl::kBufferTypeExposure,
+                                                           sl::ResourceLifecycle::eOnlyValidNow);
+        }
+        const sl::Result tagResult = absentTagCount == 0 ? sl::Result::eOk :
+            api.setTags(*token, viewport, absentTags.data(), absentTagCount, cmd);
         if (tagResult != sl::Result::eOk) {
-            // 只在第一次失败时打一行：每帧打会把日志刷爆（P210 时吃过这个亏）。
-            static bool warnedTag = false;
-            if (!warnedTag) {
-                warnedTag = true;
-                logWarn("slSetTagForFrame failed=0x%X (frame=%u, color=%p depth=%p mv=%p out=%p)",
-                        static_cast<unsigned>(tagResult), s.submitCount,
-                        static_cast<void*>(color), static_cast<void*>(depth),
-                        static_cast<void*>(mv), static_cast<void*>(outResource));
-            }
+            gStreamlineInputInvalidationFailed.store(true);
+            logWarn("Streamline optional SR input invalidation failed: 0x%X", static_cast<unsigned>(tagResult));
+            return -1;
         }
 
         // 3) 选项（:170-186：各档 preset + 模式 + 输出尺寸 + 非 HDR/非自动曝光）
-        sl::DLSSOptions opt{};
-        opt.dlaaPreset = sl::DLSSPreset::ePresetK;
-        opt.qualityPreset = sl::DLSSPreset::ePresetK;
-        opt.balancedPreset = sl::DLSSPreset::ePresetK;
-        opt.performancePreset = sl::DLSSPreset::ePresetM;
-        opt.ultraPerformancePreset = sl::DLSSPreset::ePresetL;
-        switch (s.qualityValue) {
-            case NVSDK_NGX_PerfQuality_Value_DLAA:       opt.mode = sl::DLSSMode::eDLAA; break;
-            case NVSDK_NGX_PerfQuality_Value_MaxQuality: opt.mode = sl::DLSSMode::eMaxQuality; break;
-            case NVSDK_NGX_PerfQuality_Value_Balanced:   opt.mode = sl::DLSSMode::eBalanced; break;
-            // P291（用户 m03752）：极致性能 = 3x。它原先落进 default 被当成 MaxPerformance（2x），
-            // Streamline 于是按 2x 规划特征，我们却喂 3x 的输入 —— 评价结果全黑（只有 GUI 正常），
-            // 而 50% / 58% / 67% 恰好都与 default 的 eMaxPerformance 或已有分支吻合，所以只有这一档坏。
-            case NVSDK_NGX_PerfQuality_Value_UltraPerformance: opt.mode = sl::DLSSMode::eUltraPerformance; break;
-            default:                                     opt.mode = sl::DLSSMode::eMaxPerformance; break;
-        }
-        opt.outputWidth = static_cast<uint32_t>(in.targetWidth);
-        opt.outputHeight = static_cast<uint32_t>(in.targetHeight);
-        opt.preExposure = in.preExposure > 0.0f ? in.preExposure : 1.0f;
-        opt.exposureScale = in.exposureScale > 0.0f ? in.exposureScale : 1.0f;
-        opt.useAutoExposure = sl::Boolean::eFalse;
-        // P197：HDR 开启时 colorBuffersHDR 必须是 eTrue。注意我们的内部主渲染目标仍是 SDR，
-        // 线性化与白点换算发生在呈现用的 blit PS 里；这里只是让 Streamline 按 HDR 语义
-        // 处理颜色缓冲（避免它再套一层 sRGB 编解码）。
-        opt.colorBuffersHDR =
-            mcdr_hdr_state_active() != 0 ? sl::Boolean::eTrue : sl::Boolean::eFalse;
-        opt.alphaUpscalingEnabled = sl::Boolean::eFalse;
+        const auto options = srStreamlineOptions(in, s.qualityValue, s.requestedPreset);
+        if (!options) return 0;
+        const auto& opt = *options;
+        const bool hdrInput = opt.colorBuffersHDR == sl::Boolean::eTrue;
         // P199：`slDLSSSetOptions` 是"配置变化时"的调用，不是每帧调用。26.3 起我们每帧都会走到
         // 这里，而 SL 的 DLSS 插件在 SetOptions 里会重建内部资源（实测每帧调用时进程私有提交
         // 内存约 750 MB/min 线性上涨，关闭 DLSS 则完全平坦）。只在参数真的变了才下发。
@@ -2755,7 +2859,8 @@ sl::FrameToken* gLastFrameToken = nullptr;
                                    s.slEvalOptPreExposure != opt.preExposure ||
                                    s.slEvalOptExposureScale != opt.exposureScale ||
                                    s.slEvalOptQuality != s.qualityValue ||
-                                   s.slEvalOptHdr != (mcdr_hdr_state_active() != 0);
+                                   s.slEvalOptPreset != s.requestedPreset ||
+                                   s.slEvalOptHdr != hdrInput;
         sl::Result optResult = sl::Result::eOk;
         if (slOptsChanged) {
             optResult = api.setOptions(viewport, opt);
@@ -2767,14 +2872,20 @@ sl::FrameToken* gLastFrameToken = nullptr;
                 s.slEvalOptPreExposure = opt.preExposure;
                 s.slEvalOptExposureScale = opt.exposureScale;
                 s.slEvalOptQuality = s.qualityValue;
-                s.slEvalOptHdr = mcdr_hdr_state_active() != 0;
+                s.slEvalOptPreset = s.requestedPreset;
+                s.slEvalOptHdr = hdrInput;
             }
         }
 
-        // 4) evaluate（文档 :235：inputs 只需要 viewport；资源已经在 tag 里给过）
-        const sl::BaseStructure* evalInputs[1] = {&viewport};
-        sl::Result evalResult = sl::Result::eOk;
-        evalResult = api.evaluate(sl::kFeatureDLSS, *token, evalInputs, 1, cmd);
+        std::array<const sl::BaseStructure*, 6> evalInputs{};
+        uint32_t evalInputCount = 0;
+        evalInputs[evalInputCount++] = &viewport;
+        for (uint32_t index = 0; index < tagCount; ++index)
+            evalInputs[evalInputCount++] = &tags[index];
+        const sl::Result evalResult = optResult == sl::Result::eOk
+            ? api.evaluate(sl::kFeatureDLSS, *token, evalInputs.data(),
+                           evalInputCount, cmd)
+            : optResult;
         ++s.submitCount;
 
 
@@ -2788,173 +2899,15 @@ sl::FrameToken* gLastFrameToken = nullptr;
         // 5) 宿主负责恢复（:242-253 + eDisableCLStateTracking）：只恢复输出到 RT。
         // 输入侧我们不再改状态，所以也没有要恢复的 barrier。
         transition(out, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        // P305ag：SR 已跑完、输出已在 RENDER_TARGET —— 此刻把本帧输入交给 FG provider。
-        tagFrameGenInputsFromDlss(cmd, in);
-
-        // 5.5) P213：帧生成（DLSS-G）。
-        // - HUD-less 必须“UI 之前、与 backbuffer 同尺寸”的画面（ProgrammingGuideDLSS_G.md §5.0）。
-        //   我们这里只有 SR 的输出（`outResource`）满足：它是窗口尺寸、且此后只有 GUI 合成会
-        //   写到 `out`，不会再碰 `outResource`。`outResource == out` 时不满足（那张会叠上 UI），
-        //   所以那种情形直接不开 FG。
-        // - §5.2：tag 的资源在 Present 时才被消费，用 eValidUntilPresent。
-        // - §6.0：slDLSSGSetOptions 要在呈现线程调用、下一次 Present 生效 —— 本函数就在渲染线程，
-        //   紧随其后的 present 就是它要影响的那一次。
-        const int32_t fgMode = fgModeEarly;
-        // P213e（用户 m01219）：`appliedFgMode` 原来是 `if (wantFg)` 块内的静态量，关掉 FG 的
-        // 分支看不见它，于是那里只能用一次性闩 `fgOffSent` —— 开过再关就再也不发 eOff，
-        // Streamline 继续插帧而我们以为已经关了。挪到这里，两个分支共用。
-        static int32_t appliedFgMode = -1;
-        static int32_t appliedFgFrames = -1;
-        if (wantFg) {
-            // 上一步的拷贝把 outResource 留在了 COPY_SOURCE；tag 里声明的是 UNORDERED_ACCESS，
-            // 所以这里要把它切回去（Present 时状态必须与 tag 一致）。
-            transition(outResource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-            // 选项只在“期望状态变了”时下发：每帧调会拖慢 Present 线程（文档 §6.0 也不建议）。
-            // P213f：交换链重建（ResizeBuffers）之后 SL 侧必须重新拿到 options，否则 FG 会停在
-            // 旧尺寸上不再插帧。用“输出尺寸”当代理：尺寸变了就重发一次。
-            static uint32_t appliedFgW = 0;
-            static uint32_t appliedFgH = 0;
-            // P225（Phase D）：动态多帧。
-            // 模式 DYNAMIC 时不再把决定权交给 SL（eDynamic 的 dynamicTargetFrameRate 只跟显示器
-            // 刷新率，完全无视我们的 Reflex 帧限），而是自己按“上帧时长 : 帧限”的比值算要插几帧，
-            // 再用 eOn + 显式 numFramesToGenerate 下发 —— 这样“Reflex 限帧”就是目标呈现率。
-            const int32_t maxFrames = std::clamp<int32_t>(gDlssgFrames.load(), 1, 5);
-            static uint64_t lastFgQpc = 0;
-            static int32_t dynFrames = 1;
-            static int32_t dynTick = 0;
-            int32_t wantFrames = maxFrames;
-            if (fgMode == 2) {
-                LARGE_INTEGER qpc{};
-                LARGE_INTEGER freq{};
-                QueryPerformanceFrequency(&freq);
-                QueryPerformanceCounter(&qpc);
-                const uint64_t nowUs = static_cast<uint64_t>(qpc.QuadPart) * 1000000ull /
-                                       static_cast<uint64_t>(freq.QuadPart);
-                if (lastFgQpc != 0 && nowUs > lastFgQpc) {
-                    const uint32_t renderUs = static_cast<uint32_t>(nowUs - lastFgQpc);
-                    const uint32_t targetUs = gReflex.frameLimitUs;  // 0 = 不限帧
-                    if (targetUs > 0 && renderUs > 0) {
-                        int32_t need = static_cast<int32_t>(targetUs / renderUs) - 1;
-                        need = std::clamp(need, 1, maxFrames);
-                        // 一次只走一帧，避免抖动；上限由“生成帧数”配置决定。
-                        if (need > dynFrames) {
-                            dynFrames += 1;
-                        } else if (need < dynFrames) {
-                            dynFrames -= 1;
-                        }
-                        dynFrames = std::clamp(dynFrames, 1, maxFrames);
-                    } else {
-                        dynFrames = 1;
-                    }
-                }
-                lastFgQpc = nowUs;
-                wantFrames = dynFrames;
-                if (++dynTick % 120 == 0) {
-                    logWarn("fg dynamic: frames=%d max=%d target=%uus",
-                            wantFrames, maxFrames, gReflex.frameLimitUs);
-                }
-            }
-            // P226（用户 m10065）：DYNAMIC 且没有 Reflex 限帧时，交回 SL 的 eDynamic —— 它知道
-            // 显示器刷新率，会自己往刷新率上追；有 Reflex 限帧时才用 P225 的显式帧数（让限帧成为目标）。
-            const bool fgDynamic = (fgMode == 2) && (gReflex.frameLimitUs == 0);
-            // P296b：dynamic 下用 -1 当"帧数不由我们决定"的哨兵。原来条件里比的是哨兵、写的却是
-            // wantFrames，于是**每帧都判不等**→ 每帧一次 `slDLSSGSetOptions`。P199 已经量过同类调用
-            // 每帧一次的代价（进程私有提交内存 750 MB/min 线性上涨），所以这里存哨兵、比哨兵。
-            const int32_t appliedFramesWanted = fgDynamic ? -1 : wantFrames;
-            if (appliedFgMode != fgMode || appliedFgFrames != appliedFramesWanted ||
-                appliedFgW != in.targetWidth || appliedFgH != in.targetHeight) {
-                sl::DLSSGOptions fg{};
-                fg.mode = fgDynamic ? sl::DLSSGMode::eDynamic : sl::DLSSGMode::eOn;
-                fg.numFramesToGenerate = fgDynamic ? 1u : static_cast<uint32_t>(wantFrames);
-
-                const sl::Result fgOptResult = api.setFgOptions(viewport, fg);
-                if (fgOptResult == sl::Result::eOk) {
-                    appliedFgMode = fgMode;
-                    appliedFgFrames = appliedFramesWanted;
-                    appliedFgW = in.targetWidth;
-                    appliedFgH = in.targetHeight;
-                    // P296：只在本函数真的下发过选项时打一行（上面的 if 已经按"值变了才下发"过滤），
-                    // 验收时用它证明"开关确实到过 SL"，不需要去 sl.log 里猜 —— 那份日志只记
-                    // "slDLSSGSetOptions() is called on the thread N"，不记 mode/numFrames。
-                    logInfo("fg options -> %s frames=%u (%ux%u)",
-                            fgDynamic ? "dynamic" : "on",
-                            static_cast<unsigned>(fg.numFramesToGenerate),
-                            static_cast<unsigned>(in.targetWidth),
-                            static_cast<unsigned>(in.targetHeight));
-                } else {
-                    static bool warnedFgOpt = false;
-                    if (!warnedFgOpt) {
-                        warnedFgOpt = true;
-                        logWarn("slDLSSGSetOptions failed=0x%X (mode=%d frames=%d)",
-                                static_cast<unsigned>(fgOptResult), fgMode, wantFrames);
-                    }
-                }
-            }
-            // P213c：每帧问一次（只在 FG 开着时）presented 数，F3 的 output 要用它累积。
-            if (api.getFgState != nullptr) {
-                sl::DLSSGState stFrame{};
-                const sl::Result stRes = api.getFgState(viewport, stFrame, nullptr);
-                if (stRes == sl::Result::eOk) {
-                    gFgPresented.store(static_cast<int32_t>(stFrame.numFramesActuallyPresented));
-                    // P248：RTSS OSD 与"帧生成是否真的走 SL"互为前提 —— 秒级打一次状态，
-                    // 用 numFramesActuallyPresented > 1 证明插帧真的发生（而不是我们只是下发过选项）。
-                    static uint64_t fgLogTick = 0;
-                    if (++fgLogTick % 600 == 0) {
-                        logInfo("fg state: status=%d presented=%u maxGen=%u tick=%llu",
-                                static_cast<int>(stFrame.status),
-                                static_cast<unsigned>(stFrame.numFramesActuallyPresented),
-                                static_cast<unsigned>(stFrame.numFramesToGenerateMax),
-                                static_cast<unsigned long long>(fgLogTick));
-                    }
-                } else {
-                    static bool warnedFgState = false;
-                    if (!warnedFgState) {
-                        warnedFgState = true;
-                        logWarn("slDLSSGGetState failed=0x%X", static_cast<unsigned>(stRes));
-                    }
-                }
-            }
-
-        } else if (fgMode == 0 && api.setFgOptions != nullptr) {
-            // P213e（用户 m01219）：关掉 FG 必须真的下发一次 eOff。原来靠一次性闩 `fgOffSent`，
-            // 一旦本进程里开过 FG 再关，就再也不发 → SL 仍在插帧、JVM 这边却以为已经关了。
-            if (appliedFgMode != 0) {
-                sl::DLSSGOptions fg{};
-                fg.mode = sl::DLSSGMode::eOff;
-                const sl::Result offResult = api.setFgOptions(viewport, fg);
-                if (offResult == sl::Result::eOk) {
-                    appliedFgMode = 0;
-                    appliedFgFrames = 0;
-                    // P296（验收 A6）：关掉时到底有没有真的下发 eOff，只能由我们自己证明 ——
-                    // sl.log 不记 mode/numFrames。这行打在"刚关掉"的那一帧，之后 fgMode 一直是 0
-                    // 且 appliedFgMode 也是 0，不会再进这个分支。
-                    logInfo("fg options -> off (applied)");
-                } else {
-                    // 失败时 appliedFgMode 保持非 0，下一帧还会再试；这里只警告一次，
-                    // 免得"SL 不认 eOff"变成每秒几十行的垃圾日志。
-                    static bool warnedFgOff = false;
-                    if (!warnedFgOff) {
-                        warnedFgOff = true;
-                        logWarn("slDLSSGSetOptions(eOff) failed=0x%X",
-                                static_cast<unsigned>(offResult));
-                    }
-                }
-            }
-            // P213c（用户 m01219）：关着时“上一次真正提交的帧数”必须是 1。原来这里不复位，
-            // gFgPresented 会停在上次开 FG 时的 2/3…，JVM 的 F3 把它当成每帧都交了 2 帧，
-            // 于是出现“RTSS 实测 120、F3 却显示 120/240 (FG 2.0x)”。
-            gFgPresented.store(1);
-        }
 
         // P291e：记下这一帧结束时"那张被 DLSS 写过的输出纹理"停在哪个状态，
         // 供 JVM 做状态正确的读回（0 = 本帧没有 handover 纹理，别采样）。
         gDlssOutputState.store(
             (copyBack && outResource != out && evalResult == sl::Result::eOk)
-                ? static_cast<int32_t>(wantFg ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-                                             : D3D12_RESOURCE_STATE_COPY_SOURCE)
+                ? static_cast<int32_t>(D3D12_RESOURCE_STATE_COPY_SOURCE)
                 : 0);
 
+        if (gStreamlineInputInvalidationFailed.load()) return -1;
         if (evalResult != sl::Result::eOk) {
             logWarn("streamline evaluate tags=0x%X options=0x%X evaluate=0x%X "
                     "(mode=%d, out=%ux%u)",
@@ -2963,14 +2916,559 @@ sl::FrameToken* gLastFrameToken = nullptr;
                     opt.outputWidth, opt.outputHeight);
             return 0;
         }
+        s.resetPending = false;
         return 1;
     }
 #endif
+
+int32_t mcdr_dlss_prepare_sr(void* commandList, const mcdr_dlss_input* seed,
+    const mcdr_raster_camera* camera, int32_t tier, int32_t preset,
+    const int32_t resourceStates[5], void** retainedCandidateToken) {
+    if (retainedCandidateToken == nullptr) return MCDR_SR_PREPARE_INVALID_ARGUMENT;
+    *retainedCandidateToken = nullptr;
+    if (commandList == nullptr || seed == nullptr || tier < 0 || tier > 4 ||
+        preset < 0 || preset > NVSDK_NGX_DLSS_Hint_Render_Preset_O ||
+        seed->renderWidth <= 0 || seed->renderHeight <= 0 || seed->targetWidth <= 0 ||
+        seed->targetHeight <= 0 || (tier == 4 && (seed->renderWidth != seed->targetWidth ||
+        seed->renderHeight != seed->targetHeight)) ||
+        !std::isfinite(seed->preExposure) || seed->preExposure < 0.0f ||
+        (seed->preExposure > 0.0f && !std::isfinite(1.0f / seed->preExposure)) ||
+        !std::isfinite(seed->exposureScale) || seed->exposureScale < 0.0f)
+        return MCDR_SR_PREPARE_INVALID_ARGUMENT;
+    static constexpr uint32_t qualities[] = {
+        NVSDK_NGX_PerfQuality_Value_UltraPerformance, NVSDK_NGX_PerfQuality_Value_MaxPerf,
+        NVSDK_NGX_PerfQuality_Value_Balanced, NVSDK_NGX_PerfQuality_Value_MaxQuality,
+        NVSDK_NGX_PerfQuality_Value_DLAA};
+    auto candidate = std::make_unique<SrCandidate>();
+    candidate->input = *seed;
+    candidate->quality = qualities[tier];
+    candidate->tier = tier;
+    candidate->preset = preset;
+    candidate->flags = computeFeatureFlags(*seed);
+    candidate->streamline = dlssImplStreamline();
+    auto* prepared = candidate.get();
+    *retainedCandidateToken = candidate.release();
+    ++gSrCandidateCount;
+    if (prepared->streamline) {
+#if MCDR_DLSS_HAVE_STREAMLINE
+        auto& api = streamlineEvalApi();
+        using SlAllocateResources = sl::Result (*)(sl::CommandBuffer*, sl::Feature,
+            const sl::ViewportHandle&);
+        const auto allocate = gSlInterposer == nullptr ? nullptr : reinterpret_cast<SlAllocateResources>(
+            ::GetProcAddress(gSlInterposer, "slAllocateResources"));
+        if (!allocate || !api.setOptions || !api.setConstants || !api.setTags || !api.newFrameToken)
+            return MCDR_SR_PREPARE_REJECTED;
+        if (camera == nullptr) return MCDR_SR_PREPARE_NOT_READY;
+        if (resourceStates == nullptr) return MCDR_SR_PREPARE_INVALID_ARGUMENT;
+        if ((camera->flags & 1u) == 0 || (camera->flags & 2u) != 0 ||
+            !std::isfinite(camera->nearPlane) || !std::isfinite(camera->farPlane) ||
+            !std::isfinite(camera->verticalFovRadians) || camera->nearPlane <= 0.0f ||
+            camera->farPlane <= camera->nearPlane || camera->verticalFovRadians <= 0.0f ||
+            camera->verticalFovRadians >= 3.141592654f)
+            return MCDR_SR_PREPARE_INVALID_ARGUMENT;
+        for (uint32_t index = 0; index < 16; ++index) {
+            if (!std::isfinite(camera->projection[index]) || !std::isfinite(camera->viewRotation[index]))
+                return MCDR_SR_PREPARE_INVALID_ARGUMENT;
+        }
+        for (double coordinate : camera->origin) {
+            if (!std::isfinite(coordinate) || !std::isfinite(static_cast<float>(coordinate)))
+                return MCDR_SR_PREPARE_INVALID_ARGUMENT;
+        }
+        mcdr_dlss_constants candidateCamera{};
+        mat4Multiply(camera->viewRotation, camera->projection, candidateCamera.viewProjection);
+        std::memcpy(candidateCamera.prevViewProjection, candidateCamera.viewProjection,
+            sizeof(candidateCamera.prevViewProjection));
+        std::memcpy(candidateCamera.projection, camera->projection, sizeof(candidateCamera.projection));
+        candidateCamera.jitterOffsetX = seed->jitterOffsetX;
+        candidateCamera.jitterOffsetY = seed->jitterOffsetY;
+        candidateCamera.mvecScaleX = seed->mvScaleX / seed->renderWidth;
+        candidateCamera.mvecScaleY = seed->mvScaleY / seed->renderHeight;
+        candidateCamera.cameraPosX = static_cast<float>(camera->origin[0]);
+        candidateCamera.cameraPosY = static_cast<float>(camera->origin[1]);
+        candidateCamera.cameraPosZ = static_cast<float>(camera->origin[2]);
+        candidateCamera.cameraRightX = camera->viewRotation[0];
+        candidateCamera.cameraRightY = camera->viewRotation[4];
+        candidateCamera.cameraRightZ = camera->viewRotation[8];
+        candidateCamera.cameraUpX = camera->viewRotation[1];
+        candidateCamera.cameraUpY = camera->viewRotation[5];
+        candidateCamera.cameraUpZ = camera->viewRotation[9];
+        candidateCamera.cameraFwdX = camera->viewRotation[2];
+        candidateCamera.cameraFwdY = camera->viewRotation[6];
+        candidateCamera.cameraFwdZ = camera->viewRotation[10];
+        candidateCamera.cameraNear = camera->nearPlane;
+        candidateCamera.cameraFar = camera->farPlane;
+        candidateCamera.cameraFovRadians = camera->verticalFovRadians;
+        candidateCamera.cameraAspectRatio = static_cast<float>(seed->renderWidth) / seed->renderHeight;
+        candidateCamera.depthInverted = (camera->flags & 256u) != 0 ? 1u : 0u;
+        candidateCamera.cameraMotionIncluded = 1;
+        candidateCamera.reset = 1;
+        candidateCamera.renderingGameFrames = 1;
+        const auto options = srStreamlineOptions(*seed, prepared->quality, preset);
+        sl::Constants constants{};
+        if (!options || !makeStreamlineCamera(candidateCamera, 0, constants))
+            return MCDR_SR_PREPARE_INVALID_ARGUMENT;
+        using SlGetFeatureFunction = sl::Result (*)(sl::Feature, const char*, void*&);
+        using SlGetOptimalSettings = sl::Result (*)(const sl::DLSSOptions&, sl::DLSSOptimalSettings&);
+        const auto getFeatureFunction = reinterpret_cast<SlGetFeatureFunction>(
+            ::GetProcAddress(gSlInterposer, "slGetFeatureFunction"));
+        void* queryFunction = nullptr;
+        if (!getFeatureFunction || getFeatureFunction(sl::kFeatureDLSS,
+            "slDLSSGetOptimalSettings", queryFunction) != sl::Result::eOk || !queryFunction)
+            return MCDR_SR_PREPARE_REJECTED;
+        sl::DLSSOptimalSettings settings{};
+        if (reinterpret_cast<SlGetOptimalSettings>(queryFunction)(*options, settings) != sl::Result::eOk ||
+            settings.optimalRenderWidth == 0 || settings.optimalRenderHeight == 0 ||
+            static_cast<uint32_t>(seed->renderWidth) < settings.renderWidthMin ||
+            static_cast<uint32_t>(seed->renderHeight) < settings.renderHeightMin ||
+            (settings.renderWidthMax != 0 && static_cast<uint32_t>(seed->renderWidth) > settings.renderWidthMax) ||
+            (settings.renderHeightMax != 0 && static_cast<uint32_t>(seed->renderHeight) > settings.renderHeightMax))
+            return MCDR_SR_PREPARE_REJECTED;
+        ID3D12Resource* resources[] = {
+            reinterpret_cast<ID3D12Resource*>(seed->pInColor),
+            reinterpret_cast<ID3D12Resource*>(seed->pInDepth),
+            reinterpret_cast<ID3D12Resource*>(seed->pInMotionVectors),
+            reinterpret_cast<ID3D12Resource*>(seed->pInOutput),
+            reinterpret_cast<ID3D12Resource*>(seed->pInExposure)};
+        for (uint32_t index = 0; index < 4; ++index) {
+            if (!resources[index]) return MCDR_SR_PREPARE_INVALID_ARGUMENT;
+            const auto description = resources[index]->GetDesc();
+            const auto width = index == 3 ? seed->targetWidth : seed->renderWidth;
+            const auto height = index == 3 ? seed->targetHeight : seed->renderHeight;
+            if (description.Width < static_cast<UINT64>(width) ||
+                description.Height < static_cast<UINT>(height)) return MCDR_SR_PREPARE_INVALID_ARGUMENT;
+        }
+        if ((resources[3]->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0)
+            return MCDR_SR_PREPARE_INVALID_ARGUMENT;
+        for (int32_t slot = 0; slot < 3; ++slot) {
+            if (!gSrViewportSlots[slot]) {
+                prepared->viewportSlot = slot;
+                prepared->viewport = static_cast<uint32_t>(slot + 2);
+                gSrViewportSlots[slot] = true;
+                prepared->viewportTouched = true;
+                break;
+            }
+        }
+        if (prepared->viewportSlot < 0) return MCDR_SR_PREPARE_NOT_READY;
+        auto& allocationConstants = gSrAllocationConstants[prepared->viewportSlot];
+        if (allocationConstants &&
+            (allocationConstants->depthInverted != constants.depthInverted ||
+             allocationConstants->motionVectorsJittered != constants.motionVectorsJittered))
+            return MCDR_SR_PREPARE_REJECTED;
+        if (allocationConstants) constants = *allocationConstants;
+        constants.reset = sl::Boolean::eTrue;
+        const sl::ViewportHandle viewport(prepared->viewport);
+        const auto& option = *options;
+        if (api.setOptions(viewport, option) != sl::Result::eOk) return MCDR_SR_PREPARE_REJECTED;
+        prepared->mode = static_cast<int32_t>(option.mode);
+        prepared->preExposure = option.preExposure;
+        prepared->exposureScale = option.exposureScale;
+        prepared->hdr = option.colorBuffersHDR == sl::Boolean::eTrue;
+        const uint32_t allocationFrame = 0;
+        sl::FrameToken* allocationToken = nullptr;
+        if (api.newFrameToken(allocationToken, &allocationFrame) != sl::Result::eOk ||
+            allocationToken == nullptr) return MCDR_SR_PREPARE_REJECTED;
+        const auto constantsResult = api.setConstants(constants, *allocationToken, viewport);
+        if (constantsResult == sl::Result::eOk) allocationConstants = constants;
+        const sl::Extent renderExtent{0, 0, static_cast<uint32_t>(seed->renderWidth),
+            static_cast<uint32_t>(seed->renderHeight)};
+        const sl::Extent outputExtent{0, 0, static_cast<uint32_t>(seed->targetWidth),
+            static_cast<uint32_t>(seed->targetHeight)};
+        const sl::Extent exposureExtent{0, 0, 1, 1};
+        const sl::BufferType bufferTypes[] = {sl::kBufferTypeScalingInputColor,
+            sl::kBufferTypeDepth, sl::kBufferTypeMotionVectors,
+            sl::kBufferTypeScalingOutputColor, sl::kBufferTypeExposure};
+        sl::Resource taggedResources[5] = {
+            sl::Resource(sl::ResourceType::eTex2d, resources[0]),
+            sl::Resource(sl::ResourceType::eTex2d, resources[1]),
+            sl::Resource(sl::ResourceType::eTex2d, resources[2]),
+            sl::Resource(sl::ResourceType::eTex2d, resources[3]),
+            sl::Resource(sl::ResourceType::eTex2d, resources[4])};
+        sl::ResourceTag tags[5] = {
+            {nullptr, bufferTypes[0], sl::ResourceLifecycle::eValidUntilEvaluate},
+            {nullptr, bufferTypes[1], sl::ResourceLifecycle::eValidUntilEvaluate},
+            {nullptr, bufferTypes[2], sl::ResourceLifecycle::eValidUntilEvaluate},
+            {nullptr, bufferTypes[3], sl::ResourceLifecycle::eValidUntilEvaluate},
+            {nullptr, bufferTypes[4], sl::ResourceLifecycle::eValidUntilEvaluate}};
+        for (uint32_t index = 0; index < 5; ++index) {
+            taggedResources[index] = sl::Resource(sl::ResourceType::eTex2d,
+                resources[index], static_cast<D3D12_RESOURCE_STATES>(resourceStates[index]));
+            tags[index] = sl::ResourceTag(resources[index] ? &taggedResources[index] : nullptr,
+                bufferTypes[index], sl::ResourceLifecycle::eValidUntilEvaluate,
+                index == 4 ? &exposureExtent : (index == 3 ? &outputExtent : &renderExtent));
+        }
+        const uint32_t tagCount = resources[4] ? 5u : 4u;
+        sl::Result result = constantsResult;
+        if (result == sl::Result::eOk) {
+            prepared->tagsPresent = true;
+            result = api.setTags(*allocationToken, viewport, tags, tagCount,
+                static_cast<sl::CommandBuffer*>(commandList));
+        }
+        if (result == sl::Result::eOk)
+            result = allocate(static_cast<sl::CommandBuffer*>(commandList), sl::kFeatureDLSS, viewport);
+        for (auto& tag : tags) tag.resource = nullptr;
+        const auto clearResult = api.setTags(*allocationToken, viewport, tags, tagCount,
+            static_cast<sl::CommandBuffer*>(commandList));
+        if (clearResult == sl::Result::eOk) prepared->tagsPresent = false;
+        if (result != sl::Result::eOk || clearResult != sl::Result::eOk) {
+            logWarn("DLSS candidate allocation failed: allocate=0x%X clear=0x%X",
+                static_cast<unsigned>(result), static_cast<unsigned>(clearResult));
+            return MCDR_SR_PREPARE_REJECTED;
+        }
+        prepared->ready = true;
+        return MCDR_SR_PREPARE_READY;
+#else
+        return MCDR_SR_PREPARE_REJECTED;
+#endif
+    }
+    if (!s.initOk || !s.paramsOk || s.disabled) return MCDR_SR_PREPARE_REJECTED;
+    auto result = NVSDK_NGX_D3D12_GetCapabilityParameters(&prepared->params);
+    if (NVSDK_NGX_FAILED(result) || !prepared->params) return MCDR_SR_PREPARE_REJECTED;
+    unsigned int optimalWidth = 0, optimalHeight = 0;
+    unsigned int maximumWidth = 0, maximumHeight = 0, minimumWidth = 0, minimumHeight = 0;
+    float sharpness = 0.0f;
+    result = NGX_DLSS_GET_OPTIMAL_SETTINGS(prepared->params,
+        static_cast<uint32_t>(seed->targetWidth), static_cast<uint32_t>(seed->targetHeight),
+        static_cast<NVSDK_NGX_PerfQuality_Value>(prepared->quality), &optimalWidth,
+        &optimalHeight, &maximumWidth, &maximumHeight, &minimumWidth, &minimumHeight,
+        &sharpness);
+    if (NVSDK_NGX_FAILED(result) || optimalWidth == 0 || optimalHeight == 0 ||
+        static_cast<uint32_t>(seed->renderWidth) < minimumWidth ||
+        static_cast<uint32_t>(seed->renderHeight) < minimumHeight ||
+        (maximumWidth != 0 && static_cast<uint32_t>(seed->renderWidth) > maximumWidth) ||
+        (maximumHeight != 0 && static_cast<uint32_t>(seed->renderHeight) > maximumHeight))
+        return MCDR_SR_PREPARE_REJECTED;
+    if (const auto* key = presetHintKey(prepared->quality))
+        NVSDK_NGX_Parameter_SetI(prepared->params, key, preset);
+    NVSDK_NGX_DLSS_Create_Params parameters{};
+    parameters.Feature.InWidth = static_cast<uint32_t>(seed->renderWidth);
+    parameters.Feature.InHeight = static_cast<uint32_t>(seed->renderHeight);
+    parameters.Feature.InTargetWidth = static_cast<uint32_t>(seed->targetWidth);
+    parameters.Feature.InTargetHeight = static_cast<uint32_t>(seed->targetHeight);
+    parameters.Feature.InPerfQualityValue = static_cast<NVSDK_NGX_PerfQuality_Value>(prepared->quality);
+    parameters.InFeatureCreateFlags = prepared->flags;
+    parameters.InEnableOutputSubrects = false;
+    result = NGX_D3D12_CREATE_DLSS_EXT(static_cast<ID3D12GraphicsCommandList*>(commandList),
+        1u, 1u, &prepared->feature, prepared->params, &parameters);
+    if (NVSDK_NGX_FAILED(result) || !prepared->feature) {
+        logWarn("DLSS candidate CreateFeature failed: %s", ngxResultString(result).c_str());
+        return MCDR_SR_PREPARE_REJECTED;
+    }
+    prepared->ready = true;
+    return MCDR_SR_PREPARE_READY;
+}
+
+void mcdr_dlss_commit_sr(void* candidateToken, void** retiredToken) {
+    if (retiredToken == nullptr) return;
+    *retiredToken = nullptr;
+    auto* candidate = static_cast<SrCandidate*>(candidateToken);
+    if (candidate == nullptr || !candidate->ready) return;
+    std::swap(candidate->params, s.params);
+    std::swap(candidate->feature, s.feature);
+    const auto previousViewport = s.srViewport;
+    const auto previousSlot = s.srViewportSlot;
+    s.srViewport = candidate->viewport;
+    s.srViewportSlot = candidate->viewportSlot;
+    candidate->viewport = previousViewport;
+    candidate->viewportSlot = previousSlot;
+    candidate->viewportTouched = candidate->streamline && (s.srPrepared || s.slEvalOptsValid);
+    s.renderWidth = candidate->input.renderWidth;
+    s.renderHeight = candidate->input.renderHeight;
+    s.targetWidth = candidate->input.targetWidth;
+    s.targetHeight = candidate->input.targetHeight;
+    s.qualityValue = candidate->quality;
+    s.requestedQuality = candidate->tier;
+    s.effectiveQuality = candidate->tier;
+    s.requestedPreset = candidate->preset;
+    s.effectivePreset = candidate->preset;
+    s.featureFlags = candidate->flags;
+    s.qualityIsExplicit = true;
+    s.featureOk = true;
+    s.paramsOk = candidate->streamline ? s.paramsOk : s.params != nullptr;
+    s.createdWarned = false;
+    s.evalFailWarned = false;
+    s.evalOk = false;
+    s.resetPending = true;
+    s.createdThisFrame = true;
+    s.srPrepared = true;
+    s.preparedFailure.reset();
+    s.slOptsApplied = false;
+    s.slEvalOptsValid = candidate->streamline;
+    s.slEvalOptMode = candidate->mode;
+    s.slEvalOptOutW = static_cast<uint32_t>(s.targetWidth);
+    s.slEvalOptOutH = static_cast<uint32_t>(s.targetHeight);
+    s.slEvalOptPreExposure = candidate->preExposure;
+    s.slEvalOptExposureScale = candidate->exposureScale;
+    s.slEvalOptQuality = candidate->quality;
+    s.slEvalOptPreset = candidate->preset;
+    s.slEvalOptHdr = candidate->hdr;
+    candidate->ready = false;
+    *retiredToken = candidate;
+}
+
+int32_t mcdr_dlss_abort_sr(void* candidateToken) {
+    auto* candidate = static_cast<SrCandidate*>(candidateToken);
+    if (candidate == nullptr) return 1;
+#if MCDR_DLSS_HAVE_STREAMLINE
+    if (candidate->streamline && candidate->viewportTouched) {
+        using SlFreeResources = sl::Result (*)(sl::Feature, const sl::ViewportHandle&);
+        const auto freeResources = gSlInterposer == nullptr ? nullptr : reinterpret_cast<SlFreeResources>(
+            ::GetProcAddress(gSlInterposer, "slFreeResources"));
+        if (!freeResources) return 0;
+        const sl::ViewportHandle viewport(candidate->viewport);
+        if (candidate->tagsPresent) {
+            auto& api = streamlineEvalApi();
+            if (!api.newFrameToken || !api.setTags) return 0;
+            const uint32_t allocationFrame = 0;
+            sl::FrameToken* allocationToken = nullptr;
+            if (api.newFrameToken(allocationToken, &allocationFrame) != sl::Result::eOk ||
+                allocationToken == nullptr) return 0;
+            const sl::ResourceTag tags[] = {
+                {nullptr, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate},
+                {nullptr, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate},
+                {nullptr, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate},
+                {nullptr, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate},
+                {nullptr, sl::kBufferTypeExposure, sl::ResourceLifecycle::eValidUntilEvaluate}};
+            const auto clearResult = api.setTags(*allocationToken, viewport, tags,
+                static_cast<uint32_t>(std::size(tags)), nullptr);
+            if (clearResult != sl::Result::eOk) return 0;
+            candidate->tagsPresent = false;
+        }
+        const auto result = freeResources(sl::kFeatureDLSS, viewport);
+        if (result != sl::Result::eOk && result != sl::Result::eErrorInvalidParameter) return 0;
+        candidate->viewportTouched = false;
+    }
+#endif
+    if (candidate->feature) {
+        const auto result = NVSDK_NGX_D3D12_ReleaseFeature(candidate->feature);
+        if (NVSDK_NGX_FAILED(result)) return 0;
+        candidate->feature = nullptr;
+    }
+    if (candidate->params) {
+        const auto result = NVSDK_NGX_D3D12_DestroyParameters(candidate->params);
+        if (NVSDK_NGX_FAILED(result)) return 0;
+        candidate->params = nullptr;
+    }
+    if (candidate->viewportSlot >= 0) gSrViewportSlots[candidate->viewportSlot] = false;
+    delete candidate;
+    --gSrCandidateCount;
+    return 1;
+}
+
+int32_t mcdr_dlss_submit_display_frame(void* commandList, const mcdr_dlss_input* input,
+    const mcdr_dlss_constants* camera, int32_t colorState, int32_t depthState,
+    int32_t motionState, void* ui, int32_t uiState, uint64_t realFrameId, uint32_t guidesDilated,
+    float frameTimeDeltaMs,
+    DlssTransitionFn transitionFn, void* transitionContext) {
+#if MCDR_DLSS_HAVE_STREAMLINE
+    if (!dlssImplStreamline() || !commandList || !input || !camera || !ui || !transitionFn ||
+        !input->pInOutput || !input->pInDepth || !input->pInMotionVectors || realFrameId == 0 ||
+        input->renderWidth != input->targetWidth || input->renderHeight != input->targetHeight ||
+        input->renderWidth <= 0 || input->renderHeight <= 0 ||
+        !std::isfinite(frameTimeDeltaMs) || !(frameTimeDeltaMs > 0)) return -1;
+    const int32_t mode = gDlssgMode.load();
+    if (mode == 0) return mcdr_dlss_invalidate_inputs() == 1 ? 0 : -1;
+    auto& api = streamlineEvalApi();
+    refreshFgApi(api);
+    if (!api.setFgOptions || !api.setConstants || !api.setTags || !api.getFgState ||
+        !gLastFrameToken || gDisplayConstantsFrame == gStreamlineFrameSerial ||
+        gStreamlineInputInvalidationFailed.load()) return -1;
+    const sl::ViewportHandle viewport(1);
+    sl::Constants constants{};
+    if (!makeStreamlineCamera(*camera, guidesDilated, constants)) return -1;
+    gDisplayConstantsFrame = gStreamlineFrameSerial;
+    if (api.setConstants(constants, *gLastFrameToken, viewport) != sl::Result::eOk) {
+        (void)mcdr_dlss_invalidate_inputs();
+        return -1;
+    }
+    const int32_t maximumFrames = std::clamp<int32_t>(gDlssgFrames.load(), 1, 5);
+    const bool dynamic = mode == 2 && gReflex.frameLimitUs == 0;
+    int32_t frames = maximumFrames;
+    if (mode == 2 && !dynamic) {
+        const float targetMs = static_cast<float>(gReflex.frameLimitUs) / 1000.0f;
+        frames = std::clamp<int32_t>(static_cast<int32_t>(targetMs / frameTimeDeltaMs) - 1,
+            1, maximumFrames);
+    }
+    const int32_t appliedFrames = dynamic ? -1 : frames;
+    auto& state = gStreamlineFgState;
+    if (state.mode != mode || state.frames != appliedFrames ||
+        state.width != static_cast<uint32_t>(input->targetWidth) ||
+        state.height != static_cast<uint32_t>(input->targetHeight)) {
+        sl::DLSSGOptions options{};
+        options.mode = dynamic ? sl::DLSSGMode::eDynamic : sl::DLSSGMode::eOn;
+        options.numFramesToGenerate = dynamic ? 1u : static_cast<uint32_t>(frames);
+        options.mvecDepthWidth = static_cast<uint32_t>(input->renderWidth);
+        options.mvecDepthHeight = static_cast<uint32_t>(input->renderHeight);
+        options.colorWidth = static_cast<uint32_t>(input->targetWidth);
+        options.colorHeight = static_cast<uint32_t>(input->targetHeight);
+        if (api.setFgOptions(viewport, options) != sl::Result::eOk) {
+            (void)mcdr_dlss_invalidate_inputs();
+            return -1;
+        }
+        state = {mode, appliedFrames, static_cast<uint32_t>(input->targetWidth),
+            static_cast<uint32_t>(input->targetHeight)};
+    }
+    const auto readonly = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    for (void* resource : {static_cast<void*>(input->pInOutput), static_cast<void*>(input->pInDepth),
+        static_cast<void*>(input->pInMotionVectors), ui})
+        transitionFn(transitionContext, resource, static_cast<int32_t>(readonly));
+    sl::Resource color(sl::ResourceType::eTex2d, input->pInOutput, readonly);
+    sl::Resource depth(sl::ResourceType::eTex2d, input->pInDepth, readonly);
+    sl::Resource motion(sl::ResourceType::eTex2d, input->pInMotionVectors, readonly);
+    sl::Resource uiResource(sl::ResourceType::eTex2d, ui, readonly);
+    const auto result = tagStreamlineFrameInputs(api, *gLastFrameToken, viewport,
+        static_cast<ID3D12GraphicsCommandList*>(commandList), *input, depth, motion, color, uiResource);
+    transitionFn(transitionContext, input->pInOutput, colorState);
+    transitionFn(transitionContext, input->pInDepth, depthState);
+    transitionFn(transitionContext, input->pInMotionVectors, motionState);
+    transitionFn(transitionContext, ui, uiState);
+    if (result != sl::Result::eOk) {
+        (void)mcdr_dlss_invalidate_inputs();
+        return -1;
+    }
+    gDisplayInputsAccepted = true;
+    return 1;
+#else
+    (void)commandList; (void)input; (void)camera; (void)colorState; (void)depthState;
+    (void)motionState; (void)ui; (void)uiState; (void)realFrameId; (void)guidesDilated;
+    (void)frameTimeDeltaMs; (void)transitionFn; (void)transitionContext;
+    return -1;
+#endif
+}
+
+int32_t mcdr_dlss_prepare_fg(int32_t mode, int32_t numFrames, uint32_t displayWidth,
+    uint32_t displayHeight, uint32_t guideWidth, uint32_t guideHeight,
+    uint32_t* maxGeneratedFrames) {
+#if MCDR_DLSS_HAVE_STREAMLINE
+    if (maxGeneratedFrames != nullptr) *maxGeneratedFrames = 0;
+    if (mode == 0) return MCDR_FG_PREPARE_READY;
+    if ((mode != 1 && mode != 2) || numFrames < 1 || numFrames > 5 || displayWidth == 0 ||
+        displayHeight == 0 || guideWidth == 0 || guideHeight == 0 ||
+        guideWidth != displayWidth || guideHeight != displayHeight)
+        return MCDR_FG_PREPARE_INVALID_ARGUMENT;
+    if (!dlssImplStreamline() || gSlDlssLoaded.load() != 1 || mcdr_reflex_available() != 1)
+        return MCDR_FG_PREPARE_REJECTED;
+    auto& api = streamlineEvalApi();
+    refreshFgApi(api);
+    if (!api.getFgState || !api.setFgOptions) return MCDR_FG_PREPARE_REJECTED;
+    sl::DLSSGOptions options{};
+    options.mode = mode == 2 ? sl::DLSSGMode::eDynamic : sl::DLSSGMode::eOn;
+    options.numFramesToGenerate = static_cast<uint32_t>(numFrames);
+    options.mvecDepthWidth = guideWidth;
+    options.mvecDepthHeight = guideHeight;
+    options.colorWidth = displayWidth;
+    options.colorHeight = displayHeight;
+    sl::DLSSGState state{};
+    const sl::Result result = api.getFgState(sl::ViewportHandle(1), state, &options);
+    if (result != sl::Result::eOk || state.status != sl::DLSSGStatus::eOk ||
+        state.minWidthOrHeight > std::min(displayWidth, displayHeight) ||
+        state.numFramesToGenerateMax < static_cast<uint32_t>(numFrames) ||
+        (mode == 2 && state.bIsDynamicMFGSupported != sl::Boolean::eTrue))
+        return MCDR_FG_PREPARE_REJECTED;
+    if (state.lastPresentInputsProcessingCompletionFenceValue != 0) {
+        auto* fence = static_cast<ID3D12Fence*>(state.inputsProcessingCompletionFence);
+        if (fence == nullptr) return MCDR_FG_PREPARE_REJECTED;
+        const auto completed = fence->GetCompletedValue();
+        if (completed == UINT64_MAX) return MCDR_FG_PREPARE_REJECTED;
+        if (completed < state.lastPresentInputsProcessingCompletionFenceValue)
+            return MCDR_FG_PREPARE_NOT_READY;
+    }
+    if (maxGeneratedFrames != nullptr) *maxGeneratedFrames = state.numFramesToGenerateMax;
+    return MCDR_FG_PREPARE_READY;
+#else
+    (void)mode; (void)numFrames; (void)displayWidth; (void)displayHeight;
+    (void)guideWidth; (void)guideHeight;
+    if (maxGeneratedFrames != nullptr) *maxGeneratedFrames = 0;
+    return MCDR_FG_PREPARE_REJECTED;
+#endif
+}
+
+int32_t mcdr_dlss_fg_after_present(void) {
+#if MCDR_DLSS_HAVE_STREAMLINE
+    if (!gDisplayInputsAccepted) return 0;
+    gDisplayInputsAccepted = false;
+    auto& api = streamlineEvalApi();
+    sl::DLSSGState state{};
+    if (!api.getFgState || api.getFgState(sl::ViewportHandle(1), state, nullptr) != sl::Result::eOk ||
+        state.status != sl::DLSSGStatus::eOk) return 0;
+    gFgPresented.store(static_cast<int32_t>(state.numFramesActuallyPresented));
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+void mcdr_dlss_clear_camera_constants(void) {
+#if MCDR_DLSS_HAVE_STREAMLINE
+    gCameraConstantsValid = false;
+#endif
+}
+
+#if !MCDR_DLSS_HAVE_STREAMLINE
+int32_t mcdr_dlss_set_constants(const mcdr_dlss_constants* constants) {
+    return constants != nullptr ? 1 : 0;
+}
+#endif
+
+int32_t mcdr_dlss_install_recording_pin(void* pinFn) {
+    gPinTexture = reinterpret_cast<PinTextureFn>(pinFn);
+    return 1;
+}
+
+int32_t mcdr_dlss_install_streamline_shutdown(void* shutdownFn) {
+    gShutdownStreamline = reinterpret_cast<ShutdownStreamlineFn>(shutdownFn);
+    return 1;
+}
+
+int32_t mcdr_dlss_inputs_ready_for_present(void) {
+    return gStreamlineInputInvalidationFailed.load() ? 0 : 1;
+}
+
+int32_t mcdr_dlss_invalidate_inputs(void) {
+#if MCDR_DLSS_HAVE_STREAMLINE
+    if (!dlssImplStreamline() || gSlDlssLoaded.load() != 1) return 1;
+    auto& api = streamlineEvalApi();
+    const sl::ViewportHandle viewport(1);
+    bool ok = true;
+    // Invalidate only the current CPU frame. Older copies may still be used on SDK queues.
+    if (gLastFrameToken != nullptr) {
+        ok = api.setTags != nullptr &&
+             clearStreamlineFrameTags(api, *gLastFrameToken, viewport) == sl::Result::eOk;
+        if (s.srViewport != 1) {
+            const sl::ViewportHandle srViewport(s.srViewport);
+            ok = api.setTags != nullptr &&
+                clearStreamlineFrameTags(api, *gLastFrameToken, srViewport) == sl::Result::eOk && ok;
+        }
+    }
+    if (api.setFgOptions != nullptr && gStreamlineFgState.mode != 0) {
+        sl::DLSSGOptions off{};
+        off.mode = sl::DLSSGMode::eOff;
+        ok = (api.setFgOptions(viewport, off) == sl::Result::eOk) && ok;
+    } else if (gStreamlineFgState.mode > 0) {
+        ok = false;
+    }
+    if (ok) gStreamlineFgState = {0, 0, 0, 0};
+    const bool failedBefore = gStreamlineInputInvalidationFailed.exchange(!ok);
+    gFgPresented.store(1);
+    gDisplayInputsAccepted = false;
+    gDlssOutputState.store(0);
+    if (!ok && !failedBefore) logWarn("Streamline input invalidation failed; presentation must be stopped");
+    return ok ? 1 : 0;
+#else
+    return 1;
+#endif
+}
 
 int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTransitionFn tl,
                            void* tlCtx) {
     if (in == nullptr) {
         return -1;
+    }
+    if (!std::isfinite(in->preExposure) || in->preExposure < 0.0f ||
+        (in->preExposure > 0.0f && !std::isfinite(1.0f / in->preExposure)) ||
+        !std::isfinite(in->exposureScale) || in->exposureScale < 0.0f) return -1;
+    if (s.srPrepared) {
+        s.preparedFailure = preparedSrMismatch(*in);
+        if (s.preparedFailure) return 0;
     }
 #if MCDR_DLSS_HAVE_STREAMLINE
     // P127（p93 实测：native 已自报 impl=streamline，但 streamlineEvaluate 一次都没被调用）：
@@ -2998,6 +3496,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     s.transitionFn = tl;
     s.transitionCtx = tlCtx;
     auto* color = reinterpret_cast<ID3D12Resource*>(in->pInColor);
+    auto* exposure = reinterpret_cast<ID3D12Resource*>(in->pInExposure);
     auto* depth = reinterpret_cast<ID3D12Resource*>(in->pInDepth);
     auto* mv = reinterpret_cast<ID3D12Resource*>(in->pInMotionVectors);
     auto* out = reinterpret_cast<ID3D12Resource*>(in->pInOutput);
@@ -3062,28 +3561,9 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
         s.mvCopyResourceState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     }
 
-    // P108: prefer the depth snapshot taken before vanilla cleared the depth buffer. This is
-    // what keeps the upscale depth-aware instead of colour-only; without it the depth term is
-    // a constant "far" plane. Falls back to the JVM-supplied depth when no snapshot exists.
-    ID3D12Resource* depthForDlss = depth;
-    if (s.depthSnapshot != nullptr) {
-        depthForDlss = s.depthSnapshot;
-    }
-
-    // All four inputs go to PIXEL_SHADER_RESOURCE (NGX samples them) and the output to
-    // RENDER_TARGET (NGX writes it). Done before every Evaluate so the states hold no
-    // matter which pass the JVM hands them over from. `depth` is only transitioned when it is
-    // the resource actually handed to NGX (the snapshot already sits in PIXEL_SHADER_RESOURCE).
-    // P108x ROOT-CAUSE FIX: NGX evaluates DLSS with a COMPUTE dispatch (its output is a UAV), and a
-    // texture sitting in PIXEL_SHADER_RESOURCE is not readable from a compute shader. That is an
-    // INVALID CALL — and indeed `logDeviceStatus("dlss-evaluate")` reports
-    // `GetDeviceRemovedReason=HRESULT 0x887A0001` (DXGI_ERROR_INVALID_CALL) one millisecond after a
-    // "successful" evaluate. All three inputs therefore go to NON_PIXEL_SHADER_RESOURCE (the state
-    // compute dispatches read from).
     transition(color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    if (depthForDlss == depth) {
-        transition(depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    }
+    if (exposure) transition(exposure, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transition(depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     transition(mvForDlss, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     // P108: NGX's output must be a UAV resource. The JVM's target is created with
     // ALLOW_RENDER_TARGET only, which NGX rejects with `FAIL_RWFlagMissing` (0xBAD00009), so DLSS
@@ -3101,8 +3581,11 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     // `mcdr_dx12SetDlssOutput`), use it and never build a private one. The private texture stays
     // only as a fallback for older JVM builds / older DLL pairings.
     ID3D12Resource* ngxTarget = out;
-    bool viaHandover = false;
-    if (s.externalOutput != nullptr) {
+    const bool directOutput = (out->GetDesc().Flags &
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
+    bool viaHandover = directOutput;
+    if (directOutput) transition(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (!directOutput && s.externalOutput != nullptr) {
         const D3D12_RESOURCE_DESC ed = s.externalOutput->GetDesc();
         const bool fits = (ed.Width == static_cast<UINT64>(in->targetWidth)) &&
                           (ed.Height == static_cast<UINT>(in->targetHeight)) &&
@@ -3123,7 +3606,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
                      static_cast<int>(out->GetDesc().Format));
         }
     }
-    if (ngxTarget == out) {
+    if (!directOutput && ngxTarget == out) {
         ID3D12Resource* priv = createDlssOutput(static_cast<UINT>(in->targetWidth),
                                                 static_cast<UINT>(in->targetHeight),
                                                 out->GetDesc().Format);
@@ -3140,7 +3623,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     // UNORDERED_ACCESS is what removes the device (user m04140: turning the hand-over off
     // crashed the game). If neither the hand-over texture nor a private one is usable, skip
     // the frame instead of removing the device.
-    if (ngxTarget == out) {
+    if (!directOutput && ngxTarget == out) {
         logError("no usable DLSS output texture this frame (the hand-over texture was "
                  "rejected and the private one could not be created); skipping the evaluate "
                  "instead of transitioning a non-UAV target to UNORDERED_ACCESS");
@@ -3153,8 +3636,9 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     // "sharpening is deprecated in DLSS"; the value we used to pass (0.35 here) is a leftover from
     // the optimal-settings query and is not what a working integration asks for.
     ep.Feature.InSharpness = 0.0f;
-    ep.pInDepth = depthForDlss;
+    ep.pInDepth = depth;
     ep.pInMotionVectors = mvForDlss;
+    ep.pInExposureTexture = exposure;
     ep.InJitterOffsetX = in->jitterOffsetX;
     ep.InJitterOffsetY = in->jitterOffsetY;
     ep.InRenderSubrectDimensions.Width = static_cast<unsigned>(in->renderWidth);
@@ -3166,8 +3650,6 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     ep.InExposureScale = (in->exposureMode == MCDR_DLSS_EXPOSURE_NONE && in->exposureScale != 0.0f)
                              ? in->exposureScale
                              : 1.0f;
-    // No transparency mask, no auto-exposure texture, no subrects: the data plane produces
-    // none of them yet (see the ABI header's list of what MCDR does not have).
 
     const NVSDK_NGX_Result er = NGX_D3D12_EVALUATE_DLSS_EXT(cmd, s.feature, s.params, &ep);
     if (NVSDK_NGX_FAILED(er)) {
@@ -3197,8 +3679,6 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     } else {
         transition(out, D3D12_RESOURCE_STATE_RENDER_TARGET);
     }
-    // P305ag：NGX 路径同样在 SR 成功后把本帧输入交给 FG provider（深度/MV 已在上面转成只读）。
-    tagFrameGenInputsFromDlss(cmd, *in);
     s.resetPending = false;
 
     ++s.submitCount;
@@ -3285,6 +3765,7 @@ int32_t mcdr_dlss_set_output_texture(void* resource) {
     if (res == s.externalOutput) {
         return res != nullptr ? 1 : 0;
     }
+    if (mcdr_dlss_invalidate_inputs() != 1) return -1;
     s.externalOutput = res;
     if (res != nullptr) {
         const D3D12_RESOURCE_DESC d = res->GetDesc();
@@ -3315,8 +3796,41 @@ int32_t mcdr_dlss_set_output_texture(void* resource) {
     return want ? 1 : 0;
     }
 
-    void mcdr_dlss_shutdown(void) {
-    destroyFeature();
+int32_t mcdr_dlss_shutdown_checked(void) {
+    if (gSrCandidateCount != 0) {
+        logWarn("DLSS shutdown requires all prepared and retired SR instances to be released");
+        return 0;
+    }
+    if (mcdr_dlss_invalidate_inputs() != 1) return 0;
+    if ((s.mvBufferObject != nullptr || s.dlssOutputObject != nullptr ||
+         s.depthSnapshotObject != nullptr) && gDestroyTexture == nullptr) {
+        logWarn("DLSS texture destroy callback missing; texture ownership must be retained");
+        return 0;
+    }
+    if (!destroyFeature()) return 0;
+    if (s.params != nullptr) {
+        const NVSDK_NGX_Result r = NVSDK_NGX_D3D12_DestroyParameters(s.params);
+        if (NVSDK_NGX_FAILED(r)) {
+            logWarn("NVSDK_NGX_D3D12_DestroyParameters failed: %s", ngxResultString(r).c_str());
+            return 0;
+        }
+        s.params = nullptr;
+        s.paramsOk = false;
+    }
+    if (s.initOk) {
+        const NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Shutdown1(s.device);
+        if (NVSDK_NGX_FAILED(r)) {
+            logWarn("NVSDK_NGX_D3D12_Shutdown1 failed: %s", ngxResultString(r).c_str());
+            return 0;
+        }
+        s.initOk = false;
+    }
+    if (gShutdownStreamline != nullptr) {
+        if (gShutdownStreamline() != 1) return 0;
+    } else if (dlssImplStreamline()) {
+        logWarn("Streamline shutdown callback missing; device ownership must be retained");
+        return 0;
+    }
     // B4: the three private textures are module-owned now. Hand them back **before** the device
     // goes away (ctx = nullptr: no command list to touch, just the deferred delete). They used to
     // be leaked here (`s = State{}` dropped the pointers) or Release()d inline.
@@ -3330,18 +3844,34 @@ int32_t mcdr_dlss_set_output_texture(void* resource) {
         s.depthStencil->Release();
         s.depthStencil = nullptr;
     }
-    if (s.initOk) {
-        // Shutdown1(device) 是现行入口；NVSDK_NGX_D3D12_Shutdown() 只在定义了
-        // NGX_ENABLE_DEPRECATED_SHUTDOWN 时才声明，本项目没有定义它（编译期就报 C3861）。
-        const NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Shutdown1(s.device);
-        if (NVSDK_NGX_FAILED(r)) {
-            logWarn("NVSDK_NGX_D3D12_Shutdown1 failed: %s", ngxResultString(r).c_str());
-        }
-        s = State{};
-    }
+    s = State{};
+    for (auto& slot : gSrViewportSlots) slot = false;
+#if MCDR_DLSS_HAVE_STREAMLINE
+    for (auto& constants : gSrAllocationConstants) constants.reset();
+    streamlineEvalApi(true);
+    slDlssSetOptionsFn(true);
+    const int32_t reflexMode = gReflex.mode;
+    const uint32_t reflexFrameLimit = gReflex.frameLimitUs;
+    gReflex = ReflexApi{};
+    gReflex.mode = reflexMode;
+    gReflex.frameLimitUs = reflexFrameLimit;
+    gStreamlineFgState = {};
+    gSlDlssLoaded.store(-1);
+    gStreamlineInputInvalidationFailed.store(false);
+    gLastFrameToken = nullptr;
+    gCameraConstantsValid = false;
+    gWorldConstantsFrame = UINT64_MAX;
+    gDisplayConstantsFrame = UINT64_MAX;
+    gDisplayInputsAccepted = false;
+#endif
 
 
-}  // mcdr_dlss_shutdown
+    return 1;
+}
+
+void mcdr_dlss_shutdown(void) {
+    (void)mcdr_dlss_shutdown_checked();
+}
 
 // P249：DXGI 工厂升级入口。设备模块建工厂后立刻调一次，把 swapchain 交给 SL 的代理工厂
 // （否则 DLSS-G 一次都不出帧；见 mcdr_dlss_impl.h 里那段说明）。

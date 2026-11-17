@@ -2,6 +2,9 @@ module;
 
 #include <initguid.h>
 #include "_d3d12_module_prelude.h"
+#include "mcdr_graphics_capture.h"
+#include "mcdr_graphics_recording.h"
+#include "mcdr_oit_budget.h"
 #include "mcdr_rt_state.h"  // P117: 光追模式（创建期日志/后续 G-Buffer 都要读）
 
 // RTX（DLSS/NRD）可用性探测接口。和 dxcapi.h 同理必须放在全局模块片段里，
@@ -58,11 +61,16 @@ namespace d3d12_mc {
 Dx12Surface* gActiveSurface = nullptr;
 
 namespace {
+std::atomic<uint64_t> nextSampledTextureOwnerGeneration{1};
 
 DeviceContext* makeDeviceContext() {
     return new DeviceContext();
 }
 DeviceContext& gCtx = *makeDeviceContext();
+std::mutex gQueueSubmissionMutex;
+std::mutex gAsyncSubmissionMutex;
+std::mutex gRecordingContextsMutex;
+std::unordered_map<void*, CommandContext*> gRecordingContexts;
 
 struct PendingDelete {
     Dx12Object* obj;
@@ -381,6 +389,10 @@ void flushPendingDeletes(bool force) {
         std::vector<PendingDelete> keep;
         keep.reserve(gPendingDeletes.size());
         for (PendingDelete& pd : gPendingDeletes) {
+            if (pd.obj->recordingReferences.load(std::memory_order_acquire) != 0) {
+                keep.push_back(pd);
+                continue;
+            }
             if (force) {
                 local.push_back(pd);
                 continue;
@@ -703,6 +715,7 @@ bool gDlssWired = false;
 int32_t createDlssTexture(CommandContext* ctx, const DlssTextureDesc* desc, void** outObject,
                           void** outResource);
 void destroyDlssTexture(CommandContext* ctx, void* object);
+int32_t shutdownStreamline();
 
 void wireDlssImpl() {
     if (gDlssWired) {
@@ -718,6 +731,14 @@ void wireDlssImpl() {
     // 于是它的资源从出生起就在本模块的跟踪表里（详见 mcdr_dlss_impl.h 那一段）。
     mcdr_dlss_install_texture_ops(reinterpret_cast<void*>(&d3d12_mc::createDlssTexture),
                                   reinterpret_cast<void*>(&d3d12_mc::destroyDlssTexture));
+    const auto pinTexture = +[](void* list, void* object) -> int32_t {
+        auto* context = static_cast<CommandContext*>(recordingContextForCommandList(list));
+        if (!context || !object) return 0;
+        retainObjectForRecording(context, object);
+        return 1;
+    };
+    mcdr_dlss_install_recording_pin(reinterpret_cast<void*>(pinTexture));
+    mcdr_dlss_install_streamline_shutdown(reinterpret_cast<void*>(&shutdownStreamline));
 }
 
 // 设备就绪后调用一次：注入日志、把厂商运行库目录登记进 DLL 搜索路径（见下）、把探测到的
@@ -827,6 +848,11 @@ void queryDeviceCapabilities(ID3D12Device* device, DeviceContext::Capabilities& 
         }
     }
 
+    D3D12_FEATURE_DATA_D3D12_OPTIONS3 options3{};
+    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &options3, sizeof(options3)))) {
+        caps.barycentricsSupported = options3.BarycentricsSupported != FALSE;
+    }
+
     D3D12_FEATURE_DATA_D3D12_OPTIONS7 options7{};
     if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &options7,
                                               sizeof(options7)))) {
@@ -835,6 +861,12 @@ void queryDeviceCapabilities(ID3D12Device* device, DeviceContext::Capabilities& 
     }
 
     D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5{};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS21 options21{};
+    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS21, &options21,
+                                              sizeof(options21)))) {
+        caps.workGraphsTier = options21.WorkGraphsTier;
+    }
+
     if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &options5,
                                               sizeof(options5)))) {
         caps.raytracingTier = options5.RaytracingTier;
@@ -868,11 +900,17 @@ void queryDeviceCapabilities(ID3D12Device* device, DeviceContext::Capabilities& 
 }
 
 // SM 值写成十进制（D3D_SHADER_MODEL_6_8 == 0x68 == 104），tier 枚举按 d3d12.h 原值。
+mcdr::Result<void> requireCaptureBarycentrics() {
+    if (!gCtx.caps.barycentricsSupported)
+        return mcdr::err("capture.barycentrics", "OIT capture shader ABI 2 requires D3D12 BarycentricsSupported");
+    return {};
+}
+
 std::string capabilitiesText(const DeviceContext::Capabilities& caps) {
     char buf[512] = {};
     std::snprintf(buf, sizeof(buf),
                   "FL=%s SM=%s(0x%02X)/eff=%s mesh=%d samplerFeedback=%d rt=%d rtMode=%d"
-                  "vrs=%d(tile=%u,extra=%d) binding=%d enhancedBarriers=%d",
+                  "vrs=%d(tile=%u,extra=%d) binding=%d enhancedBarriers=%d barycentrics=%d",
                   featureLevelName(caps.featureLevel), shaderModelName(caps.shaderModel),
                   static_cast<unsigned>(caps.shaderModel),
                   shaderModelProfileSuffix(effectiveShaderModel(caps)),
@@ -880,7 +918,8 @@ std::string capabilitiesText(const DeviceContext::Capabilities& caps) {
                   static_cast<int>(caps.raytracingTier), mcdr_rt_state_mode(),
                   static_cast<int>(caps.shadingRateTier),
                   caps.shadingRateImageTileSize, caps.additionalShadingRates ? 1 : 0,
-                  static_cast<int>(caps.resourceBindingTier), caps.enhancedBarriers ? 1 : 0);
+                  static_cast<int>(caps.resourceBindingTier), caps.enhancedBarriers ? 1 : 0,
+                  caps.barycentricsSupported ? 1 : 0);
     std::string text(buf);
     // P67：DXC（mesh shader 编译器）状态一并带出；完整路径与失败原因看 JSON。
     text += " dxc=";
@@ -888,8 +927,6 @@ std::string capabilitiesText(const DeviceContext::Capabilities& caps) {
     if (!caps.dxcProfile.empty()) {
         text += "(" + caps.dxcProfile + ")";
     }
-    text += " meshSmoke=";
-    text += caps.meshShaderCompileOk ? "ok" : "fail";
     // 可用性探测（DLSS/NGX + NRD）：与 caps 分开统计，失败原因看 JSON。
     text += gCtx.rtx.summary();
     return text;
@@ -925,6 +962,7 @@ std::string capabilitiesJson(const DeviceContext::Capabilities& caps) {
     j["shader_model_value"] = static_cast<int>(caps.shaderModel);
     j["shader_model_effective"] = shaderModelProfileSuffix(effectiveShaderModel(caps));
     j["mesh_shader_tier"] = static_cast<int>(caps.meshShaderTier);
+    j["work_graphs_tier"] = static_cast<int>(caps.workGraphsTier);
     j["sampler_feedback_tier"] = static_cast<int>(caps.samplerFeedbackTier);
     j["raytracing_tier"] = static_cast<int>(caps.raytracingTier);
     j["shading_rate_tier"] = static_cast<int>(caps.shadingRateTier);
@@ -932,10 +970,10 @@ std::string capabilitiesJson(const DeviceContext::Capabilities& caps) {
     j["additional_shading_rates"] = caps.additionalShadingRates;
     j["resource_binding_tier"] = static_cast<int>(caps.resourceBindingTier);
     j["enhanced_barriers"] = caps.enhancedBarriers;
+    j["barycentrics_supported"] = caps.barycentricsSupported;
     j["caps_queried"] = caps.queried;
     // P67：DXC/mesh shader 自检结果（dxc_note 里带失败原因或冒烟编译产物大小）。
     j["dxc_available"] = caps.dxcAvailable;
-    j["dxc_mesh_shader_compile_ok"] = caps.meshShaderCompileOk;
     j["dxc_profile"] = caps.dxcProfile;
     j["dxc_path"] = caps.dxcPath;
     j["dxc_note"] = caps.dxcNote;
@@ -1103,6 +1141,25 @@ bool gSlRequested = false;
 sl::Result gSlInitResult = sl::Result::eErrorInitNotCalled;
 PFun_slSetD3DDevice* gSlSetDevice = nullptr;
 PFun_slIsFeatureLoaded* gSlIsLoaded = nullptr;
+
+int32_t shutdownStreamline() {
+    if (gSlInitResult == sl::Result::eOk) {
+        auto shutdown = reinterpret_cast<PFun_slShutdown*>(::GetProcAddress(gSlModule, "slShutdown"));
+        if (shutdown == nullptr) return 0;
+        const sl::Result result = shutdown();
+        if (result != sl::Result::eOk) {
+            dbgLogError("streamline: slShutdown failed result=0x%X", static_cast<unsigned>(result));
+            return 0;
+        }
+    }
+    gSlInitAttempted = false;
+    gSlRequested = false;
+    gSlInitResult = sl::Result::eErrorInitNotCalled;
+    gSlSetDevice = nullptr;
+    gSlIsLoaded = nullptr;
+    gDlssAvailabilityLogged = false;
+    return 1;
+}
 }  // namespace
 
 // P112：SL 的 NGX 后端要求一个 **数字** applicationId（sl_appidentity.h / Preferences 注释：
@@ -1129,14 +1186,10 @@ void streamlineInitEarly() {
     gSlInitAttempted = true;
     gSlRequested = streamlineRequested();
     gSlDir = ownModuleDir();
-    FILE* probe = gSlDir.empty() ? nullptr : _wfopen((gSlDir + L"sl-probe.txt").c_str(), L"w, ccs=UTF-8");
-    if (probe) fwprintf(probe, L"env=%d dir=%s\n", gSlRequested ? 1 : 0, gSlDir.c_str());
-    if (!gSlRequested) { if (probe) fclose(probe); return; }
-    if (gSlDir.empty()) { if (probe) fclose(probe); return; }
+    if (!gSlRequested || gSlDir.empty()) return;
     const std::wstring dllPath = gSlDir + L"sl.interposer.dll";
-    gSlModule = ::LoadLibraryW(dllPath.c_str());
+    if (gSlModule == nullptr) gSlModule = ::LoadLibraryW(dllPath.c_str());
     if (gSlModule == nullptr) {
-        if (probe) { fwprintf(probe, L"load=fail err=%lu\n", ::GetLastError()); fclose(probe); }
         dbgLogWarn("streamline: %s not found (err=%lu) - skipped", backendWideToUtf8(dllPath).c_str(),
                    ::GetLastError());
         return;
@@ -1144,9 +1197,7 @@ void streamlineInitEarly() {
     auto pInit = reinterpret_cast<PFun_slInit*>(::GetProcAddress(gSlModule, "slInit"));
     gSlSetDevice = reinterpret_cast<PFun_slSetD3DDevice*>(::GetProcAddress(gSlModule, "slSetD3DDevice"));
     gSlIsLoaded = reinterpret_cast<PFun_slIsFeatureLoaded*>(::GetProcAddress(gSlModule, "slIsFeatureLoaded"));
-    if (probe) fwprintf(probe, L"load=ok exports=%d\n", (pInit && gSlSetDevice && gSlIsLoaded) ? 1 : 0);
     if (pInit == nullptr || gSlSetDevice == nullptr || gSlIsLoaded == nullptr) {
-        if (probe) fclose(probe);
         dbgLogWarn("streamline: %s is missing expected exports - skipped", backendWideToUtf8(dllPath).c_str());
         return;
     }
@@ -1183,12 +1234,10 @@ void streamlineInitEarly() {
                 // 会把 Present 槽指到 sl.interposer.dll，注入式 overlay 拿不到钩子，OSD 消失。
                 sl::PreferenceFlags::eUseDXGIFactoryProxy;
     gSlInitResult = (*pInit)(pref, sl::kSDKVersion);
-    if (probe) { fwprintf(probe, L"init=0x%X\n", static_cast<unsigned>(gSlInitResult)); fclose(probe); }
     dbgLogWarn("streamline: slInit=0x%X (early, before any DXGI/D3D12 call)", 
                static_cast<unsigned>(gSlInitResult));
 }
 
-// 设备就绪后挂接：slSetD3DDevice + 查询 DLSS 特性是否已加载 + 一次 slDLSSSetOptions 探针。
 void applyStreamline(ID3D12Device* device) {
     if (!gSlInitAttempted) streamlineInitEarly();
     if (!gSlRequested || gSlModule == nullptr || gSlInitResult != sl::Result::eOk) return;
@@ -1210,12 +1259,6 @@ void applyStreamline(ID3D12Device* device) {
     const sl::Result deviceResult = (*gSlSetDevice)(device);
     bool loaded = false;
     const sl::Result loadResult = (*gSlIsLoaded)(sl::kFeatureDLSS, loaded);
-    FILE* probe = gSlDir.empty() ? nullptr : _wfopen((gSlDir + L"sl-probe.txt").c_str(), L"a, ccs=UTF-8");
-    if (probe) {
-        fwprintf(probe, L"setDevice=0x%X load=0x%X dlssLoaded=%s\n",
-                 static_cast<unsigned>(deviceResult), static_cast<unsigned>(loadResult),
-                 loaded ? L"yes" : L"no");
-    }
     mcdr_dlss_note_sl_loaded(loaded ? 1 : 0);
     if (!loaded) {
         // P208：插件没加载 ⇒ 后面每帧 evaluate 都会被 native 跳过。历史上这条只打 P111 的
@@ -1228,38 +1271,7 @@ void applyStreamline(ID3D12Device* device) {
     dbgLogWarn("streamline: slIsFeatureSupported(DLSS)=%d setDevice=0x%X load=0x%X dlssLoaded=%s", slSupport,
                static_cast<unsigned>(deviceResult), static_cast<unsigned>(loadResult),
                loaded ? "yes" : "no");
-    using PFn_GetFeatureFunction = sl::Result (*)(sl::Feature, const char*, void*&);
-    auto getFeatureFunction = reinterpret_cast<PFn_GetFeatureFunction>(
-        ::GetProcAddress(gSlModule, "slGetFeatureFunction"));
-    unsigned getFnResult = 0xFFFFFFFFu;
-    int optResult = -1;
-    if (getFeatureFunction != nullptr) {
-        void* raw = nullptr;
-        const sl::Result r = getFeatureFunction(sl::kFeatureDLSS, "slDLSSSetOptions", raw);
-        getFnResult = static_cast<unsigned>(r);
-        if (r == sl::Result::eOk && raw != nullptr) {
-            using PFn_SetOptions = sl::Result (*)(const sl::ViewportHandle&, const sl::DLSSOptions&);
-            auto setOptions = reinterpret_cast<PFn_SetOptions>(raw);
-            sl::DLSSOptions opt{};
-            opt.mode = sl::DLSSMode::eMaxQuality;
-            opt.outputWidth = 1920;
-            opt.outputHeight = 1080;
-            opt.preExposure = 1.0f;
-            opt.exposureScale = 1.0f;
-            opt.useAutoExposure = sl::Boolean::eFalse;
-            const sl::ViewportHandle viewport(0);
-            optResult = static_cast<int>(setOptions(viewport, opt));
-        }
-    }
-    if (probe) {
-        fwprintf(probe, L"dlssOptions: getFn=0x%X result=0x%X\n", getFnResult,
-                 static_cast<unsigned>(optResult));
-        fclose(probe);
-    }
-    dbgLogWarn("streamline: slDLSSSetOptions probe getFn=0x%X result=0x%X", getFnResult,
-               static_cast<unsigned>(optResult));
-
-    }
+}
 #endif
 
 // P175：描述符游标与空闲表是文件级全局，不在 DeviceContext 里，所以 `gCtx = DeviceContext{}`
@@ -1490,34 +1502,35 @@ mcdr::Result<void> ensureDevice() {
 }
 
 void destroyDevice() {
+    auto result = destroyDeviceChecked();
+    if (!result) dbgLogError("destroyDevice: %s", result.error().message.c_str());
+}
+
+mcdr::Result<void> destroyDeviceChecked() {
     dbgLogProgress("destroyDevice stage: enter");
-    if (gCtx.queueFenceEvent) {
-        CloseHandle(gCtx.queueFenceEvent);
-        gCtx.queueFenceEvent = nullptr;
+    if (getActiveSurface() != nullptr) return mcdr::err("destroyDevice", "A surface still owns device resources");
+    {
+        std::lock_guard<std::mutex> lock(gRecordingContextsMutex);
+        if (!gRecordingContexts.empty()) return mcdr::err("destroyDevice", "Command contexts still own device resources");
     }
-    if (gCtx.queue && gCtx.queueFence) {
-        UINT64 target = gCtx.queueFenceValue;
-        if (gCtx.queueFence->GetCompletedValue() < target) {
-            HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            if (evt) {
-                if (SUCCEEDED(gCtx.queueFence->SetEventOnCompletion(target, evt))) {
-                    WaitForSingleObject(evt, 1000);
-                }
-                CloseHandle(evt);
-            }
-        }
-    }
+    if (!waitForRenderThreadSubmit()) return mcdr::err("destroyDevice", "Render submission did not drain");
+    if (auto idle = deviceWaitIdle(); !idle) return std::unexpected<mcdr::Error>(idle.error());
+    if (!fgReleaseProviderWithWait(nullptr)) return mcdr::err("destroyDevice", "Frame generation teardown is still active");
+    if (!srReleaseProvider()) return mcdr::err("destroyDevice", "Reconstruction teardown is still active");
     dbgLogProgress("destroyDevice stage: queue fence wait done");
-    flushPendingDeletes(/*force=*/true);
-    dbgLogProgress("destroyDevice stage: pending deletes flushed");
     // P108：DLSS 的特征句柄与 scratch/中间纹理必须在**设备还活着**的时候释放，并且 NGX
     // 只能在设备销毁前 Shutdown。放在 gCtx 清零之前。
-    mcdr_dlss_shutdown();
+    if (mcdr_dlss_shutdown_checked() != 1) return mcdr::err("destroyDevice", "DLSS teardown did not complete");
     dbgLogProgress("destroyDevice stage: dlss shutdown done");
+    gCtx.dlssOutputOverride = nullptr;
+    gCtx.dlssOutputOverrideLease.reset();
+    flushPendingDeletes(/*force=*/true);
+    if (gCtx.queueFenceEvent) CloseHandle(gCtx.queueFenceEvent);
     gCtx = DeviceContext{};
     // P175：设备级描述符状态不跟着 gCtx 走（见 resetDescriptorAllocationState 的注释）。
     resetDescriptorAllocationState();
     dbgLogProgress("destroyDevice stage: done");
+    return {};
 }
 
 DeviceContext& deviceContext() { return gCtx; }
@@ -1895,8 +1908,16 @@ mcdr::Result<void*> createSamplerWithMipBias(int addressU, int addressV, int min
 
 mcdr::Result<void*> createTextureView(Dx12Object* texture, int baseMipLevel, int mipLevels) {
     if (auto d = ensureDevice(); !d) return mcdr::err("createTextureView", errorMessage(d.error()));
-    if (!texture || texture->kind != Dx12Object::Kind::Texture) {
+    if (!texture || texture->kind != Dx12Object::Kind::Texture || !texture->resource) {
         return mcdr::err("createTextureView", "createTextureView: invalid texture handle");
+    }
+    const auto textureDesc = texture->resource->GetDesc();
+    const auto firstMip = static_cast<UINT>(std::max(0, baseMipLevel));
+    const auto mipCount = static_cast<UINT>(std::max(1, mipLevels));
+    if (textureDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || textureDesc.SampleDesc.Count != 1 ||
+        firstMip >= textureDesc.MipLevels || mipCount > textureDesc.MipLevels - firstMip ||
+        ((texture->usage & 16) != 0 && textureDesc.DepthOrArraySize < 6)) {
+        return mcdr::err("createTextureView", "texture SRV range or dimension is invalid");
     }
     // P29：放宽 TEXTURE_BINDING 硬校验。深度/自绘纹理可能只有 RENDER_ATTACHMENT
     // 而无 TEXTURE_BINDING（如 GuiItemAtlas 的 depth 图集 usage=9，官方 Vulkan 后端
@@ -1961,11 +1982,47 @@ mcdr::Result<void*> createTextureView(Dx12Object* texture, int baseMipLevel, int
     obj->gpuHandle = gpu;
     obj->descSlot = slot;  // 销毁时归还 SRV 槽位
     obj->sourceTexture = texture;  // 采样前据此 transition 底层纹理状态
+    obj->srvDesc = srv;
+    obj->hasSrvDesc = true;
     return static_cast<void*>(obj.release());
+}
+
+std::shared_ptr<void> retainObjectLease(void* opaqueObject) {
+    auto* object = static_cast<Dx12Object*>(opaqueObject);
+    if (!object) return {};
+    auto packetOwner = object->packetContentOwner.lock();
+    auto sourceLease = object->sourceTexture ? retainObjectLease(object->sourceTexture) : std::shared_ptr<void>{};
+    object->recordingReferences.fetch_add(1, std::memory_order_relaxed);
+    return std::shared_ptr<void>(object,
+        [packetOwner = std::move(packetOwner), sourceLease = std::move(sourceLease)](void* retained) {
+        static_cast<Dx12Object*>(retained)->recordingReferences.fetch_sub(1, std::memory_order_release);
+    });
+}
+
+void retainObjectForRecording(void* opaqueContext, void* opaqueObject) {
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    if (!context || !opaqueObject || !context->listOpen) return;
+    if (!context->retainedRecordingObjects.emplace(static_cast<Dx12Object*>(opaqueObject), true).second) return;
+    auto lease = retainObjectLease(opaqueObject);
+    context->recordingLeases[context->currentListSlot].push_back(std::move(lease));
+}
+
+void* recordingContextForCommandList(void* commandList) {
+    std::lock_guard<std::mutex> lock(gRecordingContextsMutex);
+    const auto found = gRecordingContexts.find(commandList);
+    if (found == gRecordingContexts.end()) return nullptr;
+    auto* context = found->second;
+    return context->listOpen && context->commandList == commandList ? context : nullptr;
+}
+
+namespace {
+void closeSampledTextureOwner(Dx12Object* object);
 }
 
 void destroyObject(Dx12Object* obj) {
     if (!obj) return;
+    obj->closeRequested.store(true, std::memory_order_release);
+    closeSampledTextureOwner(obj);
     if (obj->mappedPtr) {
         if (obj->resource) obj->resource->Unmap(0, nullptr);
         obj->mappedPtr = nullptr;
@@ -2002,6 +2059,906 @@ void destroyObject(Dx12Object* obj) {
         std::lock_guard<std::mutex> lk(gPendingMutex);
         gPendingDeletes.push_back(PendingDelete{obj, required});
     }
+}
+
+namespace {
+mcdr::Result<uint32_t> resourceSubresourceCount(ID3D12Resource* resource);
+bool isDepthStencilFormat(DXGI_FORMAT format);
+mcdr::Result<uint32_t> sampledTextureSubresourceCount(Dx12Object& texture) {
+    if (texture.sampledSubresourceCount) return texture.sampledSubresourceCount;
+    const auto total = resourceSubresourceCount(texture.resource.Get());
+    if (total) texture.sampledSubresourceCount = *total;
+    return total;
+}
+struct SampledTextureVersion {
+    std::shared_ptr<const void> recording;
+    std::shared_ptr<std::atomic<bool>> discarded;
+    ComPtr<ID3D12Fence> fence;
+    uint64_t submission = 0;
+    uint64_t number = 0;
+    uint64_t budgetLimit = 0;
+    std::shared_ptr<void> budget;
+    std::shared_ptr<void> sourceLease;
+    ComPtr<ID3D12Resource> source;
+    std::vector<uint32_t> coverage;
+    std::vector<uint8_t> initialized;
+    std::shared_ptr<void> savedBudget;
+    Dx12Object saved;
+    bool savedReady = false;
+    bool failed = false;
+};
+template<class Element>
+struct SampledVersionAllocator {
+    using value_type = Element;
+    const uint64_t* budgetLimit;
+    explicit SampledVersionAllocator(const uint64_t* limit) noexcept : budgetLimit(limit) {}
+    template<class Other>
+    SampledVersionAllocator(const SampledVersionAllocator<Other>& other) noexcept : budgetLimit(other.budgetLimit) {}
+    struct alignas(Element) Allocation {
+        std::shared_ptr<void> budget;
+    };
+    Element* allocate(size_t count) {
+        constexpr auto budgetBytesPerElement = sizeof(Element) + sizeof(SampledTextureVersion) +
+            2 * sizeof(std::shared_ptr<void>);
+        if (count > (SIZE_MAX - sizeof(Allocation)) / budgetBytesPerElement) throw std::bad_alloc();
+        const auto bytes = sizeof(Allocation) + count * sizeof(Element);
+        auto budget = mcdr::oit_budget::reserve(sizeof(Allocation) + uint64_t(count) * budgetBytesPerElement, *budgetLimit);
+        if (!budget) throw std::bad_alloc();
+        auto* allocation = static_cast<Allocation*>(::operator new(bytes));
+        new (allocation) Allocation{std::move(budget)};
+        return reinterpret_cast<Element*>(allocation + 1);
+    }
+    void deallocate(Element* elements, size_t) noexcept {
+        auto* allocation = reinterpret_cast<Allocation*>(elements) - 1;
+        auto budget = std::move(allocation->budget);
+        allocation->~Allocation();
+        ::operator delete(allocation);
+    }
+    template<class Other>
+    bool operator==(const SampledVersionAllocator<Other>& other) const noexcept {
+        return budgetLimit == other.budgetLimit;
+    }
+};
+struct SampledTextureOwner {
+    uint64_t generation = 0;
+    uint64_t number = 1;
+    bool closed = false;
+    uint64_t budgetLimit;
+    std::shared_ptr<void> budget;
+    std::vector<std::weak_ptr<SampledTextureVersion>,
+        SampledVersionAllocator<std::weak_ptr<SampledTextureVersion>>> versions;
+    explicit SampledTextureOwner(uint64_t totalBudgetBytes)
+        : generation(nextSampledTextureOwnerGeneration.fetch_add(1, std::memory_order_relaxed)),
+          budgetLimit(totalBudgetBytes),
+          versions(SampledVersionAllocator<std::weak_ptr<SampledTextureVersion>>{&budgetLimit}) {}
+};
+struct SampledTextureRead {
+    std::shared_ptr<SampledTextureOwner> owner;
+    std::shared_ptr<SampledTextureVersion> version;
+    std::shared_ptr<void> sourceViewLease;
+    std::shared_ptr<void> budget;
+    mutable std::shared_ptr<void> descriptorBudget;
+    Dx12Object* sourceView = nullptr;
+    D3D12_SHADER_RESOURCE_VIEW_DESC description{};
+    uint32_t firstMip = 0, mipCount = 0, layerCount = 0;
+    mutable bool registered = false;
+    mutable ComPtr<ID3D12DescriptorHeap> descriptors;
+    mutable Dx12Object savedView;
+};
+struct SampledWriteRecording {
+    CommandContext* context;
+    bool completed = false;
+    ~SampledWriteRecording() {
+        if (!completed) context->recordingFailed.store(true, std::memory_order_release);
+    }
+};
+void closeSampledTextureOwner(Dx12Object* object) {
+    std::lock_guard lock(object->sampledContentMutex);
+    auto owner = std::static_pointer_cast<SampledTextureOwner>(object->sampledContentOwner.load(std::memory_order_acquire));
+    if (!owner) return;
+    owner->closed = true;
+}
+bool textureWriteRecordingCompleted(const TextureWriteRecording& recording) {
+    if (!recording.identity || (recording.discarded && recording.discarded->load(std::memory_order_acquire))) return true;
+    if (!recording.fence) return false;
+    const auto completed = recording.fence->GetCompletedValue();
+    return completed != UINT64_MAX && completed >= recording.submission;
+}
+void retireTextureWriteRecordings(Dx12Object& texture, const std::shared_ptr<const void>& activeRecording) {
+    if (activeRecording && texture.textureWriteRecording.identity == activeRecording &&
+        !texture.additionalTextureWriteRecordings) return;
+    if (textureWriteRecordingCompleted(texture.textureWriteRecording)) texture.textureWriteRecording = {};
+    auto* entry = &texture.additionalTextureWriteRecordings;
+    while (*entry) {
+        if (textureWriteRecordingCompleted((*entry)->recording)) {
+            auto retired = std::move(*entry);
+            *entry = std::move(retired->next);
+        } else {
+            entry = &(*entry)->next;
+        }
+    }
+}
+bool textureWriteOrderingAvailable(const Dx12Object& texture, const std::shared_ptr<const void>& identity) {
+    if (texture.textureWriteRecording.identity && texture.textureWriteRecording.identity != identity) return false;
+    for (auto* entry = texture.additionalTextureWriteRecordings.get(); entry; entry = entry->next.get()) {
+        if (entry->recording.identity != identity) return false;
+    }
+    return true;
+}
+SampledTextureContentStatus recordTextureWrite(Dx12Object& texture, CommandContext& context,
+    uint32_t firstSubresource, uint32_t subresourceCount) {
+    auto* recording = &texture.textureWriteRecording;
+    if (recording->identity && recording->identity != context.recordingIdentity) {
+        recording = nullptr;
+        for (auto* entry = texture.additionalTextureWriteRecordings.get(); entry; entry = entry->next.get()) {
+            if (entry->recording.identity == context.recordingIdentity) {
+                recording = &entry->recording;
+                break;
+            }
+        }
+        if (!recording) {
+            auto budget = mcdr::oit_budget::reserve(sizeof(TextureWriteRecordingEntry));
+            if (!budget) return SampledTextureContentStatus::BudgetExceeded;
+            auto entry = std::make_unique<TextureWriteRecordingEntry>();
+            entry->budget = std::move(budget);
+            entry->next = std::move(texture.additionalTextureWriteRecordings);
+            recording = &entry->recording;
+            texture.additionalTextureWriteRecordings = std::move(entry);
+        }
+    }
+    if (recording->identity) {
+        const auto end = std::max(uint64_t(recording->firstSubresource) + recording->subresourceCount,
+            uint64_t(firstSubresource) + subresourceCount);
+        recording->firstSubresource = std::min(recording->firstSubresource, firstSubresource);
+        recording->subresourceCount = static_cast<uint32_t>(end - recording->firstSubresource);
+    } else {
+        recording->identity = context.recordingIdentity;
+        recording->discarded = context.recordingDiscarded;
+        recording->fence = context.fence;
+        recording->submission = context.fenceValue + 1;
+        recording->firstSubresource = firstSubresource;
+        recording->subresourceCount = subresourceCount;
+    }
+    return SampledTextureContentStatus::Ready;
+}
+struct SampledTextureCpuWriteLease {
+    std::shared_ptr<void> budget;
+    std::shared_ptr<void> sourceLease;
+    std::unique_lock<std::mutex> lock;
+};
+bool sampledVersionCompleted(const SampledTextureVersion& version) {
+    if (version.discarded && version.discarded->load(std::memory_order_acquire)) return true;
+    if (!version.fence) return false;
+    const auto completed = version.fence->GetCompletedValue();
+    return completed != UINT64_MAX && completed >= version.submission;
+}
+bool sampledCoverageOverlaps(const SampledTextureVersion& version, uint32_t first, uint32_t count) {
+    const auto end = std::min<uint64_t>(uint64_t(first) + count, version.coverage.size());
+    for (uint64_t subresource = first; subresource < end; ++subresource) {
+        if (version.coverage[static_cast<size_t>(subresource)]) return true;
+    }
+    return false;
+}
+struct PacketContentObjects {
+    ComPtr<ID3D12DescriptorHeap> descriptors;
+    std::vector<std::unique_ptr<Dx12Object>> objects;
+};
+}
+
+SampledTextureContentCapture captureSampledTextureContent(void* opaqueContext, void* opaqueView,
+                                                         uint64_t totalBudgetBytes) {
+    SampledTextureContentCapture result;
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    auto* view = static_cast<Dx12Object*>(opaqueView);
+    if (context && context->recordingFailed.load(std::memory_order_acquire)) {
+        result.status = SampledTextureContentStatus::RecordingFailed;
+        return result;
+    }
+    if (!context || !context->listOpen || !context->commandList || !context->recordingIdentity || !context->fence ||
+        context->fenceValue == UINT64_MAX ||
+        context->submissionFailed.load() || context->recordingFailed.load()) {
+        result.status = SampledTextureContentStatus::StaleRecording;
+        return result;
+    }
+    if (!view || view->closeRequested.load(std::memory_order_acquire) ||
+        view->kind != Dx12Object::Kind::TextureView || !view->hasSrvDesc ||
+        !view->cpuHandle.ptr || !view->sourceTexture) return result;
+    auto* texture = view->sourceTexture;
+    if (texture->closeRequested.load(std::memory_order_acquire) ||
+        texture->kind != Dx12Object::Kind::Texture || !texture->resource ||
+        texture->heapType != D3D12_HEAP_TYPE_DEFAULT) return result;
+    std::lock_guard lock(texture->sampledContentMutex);
+    const auto description = texture->resource->GetDesc();
+    const auto total = sampledTextureSubresourceCount(*texture);
+    if (!total || description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        description.SampleDesc.Count != 1 || description.SampleDesc.Quality != 0 ||
+        *total != uint32_t(description.MipLevels) * description.DepthOrArraySize ||
+        (description.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0 ||
+        isDepthStencilFormat(view->srvDesc.Format)) return result;
+    const auto& srv = view->srvDesc;
+    if ((description.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0 ||
+        isDepthStencilFormat(texture->dxgiFormat)) {
+        if (texture->dxgiFormat != DXGI_FORMAT_D32_FLOAT || description.Format != DXGI_FORMAT_R32_TYPELESS ||
+            (description.Flags != D3D12_RESOURCE_FLAG_NONE &&
+                description.Flags != D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) || description.DepthOrArraySize != 1 ||
+            srv.Format != DXGI_FORMAT_R32_FLOAT || srv.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D ||
+            srv.Texture2D.PlaneSlice != 0) return result;
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT support{DXGI_FORMAT_R32_FLOAT};
+        constexpr auto requiredSupport = D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD |
+            D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE;
+        if (FAILED(gCtx.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+            (support.Support1 & requiredSupport) != requiredSupport) return result;
+    }
+    const bool cube = srv.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE;
+    if (!cube && srv.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D) return result;
+    const auto firstMip = cube ? srv.TextureCube.MostDetailedMip : srv.Texture2D.MostDetailedMip;
+    const auto declaredMips = cube ? srv.TextureCube.MipLevels : srv.Texture2D.MipLevels;
+    if (firstMip >= description.MipLevels) return result;
+    const uint32_t mipCount = declaredMips == UINT32_MAX ? description.MipLevels - firstMip : declaredMips;
+    const uint32_t layerCount = cube ? 6u : 1u;
+    if (!mipCount || mipCount > description.MipLevels - firstMip ||
+        layerCount > description.DepthOrArraySize || (!cube && srv.Texture2D.PlaneSlice != 0)) return result;
+    for (const auto& attachment : context->activeAttachmentRanges) {
+        if (!attachment.object || attachment.object->resource != texture->resource) continue;
+        for (uint32_t layer = 0; layer < layerCount; ++layer) {
+            const auto first = firstMip + layer * description.MipLevels;
+            if (first < uint64_t(attachment.firstSubresource) + attachment.subresourceCount &&
+                attachment.firstSubresource < uint64_t(first) + mipCount) return result;
+        }
+    }
+    bool changed = false;
+    try {
+        if (texture->closeRequested.load(std::memory_order_acquire)) return result;
+        retireTextureWriteRecordings(*texture, context->recordingIdentity);
+        if (!textureWriteOrderingAvailable(*texture, context->recordingIdentity)) {
+            result.status = SampledTextureContentStatus::OrderingUnavailable;
+            return result;
+        }
+        auto opaqueOwner = texture->sampledContentOwner.load(std::memory_order_acquire);
+        if (!opaqueOwner) {
+            auto owner = std::make_shared<SampledTextureOwner>(totalBudgetBytes);
+            owner->budget = mcdr::oit_budget::reserve(sizeof(SampledTextureOwner), totalBudgetBytes);
+            if (!owner->budget) {
+                result.status = SampledTextureContentStatus::BudgetExceeded;
+                return result;
+            }
+            opaqueOwner = owner;
+            texture->sampledContentOwner.store(opaqueOwner, std::memory_order_release);
+        }
+        auto owner = std::static_pointer_cast<SampledTextureOwner>(opaqueOwner);
+        if (owner->closed || owner->number == UINT64_MAX) return result;
+        owner->budgetLimit = totalBudgetBytes;
+        std::shared_ptr<SampledTextureVersion> version;
+        for (auto iterator = owner->versions.begin(); iterator != owner->versions.end();) {
+            auto existing = iterator->lock();
+            if (!existing || sampledVersionCompleted(*existing)) {
+                iterator = owner->versions.erase(iterator);
+                continue;
+            }
+            if (existing->number == owner->number) {
+                if (existing->recording != context->recordingIdentity) {
+                    result.status = SampledTextureContentStatus::OrderingUnavailable;
+                    return result;
+                }
+                version = std::move(existing);
+            }
+            ++iterator;
+        }
+        if (!version) {
+            version = std::make_shared<SampledTextureVersion>();
+            version->budget = mcdr::oit_budget::reserve(sizeof(SampledTextureVersion) +
+                uint64_t(*total) * (sizeof(uint32_t) + sizeof(uint8_t)), totalBudgetBytes);
+            if (!version->budget) {
+                result.status = SampledTextureContentStatus::BudgetExceeded;
+                return result;
+            }
+            version->number = owner->number;
+            version->budgetLimit = totalBudgetBytes;
+            version->recording = context->recordingIdentity;
+            version->discarded = context->recordingDiscarded;
+            version->fence = context->fence;
+            version->submission = context->fenceValue + 1;
+            version->source = texture->resource;
+            version->sourceLease = retainObjectLease(texture);
+            version->coverage.resize(*total);
+            version->initialized.resize(*total);
+            owner->versions.push_back(version);
+        }
+        for (uint32_t layer = 0; layer < layerCount; ++layer) {
+            for (uint32_t mip = firstMip; mip < firstMip + mipCount; ++mip) {
+                if (version->coverage[mip + layer * description.MipLevels] == UINT32_MAX) {
+                    result.status = SampledTextureContentStatus::BudgetExceeded;
+                    return result;
+                }
+            }
+        }
+        auto read = std::make_shared<SampledTextureRead>();
+        read->budget = mcdr::oit_budget::reserve(sizeof(SampledTextureRead), totalBudgetBytes);
+        if (!read->budget) {
+            result.status = SampledTextureContentStatus::BudgetExceeded;
+            return result;
+        }
+        read->owner = owner;
+        read->version = version;
+        read->sourceView = view;
+        read->sourceViewLease = retainObjectLease(view);
+        read->description = srv;
+        read->firstMip = firstMip;
+        read->mipCount = mipCount;
+        read->layerCount = layerCount;
+        read->savedView.kind = Dx12Object::Kind::TextureView;
+        read->savedView.sourceTexture = &version->saved;
+        read->savedView.srvDesc = srv;
+        read->savedView.hasSrvDesc = true;
+        read->savedView.packetContentOwner = read;
+        context->recordingLeases[context->currentListSlot].push_back(read);
+        changed = true;
+        for (uint32_t layer = 0; layer < layerCount; ++layer) {
+            for (uint32_t mip = firstMip; mip < firstMip + mipCount; ++mip) {
+                ++version->coverage[mip + layer * description.MipLevels];
+            }
+        }
+        read->registered = true;
+        version->budgetLimit = std::min(version->budgetLimit, totalBudgetBytes);
+        result.status = SampledTextureContentStatus::Ready;
+        result.lease = read;
+        result.ownerIdentity = owner;
+        result.ownerGeneration = owner->generation;
+        result.contentVersion = version->number;
+        result.firstMip = firstMip;
+        result.mipCount = mipCount;
+        result.layerCount = layerCount;
+        return result;
+    } catch (...) {
+        if (changed) context->recordingFailed.store(true, std::memory_order_release);
+        result.status = changed ? SampledTextureContentStatus::RecordingFailed : SampledTextureContentStatus::BudgetExceeded;
+        return result;
+    }
+}
+
+void cancelSampledTextureContent(const std::shared_ptr<const void>& opaqueRead) {
+    const auto read = std::static_pointer_cast<const SampledTextureRead>(opaqueRead);
+    if (!read) return;
+    std::lock_guard lock(read->sourceView->sourceTexture->sampledContentMutex);
+    if (!read->registered) return;
+    const auto description = read->version->source->GetDesc();
+    for (uint32_t layer = 0; layer < read->layerCount; ++layer) {
+        for (uint32_t mip = read->firstMip; mip < read->firstMip + read->mipCount; ++mip) {
+            --read->version->coverage[mip + layer * description.MipLevels];
+        }
+    }
+    read->registered = false;
+}
+
+SampledTextureContentResolution resolveSampledTextureContent(void* opaqueContext,
+    const std::shared_ptr<const void>& opaqueRead) {
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    const auto read = std::static_pointer_cast<const SampledTextureRead>(opaqueRead);
+    if (!context || !read || !context->listOpen || !context->commandList ||
+        context->recordingIdentity != read->version->recording || context->submissionFailed.load() ||
+        context->recordingFailed.load() || context->fence.Get() != read->version->fence.Get() ||
+        context->fenceValue + 1 != read->version->submission) return {};
+    std::lock_guard lock(read->sourceView->sourceTexture->sampledContentMutex);
+    if (!read->registered) return {};
+    auto& version = *read->version;
+    if (version.failed) return {SampledTextureContentStatus::RecordingFailed};
+    if (!version.savedReady) return {SampledTextureContentStatus::Ready, read->sourceView};
+    const auto description = version.source->GetDesc();
+    for (uint32_t layer = 0; layer < read->layerCount; ++layer) {
+        for (uint32_t mip = read->firstMip; mip < read->firstMip + read->mipCount; ++mip) {
+            if (!version.initialized[mip + layer * description.MipLevels])
+                return {SampledTextureContentStatus::UnsupportedView};
+        }
+    }
+    if (!read->descriptors) {
+        try {
+            auto budget = mcdr::oit_budget::reserve(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, version.budgetLimit);
+            if (!budget) return {SampledTextureContentStatus::BudgetExceeded};
+            D3D12_DESCRIPTOR_HEAP_DESC description{};
+            description.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            description.NumDescriptors = 1;
+            ComPtr<ID3D12DescriptorHeap> descriptors;
+            if (FAILED(gCtx.device->CreateDescriptorHeap(&description, IID_PPV_ARGS(&descriptors))))
+                return {SampledTextureContentStatus::BudgetExceeded};
+            const auto descriptor = descriptors->GetCPUDescriptorHandleForHeapStart();
+            gCtx.device->CreateShaderResourceView(version.saved.resource.Get(), &read->description, descriptor);
+            read->savedView.cpuHandle = descriptor;
+            read->descriptorBudget = std::move(budget);
+            read->descriptors = std::move(descriptors);
+        } catch (const std::bad_alloc&) {
+            return {SampledTextureContentStatus::BudgetExceeded};
+        }
+    }
+    return {SampledTextureContentStatus::Ready, &read->savedView};
+}
+
+int captureSampledTextureContentV1(void* context, void* view, uint64_t totalBudgetBytes,
+    uint64_t* ownerIdentity, uint64_t* ownerGeneration, uint64_t* contentVersion,
+    uint32_t* firstMip, uint32_t* mipCount, uint32_t* firstLayer, uint32_t* layerCount) {
+    if (!ownerIdentity || !ownerGeneration || !contentVersion || !firstMip || !mipCount || !firstLayer || !layerCount)
+        return -1;
+    *ownerIdentity = *ownerGeneration = *contentVersion = 0;
+    *firstMip = *mipCount = *firstLayer = *layerCount = 0;
+    const auto capture = captureSampledTextureContent(context, view, totalBudgetBytes);
+    if (capture.status != SampledTextureContentStatus::Ready || !capture.lease || !capture.ownerIdentity ||
+        capture.contentVersion == 0) return static_cast<int>(capture.status) + 1;
+    *ownerIdentity = reinterpret_cast<uint64_t>(capture.ownerIdentity.get());
+    *ownerGeneration = capture.ownerGeneration;
+    *contentVersion = capture.contentVersion;
+    *firstMip = capture.firstMip;
+    *mipCount = capture.mipCount;
+    *firstLayer = capture.firstLayer;
+    *layerCount = capture.layerCount;
+    return 1;
+}
+
+SampledTextureContentStatus prepareSampledTextureWrite(void* opaqueContext, void* opaqueTexture,
+    uint32_t firstSubresource, uint32_t subresourceCount) {
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    auto* texture = static_cast<Dx12Object*>(opaqueTexture);
+    if (!context || !context->listOpen || !context->commandList || !context->recordingIdentity ||
+        !context->recordingDiscarded || !context->fence || context->fenceValue == UINT64_MAX ||
+        context->submissionFailed.load() || context->recordingFailed.load())
+        return SampledTextureContentStatus::StaleRecording;
+    if (!texture || texture->closeRequested.load(std::memory_order_acquire) ||
+        texture->kind != Dx12Object::Kind::Texture || !texture->resource)
+        return SampledTextureContentStatus::UnsupportedView;
+    std::lock_guard lock(texture->sampledContentMutex);
+    bool changed = false;
+    const auto fail = [&](SampledTextureContentStatus status) {
+        context->recordingFailed.store(true, std::memory_order_release);
+        return changed ? SampledTextureContentStatus::RecordingFailed : status;
+    };
+    if (texture->closeRequested.load(std::memory_order_acquire)) return fail(SampledTextureContentStatus::StaleRecording);
+    const auto total = sampledTextureSubresourceCount(*texture);
+    if (!total || !subresourceCount || firstSubresource >= *total ||
+        subresourceCount > *total - firstSubresource) return fail(SampledTextureContentStatus::UnsupportedView);
+    try {
+        retireTextureWriteRecordings(*texture, context->recordingIdentity);
+        auto owner = std::static_pointer_cast<SampledTextureOwner>(texture->sampledContentOwner.load(std::memory_order_acquire));
+        if (!owner) {
+            const auto status = recordTextureWrite(*texture, *context, firstSubresource, subresourceCount);
+            return status == SampledTextureContentStatus::Ready ? status : fail(status);
+        }
+        if (owner->closed || owner->number == UINT64_MAX) return fail(SampledTextureContentStatus::StaleRecording);
+        uint64_t temporaryLimit = mcdr::oit_budget::limit;
+        size_t conflictCount = 0;
+        for (auto iterator = owner->versions.begin(); iterator != owner->versions.end();) {
+            auto version = iterator->lock();
+            if (!version || sampledVersionCompleted(*version)) {
+                iterator = owner->versions.erase(iterator);
+                continue;
+            }
+            ++iterator;
+            if (version->failed) return fail(SampledTextureContentStatus::RecordingFailed);
+            if (!sampledCoverageOverlaps(*version, firstSubresource, subresourceCount)) continue;
+            if (version->recording != context->recordingIdentity)
+                return fail(SampledTextureContentStatus::OrderingUnavailable);
+            if (version->savedReady) continue;
+            ++conflictCount;
+            temporaryLimit = std::min(temporaryLimit, version->budgetLimit);
+        }
+        auto temporaryBudget = conflictCount == 0 ? std::shared_ptr<mcdr::oit_budget::Reservation>{}
+            : mcdr::oit_budget::reserve(uint64_t(conflictCount) * sizeof(std::shared_ptr<SampledTextureVersion>), temporaryLimit);
+        if (conflictCount != 0 && !temporaryBudget) return fail(SampledTextureContentStatus::BudgetExceeded);
+        std::vector<std::shared_ptr<SampledTextureVersion>> conflicts;
+        conflicts.reserve(conflictCount);
+        for (const auto& weak : owner->versions) {
+            auto version = weak.lock();
+            if (version && !version->savedReady && sampledCoverageOverlaps(*version, firstSubresource, subresourceCount))
+                conflicts.push_back(std::move(version));
+        }
+        for (const auto& version : conflicts) {
+            auto description = version->source->GetDesc();
+            description.Alignment = 0;
+            description.Flags = version->source->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+            description.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            const auto allocation = gCtx.device->GetResourceAllocationInfo(0, 1, &description);
+            if (!allocation.SizeInBytes || allocation.SizeInBytes == UINT64_MAX)
+                return fail(SampledTextureContentStatus::UnsupportedView);
+            version->savedBudget = mcdr::oit_budget::reserve(allocation.SizeInBytes, version->budgetLimit);
+            if (!version->savedBudget) return fail(SampledTextureContentStatus::BudgetExceeded);
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            if (FAILED(gCtx.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &description,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&version->saved.resource))))
+                return fail(SampledTextureContentStatus::BudgetExceeded);
+            version->saved.kind = Dx12Object::Kind::Texture;
+            version->saved.dxgiFormat = texture->dxgiFormat;
+            version->saved.usage = texture->usage;
+            version->saved.texturePlanes = 1;
+            version->saved.packetContentOwner = version;
+        }
+        for (const auto& version : conflicts) {
+            changed = true;
+            for (uint32_t subresource = 0; subresource < version->coverage.size(); ++subresource) {
+                if (!version->coverage[subresource]) continue;
+                const auto sourceState = resourceSubresourceState(context, version->source.Get(),
+                    subresource, D3D12_RESOURCE_STATE_COMMON);
+                if (!transitionResourceRange(context, version->source.Get(), subresource, 1,
+                        sourceState, D3D12_RESOURCE_STATE_COPY_SOURCE)) {
+                    version->failed = true;
+                    return fail(SampledTextureContentStatus::RecordingFailed);
+                }
+                D3D12_TEXTURE_COPY_LOCATION source{};
+                source.pResource = version->source.Get();
+                source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                source.SubresourceIndex = subresource;
+                D3D12_TEXTURE_COPY_LOCATION destination{};
+                destination.pResource = version->saved.resource.Get();
+                destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                destination.SubresourceIndex = subresource;
+                context->commandList->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+                if (!transitionResourceRange(context, version->source.Get(), subresource, 1,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE, sourceState) ||
+                    !transitionResourceRange(context, version->saved.resource.Get(), subresource, 1,
+                        D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)) {
+                    version->failed = true;
+                    return fail(SampledTextureContentStatus::RecordingFailed);
+                }
+                version->initialized[subresource] = 1;
+            }
+            version->savedReady = true;
+        }
+        ++owner->number;
+        const auto status = recordTextureWrite(*texture, *context, firstSubresource, subresourceCount);
+        if (status != SampledTextureContentStatus::Ready) return fail(status);
+        return SampledTextureContentStatus::Ready;
+    } catch (...) {
+        return fail(SampledTextureContentStatus::RecordingFailed);
+    }
+}
+
+SampledTextureCpuWrite prepareSampledTextureCpuWrite(void* opaqueTexture,
+    uint32_t firstSubresource, uint32_t subresourceCount) {
+    auto* texture = static_cast<Dx12Object*>(opaqueTexture);
+    if (!texture || texture->closeRequested.load(std::memory_order_acquire) ||
+        texture->kind != Dx12Object::Kind::Texture || !texture->resource)
+        return {};
+    try {
+        std::unique_lock lock(texture->sampledContentMutex);
+        const auto total = sampledTextureSubresourceCount(*texture);
+        if (texture->closeRequested.load(std::memory_order_acquire) || !total || !subresourceCount ||
+            firstSubresource >= *total || subresourceCount > *total - firstSubresource) return {};
+        retireTextureWriteRecordings(*texture, {});
+        if (!textureWriteOrderingAvailable(*texture, {})) return {SampledTextureContentStatus::OrderingUnavailable};
+        auto owner = std::static_pointer_cast<SampledTextureOwner>(texture->sampledContentOwner.load(std::memory_order_acquire));
+        if (owner) {
+            if (owner->closed || owner->number == UINT64_MAX) return {};
+            for (const auto& weak : owner->versions) {
+                if (const auto version = weak.lock(); version && !sampledVersionCompleted(*version) &&
+                    sampledCoverageOverlaps(*version, firstSubresource, subresourceCount))
+                    return {SampledTextureContentStatus::OrderingUnavailable};
+            }
+        }
+        auto budget = mcdr::oit_budget::reserve(sizeof(SampledTextureCpuWriteLease));
+        if (!budget) return {SampledTextureContentStatus::BudgetExceeded};
+        auto lease = std::make_shared<SampledTextureCpuWriteLease>();
+        lease->budget = std::move(budget);
+        lease->sourceLease = retainObjectLease(texture);
+        lease->lock = std::move(lock);
+        if (owner) ++owner->number;
+        return {SampledTextureContentStatus::Ready, std::move(lease)};
+    } catch (...) {
+        return {SampledTextureContentStatus::BudgetExceeded};
+    }
+}
+
+SampledTextureContentStatus prepareSampledRenderPassWrites(void* opaqueContext) {
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    if (!context || !context->listOpen || !context->commandList || !context->inRenderPass ||
+        context->submissionFailed.load() || context->recordingFailed.load())
+        return SampledTextureContentStatus::StaleRecording;
+    for (auto& range : context->activeAttachmentRanges) {
+        if (range.sampledWritePrepared) continue;
+        if (range.state == D3D12_RESOURCE_STATE_DEPTH_WRITE) {
+            if (range.object != context->activeDepthTarget || range.object->dxgiFormat != DXGI_FORMAT_D32_FLOAT) continue;
+        } else {
+            if (range.state != D3D12_RESOURCE_STATE_RENDER_TARGET) continue;
+            if (range.object != context->additionalColorTarget && range.object != context->activeMotionTarget &&
+                std::find(context->activeColorTargets.begin(), context->activeColorTargets.end(), range.object) ==
+                    context->activeColorTargets.end()) continue;
+            if (context->currentPipeline && context->currentPipeline->colorTargetCount == 0) continue;
+            if (range.object == context->activeMotionTarget && !context->rasterMotionSelected) continue;
+            if (range.object != context->activeMotionTarget && context->currentPipeline &&
+                !context->currentPipeline->rasterMotionWritesWorldColor && range.object != context->additionalColorTarget) continue;
+        }
+        const auto status = prepareSampledTextureWrite(context, range.object, range.firstSubresource, range.subresourceCount);
+        if (status != SampledTextureContentStatus::Ready) return status;
+        range.sampledWritePrepared = true;
+    }
+    return SampledTextureContentStatus::Ready;
+}
+
+std::shared_ptr<const void> retainPacketContent(void* opaqueContext, void* opaqueRanges, uint32_t count) {
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    if (!context || !context->listOpen || !context->commandList || context->submissionFailed.load() || context->recordingFailed.load() ||
+        !context->recordingIdentity || !opaqueRanges || !count) return {};
+    auto content = std::make_shared<PacketContentLease>();
+    const auto* ranges = static_cast<const PacketContentRange*>(opaqueRanges);
+    content->reads.assign(ranges, ranges + count);
+    content->fence = context->fence;
+    content->submission = context->fenceValue + 1;
+    content->recordingIdentity = context->recordingIdentity;
+    for (const auto& range : content->reads) {
+        if (!range.resource || !range.subresourceCount) {
+            content->status = PacketContentStatus::UnsupportedContent;
+            return content;
+        }
+        const auto subresources = resourceSubresourceCount(range.resource.Get());
+        if (!subresources || range.firstSubresource >= *subresources ||
+            range.subresourceCount > *subresources - range.firstSubresource) {
+            content->status = PacketContentStatus::UnsupportedContent;
+            return content;
+        }
+        const auto description = range.resource->GetDesc();
+        if (description.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+            (range.firstSubresource != 0 || range.subresourceCount != 1 || !range.byteLength ||
+                range.byteOffset > description.Width || range.byteLength > description.Width - range.byteOffset ||
+                range.byteLength > UINT64_MAX - 255u || range.byteLength > SIZE_MAX)) {
+            content->status = PacketContentStatus::UnsupportedContent;
+            return content;
+        }
+        if (std::any_of(context->activeAttachmentRanges.begin(), context->activeAttachmentRanges.end(),
+                [&](const auto& attachment) {
+                    return attachment.object && attachment.object->resource == range.resource;
+                })) {
+            content->status = PacketContentStatus::UnsupportedContent;
+            return content;
+        }
+        if (description.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+            (description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || description.SampleDesc.Count != 1 ||
+                *subresources != uint32_t(description.MipLevels) * description.DepthOrArraySize ||
+                !range.object || range.object->kind != Dx12Object::Kind::Texture ||
+                range.object->resource != range.resource || range.cpuWritable ||
+                (description.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                    D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) != 0)) {
+            content->status = PacketContentStatus::UnsupportedContent;
+            return content;
+        }
+        if (!range.immutableOwner) {
+            D3D12_HEAP_PROPERTIES properties{};
+            D3D12_HEAP_FLAGS flags{};
+            if (FAILED(range.resource->GetHeapProperties(&properties, &flags)) ||
+                properties.Type != (range.cpuWritable ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_DEFAULT)) {
+                content->status = PacketContentStatus::UnsupportedContent;
+                return content;
+            }
+        }
+        if (range.view) {
+            const auto* view = range.view;
+            if (view->kind != Dx12Object::Kind::TextureView || !view->hasSrvDesc ||
+                !view->sourceTexture || view->sourceTexture->resource != range.resource) {
+                content->status = PacketContentStatus::UnsupportedContent;
+                return content;
+            }
+            const auto& srv = view->srvDesc;
+            const bool cube = srv.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE;
+            if (!cube && srv.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D) {
+                content->status = PacketContentStatus::UnsupportedContent;
+                return content;
+            }
+            const uint32_t firstMip = cube ? srv.TextureCube.MostDetailedMip : srv.Texture2D.MostDetailedMip;
+            const uint32_t mipCount = cube ? srv.TextureCube.MipLevels : srv.Texture2D.MipLevels;
+            const uint32_t layerCount = cube ? 6u : 1u;
+            if (firstMip >= description.MipLevels || mipCount == 0 ||
+                mipCount > description.MipLevels - firstMip || layerCount > description.DepthOrArraySize ||
+                (!cube && srv.Texture2D.PlaneSlice != 0)) {
+                content->status = PacketContentStatus::UnsupportedContent;
+                return content;
+            }
+            for (uint32_t layer = 0; layer < layerCount; ++layer) {
+                for (uint32_t mip = firstMip; mip < firstMip + mipCount; ++mip) {
+                    const uint32_t subresource = mip + layer * description.MipLevels;
+                    if (std::none_of(content->reads.begin(), content->reads.end(), [&](const auto& read) {
+                            return read.resource == range.resource && read.view == view &&
+                                read.firstSubresource <= subresource &&
+                                subresource - read.firstSubresource < read.subresourceCount;
+                        })) {
+                        content->status = PacketContentStatus::UnsupportedContent;
+                        return content;
+                    }
+                }
+            }
+        }
+    }
+    content->frozenReads.reserve(content->reads.size());
+    auto frozenOwner = std::make_shared<PacketContentObjects>();
+    content->frozenOwner = frozenOwner;
+    const auto makeFrozenObject = [&]() {
+        auto object = std::make_unique<Dx12Object>();
+        object->packetContentOwner = frozenOwner;
+        auto* retained = object.get();
+        frozenOwner->objects.push_back(std::move(object));
+        return retained;
+    };
+    for (const auto& range : content->reads) {
+        const auto existing = std::find_if(content->frozenReads.begin(), content->frozenReads.end(),
+            [&](const auto& frozen) {
+                return frozen.sourceResource == range.resource && frozen.sourceByteOffset == range.byteOffset &&
+                    frozen.byteLength == range.byteLength && frozen.firstSubresource == range.firstSubresource &&
+                    frozen.subresourceCount == range.subresourceCount && frozen.cpuWritable == range.cpuWritable &&
+                    frozen.immutableOwner == range.immutableOwner;
+            });
+        if (existing != content->frozenReads.end()) {
+            auto frozen = *existing;
+            frozen.view = range.view;
+            content->frozenReads.push_back(std::move(frozen));
+            continue;
+        }
+        auto frozenSource = range.resource;
+        if (range.immutableOwner) {
+            auto frozen = range;
+            frozen.sourceResource = frozenSource;
+            frozen.sourceByteOffset = range.byteOffset;
+            content->frozenReads.push_back(std::move(frozen));
+            continue;
+        }
+        ComPtr<ID3D12Resource> frozenResource;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = range.cpuWritable ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_DEFAULT;
+        const auto description = range.resource->GetDesc();
+        const bool texture = description.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER;
+        auto frozenDescription = description;
+        frozenDescription.Alignment = 0;
+        frozenDescription.Flags = D3D12_RESOURCE_FLAG_NONE;
+        if (texture) {
+            const auto shared = std::find_if(content->frozenReads.begin(), content->frozenReads.end(),
+                [&](const auto& frozen) {
+                    return frozen.sourceResource == range.resource && !frozen.immutableOwner;
+                });
+            if (shared != content->frozenReads.end()) {
+                auto frozen = range;
+                frozen.resource = shared->resource;
+                frozen.sourceResource = frozenSource;
+                frozen.object = shared->object;
+                frozen.initialState = D3D12_RESOURCE_STATE_COMMON;
+                content->frozenReads.push_back(std::move(frozen));
+                continue;
+            }
+            frozenDescription.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        } else {
+            frozenDescription.Width = (range.byteLength + 255u) & ~255u;
+        }
+        const auto frozenInitial = range.cpuWritable ? D3D12_RESOURCE_STATE_GENERIC_READ
+            : D3D12_RESOURCE_STATE_COPY_DEST;
+        if (FAILED(gCtx.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &frozenDescription,
+                frozenInitial, nullptr, IID_PPV_ARGS(&frozenResource)))) {
+            content->status = PacketContentStatus::UnsupportedContent;
+            return content;
+        }
+        auto frozen = range;
+        frozen.resource = frozenResource;
+        frozen.sourceResource = frozenSource;
+        frozen.sourceByteOffset = range.byteOffset;
+        frozen.byteOffset = 0;
+        frozen.initialState = range.cpuWritable ? D3D12_RESOURCE_STATE_GENERIC_READ : D3D12_RESOURCE_STATE_COMMON;
+        if (range.cpuWritable) {
+            void* sourceMapped = range.object && range.object->mappedPtr ? range.object->mappedPtr : nullptr;
+            bool unmapSource = false;
+            if (!sourceMapped && SUCCEEDED(range.resource->Map(0, nullptr, &sourceMapped))) unmapSource = true;
+            if (!sourceMapped) {
+                content->status = PacketContentStatus::UnsupportedContent;
+                return content;
+            }
+            void* destinationMapped = nullptr;
+            const D3D12_RANGE readRange{0, 0};
+            if (FAILED(frozenResource->Map(0, &readRange, &destinationMapped))) {
+                if (unmapSource) range.resource->Unmap(0, nullptr);
+                content->status = PacketContentStatus::UnsupportedContent;
+                return content;
+            }
+            std::memcpy(destinationMapped, static_cast<const std::byte*>(sourceMapped) + range.byteOffset,
+                static_cast<size_t>(range.byteLength));
+            frozenResource->Unmap(0, nullptr);
+            if (unmapSource) range.resource->Unmap(0, nullptr);
+        }
+        auto object = makeFrozenObject();
+        object->kind = texture ? Dx12Object::Kind::Texture : Dx12Object::Kind::Buffer;
+        object->resource = frozenResource;
+        object->heapType = heap.Type;
+        object->size = static_cast<long long>(range.byteLength);
+        if (texture) {
+            object->dxgiFormat = range.object->dxgiFormat;
+            object->usage = range.object->usage;
+            object->texturePlanes = 1;
+        }
+        frozen.object = object;
+        content->frozenReads.push_back(std::move(frozen));
+    }
+    std::vector<Dx12Object*> views;
+    for (const auto& range : content->frozenReads) {
+        if (range.view && std::find(views.begin(), views.end(), range.view) == views.end())
+            views.push_back(range.view);
+    }
+    if (!views.empty()) {
+        D3D12_DESCRIPTOR_HEAP_DESC description{};
+        description.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        description.NumDescriptors = static_cast<UINT>(views.size());
+        if (FAILED(gCtx.device->CreateDescriptorHeap(&description, IID_PPV_ARGS(&frozenOwner->descriptors)))) {
+            content->status = PacketContentStatus::UnsupportedContent;
+            return content;
+        }
+        auto descriptor = frozenOwner->descriptors->GetCPUDescriptorHandleForHeapStart();
+        for (auto* sourceView : views) {
+            const auto read = std::find_if(content->frozenReads.begin(), content->frozenReads.end(),
+                [&](const auto& range) { return range.view == sourceView; });
+            if (read == content->frozenReads.end() || !read->object) {
+                content->status = PacketContentStatus::UnsupportedContent;
+                return content;
+            }
+            auto view = makeFrozenObject();
+            view->kind = Dx12Object::Kind::TextureView;
+            view->sourceTexture = read->object;
+            view->srvDesc = sourceView->srvDesc;
+            view->hasSrvDesc = true;
+            view->cpuHandle = descriptor;
+            gCtx.device->CreateShaderResourceView(read->resource.Get(), &view->srvDesc, descriptor);
+            content->frozenViews.push_back({sourceView, view});
+            descriptor.ptr += gCtx.srvInc;
+        }
+    }
+    context->recordingLeases[context->currentListSlot].push_back(content);
+    try {
+        std::vector<std::pair<ID3D12Resource*, uint32_t>> copied;
+        for (const auto& frozen : content->frozenReads) {
+            if (frozen.immutableOwner || frozen.cpuWritable) continue;
+            const bool texture = frozen.resource->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER;
+            for (uint32_t subresource = frozen.firstSubresource;
+                subresource < frozen.firstSubresource + frozen.subresourceCount; ++subresource) {
+                const auto key = std::pair{frozen.resource.Get(), subresource};
+                if (std::find(copied.begin(), copied.end(), key) != copied.end()) continue;
+                copied.push_back(key);
+                const auto& source = content->reads[static_cast<size_t>(&frozen - content->frozenReads.data())];
+                const uint32_t sourceState = resourceSubresourceState(context, frozen.sourceResource.Get(),
+                    subresource, source.initialState);
+                if (!transitionResourceRange(context, frozen.sourceResource.Get(), subresource, 1,
+                        sourceState, D3D12_RESOURCE_STATE_COPY_SOURCE)) {
+                    content->status = PacketContentStatus::StaleRecording;
+                    context->recordingFailed.store(true, std::memory_order_release);
+                    return content;
+                }
+                if (texture) {
+                    D3D12_TEXTURE_COPY_LOCATION sourceLocation{};
+                    sourceLocation.pResource = frozen.sourceResource.Get();
+                    sourceLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    sourceLocation.SubresourceIndex = subresource;
+                    D3D12_TEXTURE_COPY_LOCATION destinationLocation{};
+                    destinationLocation.pResource = frozen.resource.Get();
+                    destinationLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    destinationLocation.SubresourceIndex = subresource;
+                    context->commandList->CopyTextureRegion(&destinationLocation, 0, 0, 0, &sourceLocation, nullptr);
+                } else {
+                    context->commandList->CopyBufferRegion(frozen.resource.Get(), frozen.byteOffset,
+                        frozen.sourceResource.Get(), frozen.sourceByteOffset, frozen.byteLength);
+                }
+                if (!transitionResourceRange(context, frozen.resource.Get(), subresource, 1,
+                        D3D12_RESOURCE_STATE_COPY_DEST, frozen.initialState) ||
+                    !transitionResourceRange(context, frozen.sourceResource.Get(), subresource, 1,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE, sourceState) || context->submissionFailed.load()) {
+                    content->status = PacketContentStatus::StaleRecording;
+                    context->recordingFailed.store(true, std::memory_order_release);
+                    return content;
+                }
+            }
+        }
+    } catch (...) {
+        content->status = PacketContentStatus::StaleRecording;
+        context->recordingFailed.store(true, std::memory_order_release);
+        return content;
+    }
+    content->status = PacketContentStatus::Frozen;
+    return content;
+}
+
+PacketContentStatus packetContentStatus(void* opaqueContext, const std::shared_ptr<const void>& opaqueContent) {
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    auto content = std::static_pointer_cast<const PacketContentLease>(opaqueContent);
+    if (!context || !content || !context->listOpen || context->submissionFailed.load() || context->recordingFailed.load() ||
+        content->recordingIdentity != context->recordingIdentity ||
+        content->fence.Get() != context->fence.Get() || content->submission != context->fenceValue + 1)
+        return PacketContentStatus::StaleRecording;
+    return content->status;
 }
 
 // ---------------------------------------------------------------------------
@@ -2047,77 +3004,12 @@ void unmapBuffer(Dx12Object* buffer) {
 }
 
 // ---------------------------------------------------------------------------
-// 资源层自检：创建 texture/buffer/sampler/view，map 写读验证，再销毁
-// ---------------------------------------------------------------------------
-
-std::string runResourceSelfTest() {
-    if (auto d = ensureDevice(); !d) return "SELF-TEST FAILED: " + errorMessage(d.error());
-
-    // 1) texture: RGBA8_UNORM(6), 64x64, TEXTURE_BINDING|RENDER_ATTACHMENT
-    auto texRes = createTexture(4 | 8, 6, 64, 64, 1, 1);
-    if (!texRes) return "SELF-TEST FAILED: texture - " + errorMessage(texRes.error());
-    Dx12Object* tex = static_cast<Dx12Object*>(*texRes);
-
-    // 2) buffer: VERTEX|COPY_DST|MAP_WRITE, 1024
-    auto bufRes = createBuffer(32 | 8 | 2, 1024);
-    if (!bufRes) {
-        destroyObject(tex);
-        return "SELF-TEST FAILED: buffer - " + errorMessage(bufRes.error());
-    }
-    Dx12Object* buf = static_cast<Dx12Object*>(*bufRes);
-
-    // 3) map 写入并读回验证
-    auto mapRes = mapBuffer(buf, 0, 1024, false, true);
-    if (!mapRes) {
-        destroyObject(buf);
-        destroyObject(tex);
-        return "SELF-TEST FAILED: map - " + errorMessage(mapRes.error());
-    }
-    void* p = *mapRes;
-    memset(p, 0x5A, 1024);
-    bool dataOk =
-        (static_cast<unsigned char*>(p)[0] == 0x5A) && (static_cast<unsigned char*>(p)[1023] == 0x5A);
-    unmapBuffer(buf);
-
-    // 4) sampler: REPEAT/REPEAT, NEAREST/NEAREST, aniso=1, maxLod=16
-    auto samplerRes = createSampler(0, 0, 0, 0, 1, 16.0f);
-    if (!samplerRes) {
-        destroyObject(buf);
-        destroyObject(tex);
-        return "SELF-TEST FAILED: sampler - " + errorMessage(samplerRes.error());
-    }
-    Dx12Object* sampler = static_cast<Dx12Object*>(*samplerRes);
-
-    // 5) texture view
-    auto viewRes = createTextureView(tex, 0, 1);
-    if (!viewRes) {
-        destroyObject(sampler);
-        destroyObject(buf);
-        destroyObject(tex);
-        return "SELF-TEST FAILED: texture view - " + errorMessage(viewRes.error());
-    }
-    Dx12Object* view = static_cast<Dx12Object*>(*viewRes);
-
-    std::string result =
-        "SELF-TEST OK (map write/read " + std::string(dataOk ? "verified" : "MISMATCH") + ")";
-
-    destroyObject(view);
-    destroyObject(sampler);
-    destroyObject(buf);
-    destroyObject(tex);
-    return result;
-}
-
-// ---------------------------------------------------------------------------
 // 命令层（P3）
 // ---------------------------------------------------------------------------
 
 namespace {
 
 // initialStateFor 已在 P2 资源层匿名 namespace 中定义（同一翻译单元内不得重复）。
-// 注意：UPLOAD heap 的 staging buffer 初始态为 GENERIC_READ，但 CopyBuffer/CopyTexture
-// 操作要求源资源必须显式处于 COPY_SOURCE。不能将 GENERIC_READ 视为 COPY_SOURCE 的等价
-// 状态而跳过 barrier——D3D12 Debug Layer 会报 "Before state must be COPY_SOURCE" 错误。
 // from==to 的冗余跳过由 transitionTo/resourceBarrier 内部保护。
 bool needTransition(D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
     if (from == to) return false;
@@ -2200,12 +3092,11 @@ UINT blockSizeFor(DXGI_FORMAT f) {
         case DXGI_FORMAT_R32G32_TYPELESS:
         case DXGI_FORMAT_R32G32_FLOAT:
         case DXGI_FORMAT_R32G32_UINT:
-        case DXGI_FORMAT_R32G32_SINT:
-        case DXGI_FORMAT_D32_FLOAT: return 8;
+        case DXGI_FORMAT_R32G32_SINT: return 8;
         case DXGI_FORMAT_R32_FLOAT:
         case DXGI_FORMAT_R32_UINT:
         case DXGI_FORMAT_R32_SINT:
-        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return 4;
+        case DXGI_FORMAT_D32_FLOAT: return 4;
         case DXGI_FORMAT_R8G8B8A8_TYPELESS:
         case DXGI_FORMAT_R8G8B8A8_UNORM:
         case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
@@ -2228,11 +3119,13 @@ UINT blockSizeFor(DXGI_FORMAT f) {
         case DXGI_FORMAT_R16_UINT:
         case DXGI_FORMAT_R16_SNORM:
         case DXGI_FORMAT_R16_SINT:
+        case DXGI_FORMAT_D16_UNORM:
         case DXGI_FORMAT_R8G8_TYPELESS:
         case DXGI_FORMAT_R8G8_UNORM:
         case DXGI_FORMAT_R8G8_UINT:
         case DXGI_FORMAT_R8G8_SNORM:
         case DXGI_FORMAT_R8G8_SINT: return 2;
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return 8;
         case DXGI_FORMAT_R8_UNORM:
         case DXGI_FORMAT_R8_UINT:
         case DXGI_FORMAT_R8_SNORM:
@@ -2261,6 +3154,53 @@ UINT blockSizeFor(DXGI_FORMAT f) {
         case DXGI_FORMAT_BC7_UNORM_SRGB: return 16;  // 4x4 块
         default: return 4;
     }
+}
+
+bool isDepthStencilFormat(DXGI_FORMAT format) {
+    return format == DXGI_FORMAT_D16_UNORM || format == DXGI_FORMAT_D24_UNORM_S8_UINT
+        || format == DXGI_FORMAT_D32_FLOAT || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+}
+
+UINT alignedPitch(UINT bytes) {
+    return (bytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u)
+        & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
+}
+
+UINT blockWidthFor(DXGI_FORMAT format) {
+    switch (format) {
+        case DXGI_FORMAT_BC1_TYPELESS:
+        case DXGI_FORMAT_BC1_UNORM:
+        case DXGI_FORMAT_BC1_UNORM_SRGB:
+        case DXGI_FORMAT_BC2_TYPELESS:
+        case DXGI_FORMAT_BC2_UNORM:
+        case DXGI_FORMAT_BC2_UNORM_SRGB:
+        case DXGI_FORMAT_BC3_TYPELESS:
+        case DXGI_FORMAT_BC3_UNORM:
+        case DXGI_FORMAT_BC3_UNORM_SRGB:
+        case DXGI_FORMAT_BC4_TYPELESS:
+        case DXGI_FORMAT_BC4_UNORM:
+        case DXGI_FORMAT_BC4_SNORM:
+        case DXGI_FORMAT_BC5_TYPELESS:
+        case DXGI_FORMAT_BC5_UNORM:
+        case DXGI_FORMAT_BC5_SNORM:
+        case DXGI_FORMAT_BC6H_TYPELESS:
+        case DXGI_FORMAT_BC6H_UF16:
+        case DXGI_FORMAT_BC6H_SF16:
+        case DXGI_FORMAT_BC7_TYPELESS:
+        case DXGI_FORMAT_BC7_UNORM:
+        case DXGI_FORMAT_BC7_UNORM_SRGB: return 4;
+        default: return 1;
+    }
+}
+
+UINT64 compactRowBytesFor(DXGI_FORMAT format, UINT width) {
+    const UINT blockWidth = blockWidthFor(format);
+    return ((static_cast<UINT64>(width) + blockWidth - 1) / blockWidth) * blockSizeFor(format);
+}
+
+UINT compactRowsFor(DXGI_FORMAT format, UINT height) {
+    const UINT blockHeight = blockWidthFor(format);
+    return (height + blockHeight - 1) / blockHeight;
 }
 
 // 在指定队列上执行瞬时提交并等待完成（query 读回 / getTimestampNow 用）。
@@ -2307,6 +3247,30 @@ void transitionTo(CommandContext* ctx, ID3D12Resource* res, D3D12_RESOURCE_STATE
                   D3D12_RESOURCE_STATES to) {
     if (!ctx || !res) return;
     auto& m = ctx->resourceState;
+    auto split = ctx->subresourceState.find(res);
+    if (split != ctx->subresourceState.end()) {
+        const auto baseline = m.contains(res) ? m.at(res) : fromInitial;
+        const auto total = resourceSubresourceCount(res);
+        if (!total) {
+            ctx->submissionFailed.store(true, std::memory_order_release);
+            dbgLogError("resource range state reconciliation failed: %s", total.error().message.c_str());
+            return;
+        }
+        for (uint32_t subresource = 0; subresource < *total; ++subresource) {
+            const auto state = split->second.contains(subresource) ? split->second.at(subresource) : baseline;
+            if (state == to) continue;
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = res;
+            barrier.Transition.Subresource = subresource;
+            barrier.Transition.StateBefore = state;
+            barrier.Transition.StateAfter = to;
+            ctx->commandList->ResourceBarrier(1, &barrier);
+        }
+        ctx->subresourceState.erase(split);
+        m[res] = to;
+        return;
+    }
     D3D12_RESOURCE_STATES from;
     auto it = m.find(res);
     if (it != m.end()) {
@@ -2320,20 +3284,96 @@ void transitionTo(CommandContext* ctx, ID3D12Resource* res, D3D12_RESOURCE_STATE
     m[res] = to;
 }
 
-// buffer 按跟踪状态过渡（不回落初始状态）。UPLOAD heap staging buffer 被
-// transition 到 COPY_SOURCE 时，同时记录到 stagingCopySourceResources，
-// 以便 endCommandList 将其回切 GENERIC_READ（而非 COMMON）。
+namespace {
+mcdr::Result<uint32_t> resourceSubresourceCount(ID3D12Resource* resource) {
+    const auto desc = resource->GetDesc();
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return 1u;
+    D3D12_FEATURE_DATA_FORMAT_INFO format{desc.Format, 0};
+    const auto result = gCtx.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &format, sizeof(format));
+    if (FAILED(result) || format.PlaneCount == 0) {
+        return mcdr::err("resourceRange", "could not query texture plane count");
+    }
+    const uint32_t layers = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1u : desc.DepthOrArraySize;
+    const uint64_t count = uint64_t(desc.MipLevels) * layers * format.PlaneCount;
+    if (count == 0 || count > UINT32_MAX) return mcdr::err("resourceRange", "invalid subresource count");
+    return static_cast<uint32_t>(count);
+}
+
+mcdr::Result<void> applyResourceRange(void* rawContext, void* rawResource, uint32_t first,
+                                     uint32_t count, uint32_t initialState, uint32_t targetState,
+                                     bool adopt) {
+    auto* context = static_cast<CommandContext*>(rawContext);
+    auto* resource = static_cast<ID3D12Resource*>(rawResource);
+    if (!context || !context->listOpen || !context->commandList || !resource || !gCtx.device) {
+        return mcdr::err("resourceRange", "an open recording and resource are required");
+    }
+    const auto total = resourceSubresourceCount(resource);
+    if (!total) return std::unexpected(total.error());
+    if (count == 0 || first >= *total || count > *total - first) {
+        return mcdr::err("resourceRange", "subresource range is out of bounds");
+    }
+    const auto initial = static_cast<D3D12_RESOURCE_STATES>(initialState);
+    const auto target = static_cast<D3D12_RESOURCE_STATES>(targetState);
+    auto& uniform = context->resourceState;
+    if (first == 0 && count == *total) {
+        if (adopt) {
+            context->subresourceState.erase(resource);
+            uniform[resource] = target;
+        } else {
+            transitionTo(context, resource, initial, target);
+        }
+        return {};
+    }
+    const auto baseline = uniform.contains(resource) ? uniform.at(resource) : initial;
+    uniform.try_emplace(resource, baseline);
+    auto& states = context->subresourceState[resource];
+    for (uint32_t subresource = first; subresource < first + count; ++subresource) {
+        const auto before = states.contains(subresource) ? states.at(subresource) : baseline;
+        if (!adopt && before != target) {
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = resource;
+            barrier.Transition.Subresource = subresource;
+            barrier.Transition.StateBefore = before;
+            barrier.Transition.StateAfter = target;
+            context->commandList->ResourceBarrier(1, &barrier);
+        }
+        if (target == baseline) states.erase(subresource);
+        else states[subresource] = target;
+    }
+    if (states.empty()) context->subresourceState.erase(resource);
+    return {};
+}
+}
+
+mcdr::Result<void> transitionResourceRange(void* context, void* resource, uint32_t first,
+                                          uint32_t count, uint32_t initialState, uint32_t state) {
+    return applyResourceRange(context, resource, first, count, initialState, state, false);
+}
+
+mcdr::Result<void> adoptResourceRangeState(void* context, void* resource, uint32_t first,
+                                          uint32_t count, uint32_t initialState, uint32_t state) {
+    return applyResourceRange(context, resource, first, count, initialState, state, true);
+}
+
+uint32_t resourceSubresourceState(void* rawContext, void* rawResource, uint32_t subresource,
+                                 uint32_t initialState) {
+    auto* context = static_cast<CommandContext*>(rawContext);
+    auto* resource = static_cast<ID3D12Resource*>(rawResource);
+    if (!context || !resource) return initialState;
+    const auto split = context->subresourceState.find(resource);
+    if (split != context->subresourceState.end()) {
+        const auto state = split->second.find(subresource);
+        if (state != split->second.end()) return static_cast<uint32_t>(state->second);
+    }
+    const auto uniform = context->resourceState.find(resource);
+    return uniform == context->resourceState.end() ? initialState : static_cast<uint32_t>(uniform->second);
+}
+
 void transitionBufferTo(CommandContext* ctx, Dx12Object* buf, D3D12_RESOURCE_STATES to) {
     if (!buf || !buf->resource) return;
+    if (buf->heapType == D3D12_HEAP_TYPE_UPLOAD || buf->heapType == D3D12_HEAP_TYPE_READBACK) return;
     transitionTo(ctx, buf->resource.Get(), initialStateFor(buf->heapType), to);
-    // 记录 staging buffer 的 COPY_SOURCE 状态，供 endCommandList 回切到 GENERIC_READ。
-    if (buf->heapType == D3D12_HEAP_TYPE_UPLOAD && to == D3D12_RESOURCE_STATE_COPY_SOURCE) {
-        auto& m = ctx->resourceState;
-        auto it = m.find(buf->resource.Get());
-        if (it != m.end() && it->second == D3D12_RESOURCE_STATE_COPY_SOURCE) {
-            ctx->stagingCopySourceResources.insert(buf->resource.Get());
-        }
-    }
 }
 
 // texture 按跟踪状态过渡（初始锚点 COMMON；不回落 COMMON）。
@@ -2345,41 +3385,83 @@ void transitionTextureTo(CommandContext* ctx, Dx12Object* tex, D3D12_RESOURCE_ST
 // 阻塞等待 GPU 队列空闲：Signal 新 fence 并等待其完成。
 // 用于销毁 swapchain/设备前，确保 backbuffer 等资源不再被 GPU 使用。
 // 等待有界（5s）：队列卡住时返回错误，避免销毁路径无限挂起。
+namespace {
+
+mcdr::Result<void> textureSubresourceRanges(std::vector<GraphicsResourceRange>& ranges,
+    Dx12Object* texture, uint32_t firstMip, uint32_t mipCount, uint32_t firstLayer,
+    uint32_t layerCount, uint32_t firstPlane, uint32_t planeCount, uint32_t state) {
+    if (!texture || texture->kind != Dx12Object::Kind::Texture || !texture->resource) {
+        return mcdr::err("graphicsRange", "texture resource is invalid");
+    }
+    const auto description = texture->resource->GetDesc();
+    const uint32_t layers = description.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+        ? 1u : description.DepthOrArraySize;
+    if (texture->texturePlanes == 0) {
+        const auto total = resourceSubresourceCount(texture->resource.Get());
+        if (!total) return std::unexpected(total.error());
+        texture->texturePlanes = *total / (uint32_t(description.MipLevels) * layers);
+    }
+    const uint32_t planes = texture->texturePlanes;
+    if (mipCount == 0 || firstMip >= description.MipLevels || mipCount > description.MipLevels - firstMip ||
+        layerCount == 0 || firstLayer >= layers || layerCount > layers - firstLayer ||
+        planeCount == 0 || firstPlane >= planes || planeCount > planes - firstPlane) {
+        return mcdr::err("graphicsRange", "texture subresource range is invalid");
+    }
+    for (uint32_t plane = firstPlane; plane < firstPlane + planeCount; ++plane) {
+        for (uint32_t layer = firstLayer; layer < firstLayer + layerCount; ++layer) {
+            ranges.push_back({texture, firstMip + layer * description.MipLevels +
+                plane * description.MipLevels * layers, mipCount, state});
+        }
+    }
+    return {};
+}
+
+mcdr::Result<void> addAttachmentRanges(CommandContext* context, Dx12Object* texture, int mip,
+                                      uint32_t state, bool depth) {
+    const auto description = texture->resource->GetDesc();
+    if (description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || description.SampleDesc.Count != 1) {
+        return mcdr::err("graphicsRange", "attachment dimension is unsupported");
+    }
+    const auto total = resourceSubresourceCount(texture->resource.Get());
+    if (!total) return std::unexpected(total.error());
+    const uint32_t planes = depth ? *total / (uint32_t(description.MipLevels) * description.DepthOrArraySize) : 1u;
+    return textureSubresourceRanges(context->activeAttachmentRanges, texture,
+        static_cast<uint32_t>(std::clamp(mip, 0, int(description.MipLevels) - 1)), 1,
+        0, description.DepthOrArraySize, 0, planes, state);
+}
+
+mcdr::Result<void> transitionAttachmentRanges(CommandContext* context, Dx12Object* only,
+                                              bool finish) {
+    for (const auto& range : context->activeAttachmentRanges) {
+        if (only && range.object != only) continue;
+        const auto result = transitionResourceRange(context, range.object->resource.Get(),
+            range.firstSubresource, range.subresourceCount, D3D12_RESOURCE_STATE_COMMON,
+            finish ? D3D12_RESOURCE_STATE_COMMON : range.state);
+        if (!result) return result;
+    }
+    return {};
+}
+
+}
+
 mcdr::Result<void> deviceWaitIdle() {
     if (!gCtx.device || !gCtx.queue) {
         return mcdr::err("deviceWaitIdle", "deviceWaitIdle: device not initialized");
     }
-    dbgLogDebug("deviceWaitIdle: enter");
-    // 关键：先读当前已完成值，再信号一个绝对高于它的值。
-    // 原逻辑 fv = ++gCtx.queueFenceValue 存在竞态——若 GPU 已处理到更高的 fence
-    // 值（Java 线程在 awaitCompletion 后提交更多帧），fv 会低于已完成值，
-    // GetCompletedValue() >= fv 导致 while 循环立即退出，后续 ResizeBuffers
-    // 看到 DWM 仍持有 backbuffer 引用而失败（DXGI_ERROR_INVALID_CALL）。
-    UINT64 cv = gCtx.queueFence->GetCompletedValue();
-    UINT64 fv = cv + 1;
-    // 防御：若 fv 已等于或超过 queueFenceValue（说明有并发提交更新了计数器），
-    // 继续递增直到 fv > queueFenceValue，保证我们等待的值是尚未被 GPU 处理过的。
-    while (fv <= gCtx.queueFenceValue) {
-        ++fv;
-    }
-    if (FAILED(gCtx.queue->Signal(gCtx.queueFence.Get(), fv))) {
-        return mcdr::err("deviceWaitIdle", "deviceWaitIdle: Signal failed");
-    }
-    HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!evt) {
-        return mcdr::err("deviceWaitIdle", "deviceWaitIdle: CreateEvent failed");
-    }
-    while (gCtx.queueFence->GetCompletedValue() < fv) {
-        gCtx.queueFence->SetEventOnCompletion(fv, evt);
-        if (WaitForSingleObject(evt, 5000) != WAIT_OBJECT_0) {
-            CloseHandle(evt);
-            dbgLogError("deviceWaitIdle: TIMEOUT (queue stalled)");
-            return mcdr::err("deviceWaitIdle", "deviceWaitIdle: timed out waiting for queue completion");
+    UINT64 fenceValue = 0;
+    {
+        std::lock_guard<std::mutex> queueLock(gQueueSubmissionMutex);
+        const UINT64 completed = gCtx.queueFence->GetCompletedValue();
+        if (completed == UINT64_MAX || gCtx.queueFenceValue >= UINT64_MAX - 1) {
+            return mcdr::err("deviceWaitIdle", "deviceWaitIdle: device removed or fence exhausted");
+        }
+        fenceValue = (std::max)(completed, gCtx.queueFenceValue) + 1;
+        gCtx.queueFenceValue = fenceValue;
+        if (FAILED(gCtx.queue->Signal(gCtx.queueFence.Get(), fenceValue))) {
+            return mcdr::err("deviceWaitIdle", "deviceWaitIdle: Signal failed");
         }
     }
-    CloseHandle(evt);
-    dbgLogDebug("deviceWaitIdle: done (waited for fv=%llu)", static_cast<unsigned long long>(fv));
-    return {};
+    return waitForQueueFenceValue(fenceValue, 5'000'000'000ULL);
 }
 
 mcdr::Result<void*> createCommandEncoder() {
@@ -2411,12 +3493,31 @@ mcdr::Result<void*> createCommandEncoder() {
     if (!ctx->fenceEvent) {
         return mcdr::err("createCommandEncoder", "createCommandEncoder: CreateEvent failed");
     }
+    {
+        std::lock_guard<std::mutex> lock(gRecordingContextsMutex);
+        for (const auto& list : ctx->commandLists) gRecordingContexts.emplace(list.Get(), ctx.get());
+    }
     dbgLogInfo("createCommandEncoder: done ctx=%p", reinterpret_cast<void*>(ctx.get()));
     return static_cast<void*>(ctx.release());
 }
 
-void destroyCommandEncoder(CommandContext* ctx) {
-    if (!ctx) return;
+int validateCommandContextControl(void* opaqueContext) noexcept {
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    if (!context || !context->commandList) return static_cast<int>(CommandContextControlStatus::Invalid);
+    if (context->submissionFailed.load()) return static_cast<int>(CommandContextControlStatus::SubmissionUnknown);
+    if (context->inRenderPass || gAsyncRenderCtx.load(std::memory_order_acquire) == context)
+        return static_cast<int>(CommandContextControlStatus::Busy);
+    return static_cast<int>(CommandContextControlStatus::Ready);
+}
+
+int destroyCommandEncoderChecked(CommandContext* ctx) {
+    if (!ctx) return MCDR_COMMAND_DESTROY_INVALID;
+    std::lock_guard submissionLock(gAsyncSubmissionMutex);
+    if (ctx->submissionFailed.load(std::memory_order_acquire)) return MCDR_COMMAND_DESTROY_SUBMISSION_UNKNOWN;
+    if (gAsyncRenderCtx.load(std::memory_order_acquire) == ctx) return MCDR_COMMAND_DESTROY_OWNERSHIP_PENDING;
+    if (fgDisplayFrameQueued(ctx) && !waitForPendingPresents(2000))
+        return MCDR_COMMAND_DESTROY_OWNERSHIP_PENDING;
+    fgAbortDisplayFrame(ctx);
     DBG_LOG_DEBUG("destroyCommandEncoder: enter fenceValue=%llu", (unsigned long long)ctx->fenceValue);
     // 该 ctx 可能仍有未执行的已提交命令（如 createBuffer(data) 的 submit 后
     // 立即 close）；先等它全部完成再销毁 allocator，否则 GPU 在使用已释放的
@@ -2425,6 +3526,8 @@ void destroyCommandEncoder(CommandContext* ctx) {
         auto w = waitForFenceValue(ctx, ctx->fenceValue, 5000000000ULL);
         if (!w) {
             dbgLogError("destroyCommandEncoder: wait FAILED: %s", errorMessage(w.error()).c_str());
+            return gCtx.device && SUCCEEDED(gCtx.device->GetDeviceRemovedReason())
+                ? MCDR_COMMAND_DESTROY_OWNERSHIP_PENDING : MCDR_COMMAND_DESTROY_SUBMISSION_UNKNOWN;
         }
     }
     // 若该 ctx 仍处于打开（begin 后从未 submit）状态：命令列表即将销毁，
@@ -2437,13 +3540,40 @@ void destroyCommandEncoder(CommandContext* ctx) {
         if (gOpenListCount == 0) flushPendingDeletes();
     }
     if (ctx->fenceEvent) CloseHandle(ctx->fenceEvent);
+    {
+        std::lock_guard<std::mutex> lock(gRecordingContextsMutex);
+        for (const auto& list : ctx->commandLists) gRecordingContexts.erase(list.Get());
+    }
+    ctx->commandList = nullptr;
+    for (auto& list : ctx->commandLists) list.Reset();
+    if (ctx->recordingDiscarded) ctx->recordingDiscarded->store(true, std::memory_order_release);
     delete ctx;
     dbgLogInfo("destroyCommandEncoder: done ctx=%p", reinterpret_cast<void*>(ctx));
+    return MCDR_COMMAND_DESTROY_DESTROYED;
+}
+
+void destroyCommandEncoder(CommandContext* ctx) {
+    if (!ctx) return;
+    const int result = destroyCommandEncoderChecked(ctx);
+    if (result != MCDR_COMMAND_DESTROY_DESTROYED)
+        dbgLogError("destroyCommandEncoder: retained context, outcome=%d", result);
+}
+
+int commandRecordingStatus(void* opaqueContext) noexcept {
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    if (!context || !context->commandList) return MCDR_COMMAND_OUTCOME_INVALID;
+    if (context->submissionFailed.load(std::memory_order_acquire)) return MCDR_COMMAND_OUTCOME_SUBMISSION_UNKNOWN;
+    if (gAsyncRenderCtx.load(std::memory_order_acquire) == context) return MCDR_COMMAND_OUTCOME_OWNERSHIP_PENDING;
+    return context->recordingFailed.load(std::memory_order_acquire)
+        ? MCDR_COMMAND_OUTCOME_RECORDING_REJECTED : MCDR_COMMAND_OUTCOME_READY;
 }
 
 mcdr::Result<void> beginCommandList(CommandContext* ctx) {
     if (!ctx) {
         return mcdr::err("beginCommandList", "beginCommandList: null ctx");
+    }
+    if (gAsyncRenderCtx.load(std::memory_order_acquire) == ctx || ctx->submissionFailed) {
+        return mcdr::err("beginCommandList", "beginCommandList: command ownership remains active");
     }
     // P33 fix：若列表已打开（构造函数或先前调用已打开），幂等返回——不再 Reset
     // 同一 allocator，避免 E_FAIL（allocator 仍在 GPU 使用中）。
@@ -2619,7 +3749,11 @@ int setShadingRateNow(CommandContext* ctx, int rate) {
         dbgLogWarn("VRS: setShadingRateNow(%s) without an open command list; ignored", shadingRateName(rate));
         return -2;
     }
-    return issueShadingRate(ctx->commandList, rate) ? 1 : 0;
+    if (!issueShadingRate(ctx->commandList, rate)) return 0;
+    ctx->recordedShadingRate = static_cast<D3D12_SHADING_RATE>(rate);
+    ctx->recordedShadingCombiners[0] = static_cast<D3D12_SHADING_RATE_COMBINER>(gCtx.shadingRateCombiner0);
+    ctx->recordedShadingCombiners[1] = static_cast<D3D12_SHADING_RATE_COMBINER>(gCtx.shadingRateCombiner1);
+    return 1;
 }
 
 int setShadingRateCombiners(int first, int second) {
@@ -2643,6 +3777,10 @@ mcdr::Result<void> beginCommandListWithWait(CommandContext* ctx, UINT64 waitForV
     if (!ctx) {
         return mcdr::err("beginCommandListWithWait", "beginCommandListWithWait: null ctx");
     }
+    if (gAsyncRenderCtx.load(std::memory_order_acquire) == ctx || ctx->submissionFailed) {
+        return mcdr::err("beginCommandListWithWait", "beginCommandListWithWait: command ownership remains active");
+    }
+    waitForValue = (std::max)(waitForValue, ctx->slotFence[ctx->currentListSlot]);
     // P6 诊断：转储上一帧累积的验证错误（Close 成功后不打印不代表无错）。
     if (nativeLogLevel() >= 3) dumpInfoQueueMessages();
     DBG_LOG_DEBUG("beginCommandListWithWait: fenceValue=%llu waitValue=%llu",
@@ -2662,12 +3800,6 @@ mcdr::Result<void> beginCommandListWithWait(CommandContext* ctx, UINT64 waitForV
         dbgLogDebug("beginCommandListWithWait: checking qf=%llu cv=%llu qfVal=%llu",
                     static_cast<unsigned long long>(waitForValue), cv,
                     static_cast<unsigned long long>(gCtx.queueFenceValue));
-        auto wq = waitForQueueFenceValue(waitForValue, 5'000'000'000ULL);
-        if (!wq) {
-            dbgLogError("beginCommandListWithWait: wait FAILED: %s", errorMessage(wq.error()).c_str());
-            return mcdr::err("beginCommandListWithWait", errorMessage(wq.error()));
-        }
-        dbgLogDebug("beginCommandListWithWait: wait done");
     }
     // P40：等待 per-command-list fence 完成，确保 GPU 已实际执行完引用该
     // allocator 的所有命令，再 Reset——避免 allocator->Reset() 内部 hang。
@@ -2681,7 +3813,10 @@ mcdr::Result<void> beginCommandListWithWait(CommandContext* ctx, UINT64 waitForV
         dbgLogDebug("beginCommandListWithWait: per-list fence wait done val=%llu",
                     static_cast<unsigned long long>(waitForValue));
     }
+    auto recordingDiscarded = std::make_shared<std::atomic<bool>>(false);
+    std::shared_ptr<const void> recordingIdentity = recordingDiscarded;
     dbgLogDebug("beginCommandListWithWait: begin allocator reset");
+    ctx->controlIdentity.reset();
     HRESULT hr = ctx->currentAllocator()->Reset();
     if (FAILED(hr)) {
         return mcdr::err("beginCommandListWithWait", "beginCommandListWithWait: allocator Reset " + formatBackendResult(hr));
@@ -2693,12 +3828,35 @@ mcdr::Result<void> beginCommandListWithWait(CommandContext* ctx, UINT64 waitForV
         return mcdr::err("beginCommandListWithWait", "beginCommandListWithWait: list Reset " + formatBackendResult(hr));
     }
     dbgLogDebug("beginCommandListWithWait: list reset ok");
+    if (ctx->recordingDiscarded) ctx->recordingDiscarded->store(true, std::memory_order_release);
+    ctx->recordingLeases[ctx->currentListSlot].clear();
+    ctx->recordingIdentity = std::move(recordingIdentity);
+    ctx->recordingDiscarded = std::move(recordingDiscarded);
+    ctx->recordingFailed.store(false, std::memory_order_release);
+    ctx->graphicsCommandObserver = {};
+    ctx->retainedGraphicsPipelines.clear();
+    ctx->retainedRecordingObjects.clear();
+    ctx->resourceDrawHeap.Reset();
+    ctx->resourceDrawCapacity = 0;
+    ctx->resourceComputeHeap.Reset();
+    ctx->resourceComputeCapacity = 0;
+    ctx->resourceComputeNext = 0;
     // P231：这里**不再**重放玩家档位。Reset 之后列表就是 D3D12 默认的 1X1，只有 Java 侧的
     // scope（setShadingRateNow）才会把某一批绘制改粗 —— 否则天空、粒子、GUI 会跟着一起变粗
     // （P97 的行为，P232 修掉）。
     dbgLogDebug("beginCommandListWithWait: pre-increment ctx=%p", reinterpret_cast<void*>(ctx));
     ctx->listOpen = 1;
     ctx->inRenderPass = 0;
+    ctx->activePassRtvs.clear();
+    ctx->activePassDsv = {};
+    ctx->activeMotionRtv = {};
+    ctx->activeMotionTarget = nullptr;
+    ctx->rasterMotionSelected = false;
+    ctx->activePassBoundColorCount = UINT_MAX;
+    ctx->rasterMotionWorldColor = nullptr;
+    ctx->rasterMotionWorldDepth = nullptr;
+    ctx->rasterMotionTarget = nullptr;
+    ctx->rasterMotionLeases.clear();
     ctx->colorTargetsWritten = false;  // 新 command list 从零开始追踪绘制状态
     ++gOpenListCount;  // 延迟销毁：登记打开计数，submit 完成前不释放资源
     dbgLogDebug("beginCommandListWithWait: post-increment openList=%d ctx=%p", gOpenListCount,
@@ -2706,6 +3864,7 @@ mcdr::Result<void> beginCommandListWithWait(CommandContext* ctx, UINT64 waitForV
     // submit 阻塞等待 GPU 完成（见 submitCommandList），此处清空 resourceState
     // 后一切资源视为初始态是正确且保守的（D3D12 驱动会按实际 GPU 状态纠正）。
     ctx->resourceState.clear();
+    ctx->subresourceState.clear();
     // P20 fix：使用 4 个半区（ring x4）确保三帧飞行时安全交替。
     // fenceValue % 4 保证帧 N+2 写入的半区 ≠ 帧 N/N+1 GPU 正在读的半区。
     ctx->drawHeapSlotBase = static_cast<UINT>(ctx->fenceValue % kDrawHeapSections) * kDrawHeapPerFrame;
@@ -2713,6 +3872,7 @@ mcdr::Result<void> beginCommandListWithWait(CommandContext* ctx, UINT64 waitForV
     // P243：新列表 ⇒ 段内槽位从头分配，上一列表的 SRV 复用缓存作废。
     ctx->lastSrvSlotOffset = 0;
     ctx->lastSrvCount = 0;
+    ctx->lastSrvCbvCount = 0;
     ctx->lastSrvViews.clear();
     // RTV/DSV 是 CPU-only 描述符堆：命令列表提交时驱动已捕获描述符内容，
     // 双 allocator + value-2 完成等待保证旧命令已结束，可每帧从 0 复用。
@@ -2728,17 +3888,34 @@ mcdr::Result<void> beginCommandListWithWait(CommandContext* ctx, UINT64 waitForV
     ctx->rtvCache.clear();
     ctx->dsvCache.clear();
     ctx->cachedPso = nullptr;
-    ID3D12DescriptorHeap* drawHeaps[] = {gCtx.drawHeap.Get()};
+    ctx->currentPipeline = nullptr;
+    invalidateGraphicsInputBindings(ctx, true);
+    ctx->graphicsDrawState = {};
+    ctx->graphicsInputRanges.clear();
+    ctx->recordedShadingRate = D3D12_SHADING_RATE_1X1;
+    ctx->recordedShadingCombiners[0] = D3D12_SHADING_RATE_COMBINER_PASSTHROUGH;
+    ctx->recordedShadingCombiners[1] = D3D12_SHADING_RATE_COMBINER_PASSTHROUGH;
+    ctx->shadingRateImageBound = nullptr;
+    ctx->captureShadingRate = {};
+    ctx->graphicsCapture = {};
+    ctx->oitFrameState.reset();
+    ctx->activeAttachmentRanges.clear();
+    ID3D12DescriptorHeap* drawHeaps[] = {ctx->resourceDrawHeap ? ctx->resourceDrawHeap.Get() : gCtx.drawHeap.Get()};
     ctx->commandList->SetDescriptorHeaps(1, drawHeaps);
     return {};
 }
 
 void restoreDrawHeap(CommandContext* ctx) {
-    if (ctx == nullptr || ctx->commandList == nullptr || gCtx.drawHeap == nullptr) {
+    if (ctx == nullptr || ctx->commandList == nullptr || (!ctx->resourceDrawHeap && !gCtx.drawHeap)) {
         return;
     }
-    ID3D12DescriptorHeap* drawHeaps[] = {gCtx.drawHeap.Get()};
+    ID3D12DescriptorHeap* drawHeaps[] = {ctx->resourceDrawHeap ? ctx->resourceDrawHeap.Get() : gCtx.drawHeap.Get()};
     ctx->commandList->SetDescriptorHeaps(1, drawHeaps);
+    ctx->cachedPso = nullptr;
+    ctx->lastSrvCount = 0;
+    ctx->lastSrvCbvCount = 0;
+    ctx->lastSrvViews.clear();
+    invalidateGraphicsInputBindings(ctx, false);
 }
 
 mcdr::Result<void> endCommandList(CommandContext* ctx) {
@@ -2746,6 +3923,11 @@ mcdr::Result<void> endCommandList(CommandContext* ctx) {
         return mcdr::err("endCommandList", "endCommandList: null ctx");
     }
     if (!ctx->listOpen) return {};  // 幂等
+    while (!ctx->subresourceState.empty()) {
+        auto* resource = ctx->subresourceState.begin()->first;
+        const auto baseline = ctx->resourceState.at(resource);
+        transitionTo(ctx, resource, baseline, baseline);
+    }
     // 采样纹理在本 list 内被 transition 到 SHADER_RESOURCE 后，命令列表结束时
     // 必须回切 COMMON，保持"列表结束一切资源回 COMMON"的约定。否则下一
     // command list 在 beginCommandList 清空 resourceState 后按 COMMON 写 Before
@@ -2764,16 +3946,8 @@ mcdr::Result<void> endCommandList(CommandContext* ctx) {
     // copy 操作（copyBufferToBuffer 等）会把源/目的缓冲区留在 COPY_SOURCE /
     // COPY_DEST；若不清理，下一帧 beginCommandList 清空 resourceState 后
     // 按 INITIAL 写 Before，GPU 实际仍在 COPY_SOURCE/COPY_DEST → 验证 ERROR。
-    //
-    // UPLOAD heap staging buffer（COPY_SOURCE）必须回切 GENERIC_READ（初始态），
-    // 因为 beginCommandList 以 GENERIC_READ 为假设值。其他 COPY_SOURCE/COPY_DEST
-    // 资源回切 COMMON。
     for (auto it = ctx->resourceState.begin(); it != ctx->resourceState.end();) {
         D3D12_RESOURCE_STATES target = D3D12_RESOURCE_STATE_COMMON;
-        if (it->second == D3D12_RESOURCE_STATE_COPY_SOURCE
-            && ctx->stagingCopySourceResources.count(it->first)) {
-            target = D3D12_RESOURCE_STATE_GENERIC_READ;
-        }
         if (it->second == target) {
             it = ctx->resourceState.erase(it);
         } else {
@@ -2781,9 +3955,9 @@ mcdr::Result<void> endCommandList(CommandContext* ctx) {
             it = ctx->resourceState.erase(it);
         }
     }
-    ctx->stagingCopySourceResources.clear();
     HRESULT hr = ctx->commandList->Close();
     if (FAILED(hr)) {
+        fgAbortDisplayFrame(ctx);
         // P6 诊断：Close 返回 E_INVALIDARG 通常是 debug layer 的验证错误
         // （UPLOAD heap 非法 transition、未绑定/越界描述符、root 参数未设置、
         // PSO 与 root signature 不匹配等）。附加 InfoQueue 最近消息定位具体
@@ -2850,15 +4024,27 @@ static void logMemoryClass(uint64_t frame) {
                    static_cast<unsigned long long>(frame), privMB, wsMB);
     }
 }
-mcdr::Result<UINT64> submitCommandList(CommandContext* ctx) {
+namespace {
+mcdr::Result<UINT64> submitRecordedCommandList(CommandContext* ctx) {
     if (!ctx) {
         return mcdr::err("submitCommandList", "submitCommandList: null ctx");
+    }
+    if (ctx->submissionFailed) {
+        invalidatePreparedReconstructionHistory();
+        fgAbortDisplayFrame(ctx);
+        return mcdr::err("submitCommandList", "submitCommandList: previous submission failed");
+    }
+    if (ctx->recordingFailed.load(std::memory_order_acquire)) {
+        invalidatePreparedReconstructionHistory();
+        fgAbortDisplayFrame(ctx);
+        return mcdr::err("submitCommandList", "submitCommandList: recording failed; discard the command list");
     }
     // P33 fix：命令列表未打开说明本帧没有任何录制内容。此时若仍执行
     // ExecuteCommandLists，会把**上一条已提交的命令列表**再执行一遍
     // （D3D12 中重复执行同一条 list 是合法的，但会重复写入同一批资源）。
     // 这里按“空帧”处理：不执行，但仍返回本 ctx 已经 Signal 过的 fence 值，让调用方继续。
     if (!ctx->listOpen) {
+        fgAbortDisplayFrame(ctx);
         // 空帧很常见（加载屏、纯 UI 帧），不往控制台打，调试级留一行即可。
         dbgLogDebug("submitCommandList: no open list — skip execute (empty frame) ctx=%p",
                     reinterpret_cast<void*>(ctx));
@@ -2868,6 +4054,12 @@ mcdr::Result<UINT64> submitCommandList(CommandContext* ctx) {
         return ctx->fenceValue;
     }
     if (auto e = endCommandList(ctx); !e) {
+        if (gCtx.device && FAILED(gCtx.device->GetDeviceRemovedReason()))
+            ctx->submissionFailed.store(true, std::memory_order_release);
+        else
+            ctx->recordingFailed.store(true, std::memory_order_release);
+        invalidatePreparedReconstructionHistory();
+        fgAbortDisplayFrame(ctx);
         return mcdr::err("submitCommandList", errorMessage(e.error()));
     }
     UINT64 value = ctx->fenceValue + 1;
@@ -2876,6 +4068,8 @@ mcdr::Result<UINT64> submitCommandList(CommandContext* ctx) {
     }
     DBG_LOG_DEBUG("submit: ExecuteCommandLists enter (v->%llu)", (unsigned long long)value);
     ID3D12CommandList* lists[] = {ctx->commandList};
+    ctx->submissionFailed = true;
+    ctx->recordingDiscarded.reset();
     gCtx.queue->ExecuteCommandLists(1, lists);
     value = ++ctx->fenceValue;
     // P55：记录本槽位（currentListSlot）最后一次提交的 per-list fence，供 3 帧后
@@ -2883,6 +4077,8 @@ mcdr::Result<UINT64> submitCommandList(CommandContext* ctx) {
     ctx->slotFence[ctx->currentListSlot] = value;
     DBG_LOG_DEBUG("submit: executed, Signal v=%llu", (unsigned long long)value);
     if (FAILED(gCtx.queue->Signal(ctx->fence.Get(), value))) {
+        invalidatePreparedReconstructionHistory();
+        fgAbortDisplayFrame(ctx);
         return mcdr::err("submitCommandList", "submitCommandList: Signal failed");
     }
     // 全局队列 fence 同步推进：只服务于 surface / present 记账（surfaceFences、
@@ -2892,6 +4088,8 @@ mcdr::Result<UINT64> submitCommandList(CommandContext* ctx) {
     {
         UINT64 qv = ++gCtx.queueFenceValue;
         if (FAILED(gCtx.queue->Signal(gCtx.queueFence.Get(), qv))) {
+            invalidatePreparedReconstructionHistory();
+            fgAbortDisplayFrame(ctx);
             return mcdr::err("submitCommandList", "submitCommandList: Signal(queue) failed");
         }
         // P33 async：记录本次 submit 的 queue fence 值，供 beginCommandListWithWait
@@ -2905,20 +4103,10 @@ mcdr::Result<UINT64> submitCommandList(CommandContext* ctx) {
                     static_cast<unsigned long long>(gCtx.queueFenceValue),
                     static_cast<unsigned long long>(ctx->lastSubmitQueueFence));
     }
-    // P18：记录 per-backbuffer fence 值，供 acquireSurface 按需同步（非阻塞）。
-    // submit 本身不等待 GPU，改为在 acquireSurface 中检查重用的 back buffer
-    // 是否仍被 GPU 使用（上次 blit 未完成时等待），避免渲染线程阻塞导致鼠标卡顿。
-    Dx12Surface* s = getActiveSurface();
-    if (s) {
-        int idx = s->currentImageIndex;
-        if (idx >= 0 && idx < static_cast<int>(kSurfaceBufferCount)) {
-            if (s->surfaceFences.size() < static_cast<size_t>(kSurfaceBufferCount))
-                s->surfaceFences.resize(kSurfaceBufferCount, 0);
-            s->surfaceFences[static_cast<size_t>(idx)] = gCtx.queueFenceValue;
-        }
-    }
     DBG_LOG_DEBUG("submit: done v=%llu qf=%llu", (unsigned long long)value,
                   (unsigned long long)gCtx.queueFenceValue);
+    ctx->submissionFailed = false;
+    fgNoteRecordingSubmitted(ctx, value);
     // 提交并同步等待完成：本命令列表已执行完，其引用的资源可安全释放。
     // 注意：flushPendingDeletes() 不在 submit 时调用，而是延迟到渲染线程
     // presentSurface + present fence signal 之后执行，确保 GPU 工作（含 display
@@ -2930,27 +4118,85 @@ mcdr::Result<UINT64> submitCommandList(CommandContext* ctx) {
     // 目标值属于同一条 per-ctx 时间线，因此一次性 encoder 的提交不会推进帧 encoder 的 token。
     return value;
 }
+}
+
+mcdr::Result<UINT64> submitCommandList(CommandContext* ctx) {
+    std::lock_guard<std::mutex> queueLock(gQueueSubmissionMutex);
+    if (!ctx || !ctx->listOpen) return submitRecordedCommandList(ctx);
+    const auto submitted = submitRecordedCommandList(ctx);
+    if (!submitted) return submitted;
+    auto* surface = getActiveSurface();
+    if (surface) {
+        const int index = surface->currentImageIndex;
+        if (index >= 0 && index < static_cast<int>(kSurfaceBufferCount)) {
+            if (surface->surfaceFences.size() < static_cast<size_t>(kSurfaceBufferCount))
+                surface->surfaceFences.resize(kSurfaceBufferCount, 0);
+            surface->surfaceFences[static_cast<size_t>(index)] = ctx->lastSubmitQueueFence;
+        }
+    }
+    const auto queued = fgQueueDisplayFrame(ctx, *submitted);
+    if (!queued) {
+        fgAbortDisplayFrame(ctx);
+        return mcdr::err("submitCommandList", errorMessage(queued.error()));
+    }
+    const auto ticket = *queued;
+    if (surface && surface->blittedThisFrame.load(std::memory_order_acquire) && ticket.serial != 0)
+        surface->frameGenerationTicket = ticket;
+    return submitted;
+}
+
+int submitCommandListV1(CommandContext* context, uint64_t* submittedFence) {
+    if (!submittedFence) return MCDR_COMMAND_OUTCOME_INVALID;
+    *submittedFence = 0;
+    std::lock_guard submissionLock(gAsyncSubmissionMutex);
+    const int status = commandRecordingStatus(context);
+    if (status != MCDR_COMMAND_OUTCOME_READY) return status;
+    if (!context->listOpen) return MCDR_COMMAND_OUTCOME_READY;
+    const auto submitted = submitCommandList(context);
+    if (!submitted) {
+        dbgLogError("submitCommandListV1: %s", errorMessage(submitted.error()).c_str());
+        if (context->recordingFailed.load(std::memory_order_acquire) &&
+            !context->submissionFailed.load(std::memory_order_acquire))
+            return MCDR_COMMAND_OUTCOME_RECORDING_REJECTED;
+        context->submissionFailed.store(true, std::memory_order_release);
+        return MCDR_COMMAND_OUTCOME_SUBMISSION_UNKNOWN;
+    }
+    *submittedFence = *submitted;
+    return MCDR_COMMAND_OUTCOME_SUBMITTED;
+}
+
+int submitDisplayGuidesAndResume(void* opaqueContext, uint64_t* guideFence) {
+    if (guideFence == nullptr) return -1;
+    *guideFence = 0;
+    auto* ctx = static_cast<CommandContext*>(opaqueContext);
+    if (!ctx || !ctx->listOpen || !ctx->commandList || ctx->inRenderPass ||
+        ctx->submissionFailed.load() || gAsyncRenderCtx.load(std::memory_order_acquire) == ctx) return -1;
+    const auto ticket = fgDisplayGuideTicket(ctx);
+    if (ticket.serial == 0) return -1;
+    const bool colorTargetsWritten = ctx->colorTargetsWritten;
+    const auto submitted = [&] {
+        std::lock_guard<std::mutex> queueLock(gQueueSubmissionMutex);
+        return submitRecordedCommandList(ctx);
+    }();
+    if (!submitted) return -1;
+    *guideFence = *submitted;
+    if (auto resumed = beginCommandList(ctx); !resumed) {
+        dbgLogError("display guides: recording resume failed: %s", errorMessage(resumed.error()).c_str());
+        invalidatePreparedReconstructionHistory();
+        fgAbortDisplayFrame(ctx);
+        return -1;
+    }
+    ctx->colorTargetsWritten = colorTargetsWritten;
+    if (fgDisplayGuideTicket(ctx) != ticket) {
+        invalidatePreparedReconstructionHistory();
+        fgAbortDisplayFrame(ctx);
+        return -1;
+    }
+    return 1;
+}
 
 mcdr::Result<void> waitForFenceValue(CommandContext* ctx, UINT64 value, UINT64 timeoutNs) {
-    if (!ctx) {
-        return mcdr::err("waitForFenceValue", "waitForFenceValue: null ctx");
-    }
-    UINT64 cv = ctx->fence->GetCompletedValue();
-    DBG_LOG_DEBUG("waitFence: value=%llu completed=%llu", (unsigned long long)value, (unsigned long long)cv);
-    if (cv >= value) return {};
-    HRESULT hr = ctx->fence->SetEventOnCompletion(value, ctx->fenceEvent);
-    if (FAILED(hr)) {
-        return mcdr::err("waitForFenceValue", "waitForFenceValue: SetEventOnCompletion " + formatBackendResult(hr));
-    }
-    DWORD ms = static_cast<DWORD>((timeoutNs + 999999ULL) / 1000000ULL);
-    if (WaitForSingleObject(ctx->fenceEvent, ms) != WAIT_OBJECT_0) {
-        dbgLogError("waitFence: TIMEOUT value=%llu completed=%llu", static_cast<unsigned long long>(value),
-               static_cast<unsigned long long>(ctx->fence->GetCompletedValue()));
-        return mcdr::err("waitForFenceValue",
-                         "waitForFenceValue: timed out after " + std::to_string(timeoutNs) + "ns");
-    }
-    dbgLogDebug("waitFence: OK value=%llu", static_cast<unsigned long long>(value));
-    return {};
+    return waitForContextFenceValue(ctx, value, timeoutNs);
 }
 
 UINT64 currentFenceValue(CommandContext* ctx) { return ctx ? ctx->fenceValue : 0; }
@@ -2969,6 +4215,9 @@ mcdr::Result<void> waitForQueueFenceValue(UINT64 value, UINT64 timeoutNs) {
         return mcdr::err("waitForQueueFenceValue", "waitForQueueFenceValue: queue fence not initialized");
     }
     UINT64 cv = gCtx.queueFence->GetCompletedValue();
+    if (cv == UINT64_MAX) {
+        return mcdr::err("waitForQueueFenceValue", "waitForQueueFenceValue: device removed");
+    }
     dbgLogDebug("waitQFence: value=%llu completed=%llu", static_cast<unsigned long long>(value),
                 static_cast<unsigned long long>(cv));
     if (cv >= value) return {};
@@ -2988,21 +4237,28 @@ mcdr::Result<void> waitForQueueFenceValue(UINT64 value, UINT64 timeoutNs) {
     }
     // 上限钳制：Java awaitCompletion(Long.MAX_VALUE) 换算后的纳秒数溢出 DWORD，
     // 直接 cast 会得到很小的毫秒数（把"永久等待"变成瞬时轮询）。钳到 ~49.7 天。
-    UINT64 ms64 = (timeoutNs + 999999ULL) / 1000000ULL;
+    UINT64 ms64 = timeoutNs / 1000000ULL + (timeoutNs % 1000000ULL != 0);
     DWORD ms = ms64 > 0xFFFFFFF0ULL ? 0xFFFFFFF0ULL : static_cast<DWORD>(ms64);
+    const ULONGLONG waitStarted = GetTickCount64();
     for (;;) {
         HRESULT hr = gCtx.queueFence->SetEventOnCompletion(value, t_queueFenceEvent);
         if (FAILED(hr)) {
             return mcdr::err("waitForQueueFenceValue",
                              "waitForQueueFenceValue: SetEventOnCompletion " + formatBackendResult(hr));
         }
-        DWORD wr = WaitForSingleObject(t_queueFenceEvent, ms);
+        const ULONGLONG elapsed = GetTickCount64() - waitStarted;
+        DWORD remaining = elapsed >= ms ? 0 : ms - static_cast<DWORD>(elapsed);
+        DWORD wr = WaitForSingleObject(t_queueFenceEvent, remaining);
         // 回读复核：事件可能被同一事件上更早的注册误触发。
-        if (gCtx.queueFence->GetCompletedValue() >= value) {
+        cv = gCtx.queueFence->GetCompletedValue();
+        if (cv == UINT64_MAX) {
+            return mcdr::err("waitForQueueFenceValue", "waitForQueueFenceValue: device removed");
+        }
+        if (cv >= value) {
             DBG_LOG_DEBUG("waitQFence: OK value=%llu", (unsigned long long)value);
             return {};
         }
-        if (wr != WAIT_OBJECT_0) {
+        if (wr != WAIT_OBJECT_0 || GetTickCount64() - waitStarted >= ms) {
             dbgLogError("waitQFence: TIMEOUT value=%llu completed=%llu", static_cast<unsigned long long>(value),
                    static_cast<unsigned long long>(gCtx.queueFence->GetCompletedValue()));
             return mcdr::err("waitForQueueFenceValue",
@@ -3024,6 +4280,9 @@ mcdr::Result<void> waitForContextFenceValue(CommandContext* ctx, UINT64 value, U
         return mcdr::err("waitForContextFenceValue", "waitForContextFenceValue: null ctx or fence");
     }
     UINT64 cv = ctx->fence->GetCompletedValue();
+    if (cv == UINT64_MAX || ctx->submissionFailed) {
+        return mcdr::err("waitForContextFenceValue", "waitForContextFenceValue: submission failed or device removed");
+    }
     dbgLogDebug("waitCtxFence: value=%llu completed=%llu ctx=%p", static_cast<unsigned long long>(value),
                 static_cast<unsigned long long>(cv), reinterpret_cast<void*>(ctx));
     if (cv >= value) return {};
@@ -3037,20 +4296,27 @@ mcdr::Result<void> waitForContextFenceValue(CommandContext* ctx, UINT64 value, U
             return mcdr::err("waitForContextFenceValue", "waitForContextFenceValue: CreateEvent failed");
         }
     }
-    UINT64 ms64 = (timeoutNs + 999999ULL) / 1000000ULL;
+    UINT64 ms64 = timeoutNs / 1000000ULL + (timeoutNs % 1000000ULL != 0);
     DWORD ms = ms64 > 0xFFFFFFF0ULL ? 0xFFFFFFF0ULL : static_cast<DWORD>(ms64);
+    const ULONGLONG waitStarted = GetTickCount64();
     for (;;) {
         HRESULT hr = ctx->fence->SetEventOnCompletion(value, t_ctxFenceEvent);
         if (FAILED(hr)) {
             return mcdr::err("waitForContextFenceValue",
                              "waitForContextFenceValue: SetEventOnCompletion " + formatBackendResult(hr));
         }
-        DWORD wr = WaitForSingleObject(t_ctxFenceEvent, ms);
-        if (ctx->fence->GetCompletedValue() >= value) {
+        const ULONGLONG elapsed = GetTickCount64() - waitStarted;
+        DWORD remaining = elapsed >= ms ? 0 : ms - static_cast<DWORD>(elapsed);
+        DWORD wr = WaitForSingleObject(t_ctxFenceEvent, remaining);
+        cv = ctx->fence->GetCompletedValue();
+        if (cv == UINT64_MAX) {
+            return mcdr::err("waitForContextFenceValue", "waitForContextFenceValue: device removed");
+        }
+        if (cv >= value) {
             DBG_LOG_DEBUG("waitCtxFence: OK value=%llu", (unsigned long long)value);
             return {};
         }
-        if (wr != WAIT_OBJECT_0) {
+        if (wr != WAIT_OBJECT_0 || GetTickCount64() - waitStarted >= ms) {
             dbgLogError("waitCtxFence: TIMEOUT value=%llu completed=%llu ctx=%p",
                         static_cast<unsigned long long>(value),
                         static_cast<unsigned long long>(ctx->fence->GetCompletedValue()),
@@ -3167,14 +4433,16 @@ mcdr::Result<void> copyBufferToBuffer(CommandContext* ctx, Dx12Object* src, long
     if (!src || !dst || src->kind != Dx12Object::Kind::Buffer || dst->kind != Dx12Object::Kind::Buffer) {
         return mcdr::err("copyBufferToBuffer", "copyBufferToBuffer: invalid buffer handle");
     }
-    if (srcOffset < 0 || dstOffset < 0 || size < 0 || srcOffset + size > src->size
-        || dstOffset + size > dst->size) {
+    if (srcOffset < 0 || dstOffset < 0 || size < 0 || srcOffset > src->size || dstOffset > dst->size
+        || size > src->size - srcOffset || size > dst->size - dstOffset) {
         return mcdr::err("copyBufferToBuffer", "copyBufferToBuffer: range out of bounds");
     }
     // P56：移除 P6/P23 遗留的两段 UPLOAD 源诊断（每次拷贝都 Map + 扫描/格式化 + Unmap）。
     // 它们不受日志级别保护、在 Release 中依然无条件执行，而顶点/UBO 上传正是每帧高频
     // 路径（StagedVertexBuffer / GlobalSettingsUniform / UberGpuBuffer），曾把 dx12CopyBuffer
     // 抬到 P53 热点约 12%。语义不变：CopyBufferRegion 本就不改写源数据。
+    retainObjectForRecording(ctx, src);
+    retainObjectForRecording(ctx, dst);
     transitionBufferTo(ctx, src, D3D12_RESOURCE_STATE_COPY_SOURCE);
     transitionBufferTo(ctx, dst, D3D12_RESOURCE_STATE_COPY_DEST);
     ctx->commandList->CopyBufferRegion(dst->resource.Get(), static_cast<UINT64>(dstOffset),
@@ -3225,6 +4493,11 @@ static D3D12_DEPTH_STENCIL_VIEW_DESC makeDsvDesc(Dx12Object* tex, int mip) {
         d.Texture2D.MipSlice = mipU;
     }
     return d;
+}
+
+static D3D12_CLEAR_FLAGS depthClearFlags(DXGI_FORMAT format) {
+    if (format == DXGI_FORMAT_D32_FLOAT || format == DXGI_FORMAT_D16_UNORM) return D3D12_CLEAR_FLAG_DEPTH;
+    return D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL;
 }
 
 // P64：取（或创建）(资源, mip) 对应的帧级瞬态 RTV。同一命令列表内复用同一 CPU 句柄，
@@ -3308,6 +4581,11 @@ mcdr::Result<void> clearColorTexture(CommandContext* ctx, Dx12Object* tex, float
     auto rtvRes = frameRtvFor(ctx, tex, 0);
     if (!rtvRes) return mcdr::err("clearColorTexture", errorMessage(rtvRes.error()));
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = *rtvRes;
+    const auto description = tex->resource->GetDesc();
+    for (uint32_t layer = 0; layer < description.DepthOrArraySize; ++layer) {
+        if (prepareSampledTextureWrite(ctx, tex, layer * description.MipLevels, 1) != SampledTextureContentStatus::Ready)
+            return mcdr::err("clearColorTexture", "sampled texture write ordering failed");
+    }
     transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const float color[4] = {r, g, b, a};
     ctx->commandList->ClearRenderTargetView(cpu, color, 0, nullptr);
@@ -3326,9 +4604,14 @@ mcdr::Result<void> clearDepthTexture(CommandContext* ctx, Dx12Object* tex, doubl
     auto dsvRes = frameDsvFor(ctx, tex, 0);
     if (!dsvRes) return mcdr::err("clearDepthTexture", errorMessage(dsvRes.error()));
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = *dsvRes;
+    if (tex->dxgiFormat == DXGI_FORMAT_D32_FLOAT &&
+        prepareSampledTextureWrite(ctx, tex, 0, 1) != SampledTextureContentStatus::Ready)
+        return mcdr::err("clearDepthTexture", "sampled depth write ordering failed");
     transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-    ctx->commandList->ClearDepthStencilView(cpu, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+    ctx->commandList->ClearDepthStencilView(cpu, depthClearFlags(tex->dxgiFormat),
                                             static_cast<FLOAT>(depth), 0, 0, nullptr);
+    if (ctx->vanillaDepthSeedClear)
+        ctx->vanillaDepthSeedClear(ctx->vanillaDepthSeedState, ctx, tex, 0, depth, nullptr, cpu);
     // P64：不再回切 COMMON（同 clearColorTexture：后续 beginRenderPass 复用 DEPTH_WRITE，
     // 彻底未用的由 endCommandList 收尾回切）。
     return {};
@@ -3368,6 +4651,11 @@ mcdr::Result<void> clearColorTextureRegion(CommandContext* ctx, Dx12Object* tex,
     auto rtvRes = frameRtvFor(ctx, tex, 0);
     if (!rtvRes) return mcdr::err("clearColorTextureRegion", errorMessage(rtvRes.error()));
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = *rtvRes;
+    const auto description = tex->resource->GetDesc();
+    for (uint32_t layer = 0; layer < description.DepthOrArraySize; ++layer) {
+        if (prepareSampledTextureWrite(ctx, tex, layer * description.MipLevels, 1) != SampledTextureContentStatus::Ready)
+            return mcdr::err("clearColorTextureRegion", "sampled texture write ordering failed");
+    }
     transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const float color[4] = {r, g, b, a};
     D3D12_RECT rc{x, y, x + w, y + h};
@@ -3388,10 +4676,15 @@ mcdr::Result<void> clearDepthTextureRegion(CommandContext* ctx, Dx12Object* tex,
     auto dsvRes = frameDsvFor(ctx, tex, 0);
     if (!dsvRes) return mcdr::err("clearDepthTextureRegion", errorMessage(dsvRes.error()));
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = *dsvRes;
+    if (tex->dxgiFormat == DXGI_FORMAT_D32_FLOAT &&
+        prepareSampledTextureWrite(ctx, tex, 0, 1) != SampledTextureContentStatus::Ready)
+        return mcdr::err("clearDepthTextureRegion", "sampled depth write ordering failed");
     transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     D3D12_RECT rc{x, y, x + w, y + h};
-    ctx->commandList->ClearDepthStencilView(cpu, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+    ctx->commandList->ClearDepthStencilView(cpu, depthClearFlags(tex->dxgiFormat),
                                             static_cast<FLOAT>(depth), 0, 1, &rc);
+    if (ctx->vanillaDepthSeedClear)
+        ctx->vanillaDepthSeedClear(ctx->vanillaDepthSeedState, ctx, tex, 0, depth, &rc, cpu);
     // P64：不回切 COMMON（与 clearDepthTexture 一致，交由 endCommandList 收尾）。
     return {};
 }
@@ -3406,22 +4699,74 @@ mcdr::Result<void> copyBufferToTexture(CommandContext* ctx, Dx12Object* srcBuf, 
         || dstTex->kind != Dx12Object::Kind::Texture) {
         return mcdr::err("copyBufferToTexture", "copyBufferToTexture: invalid handle");
     }
-    if (w <= 0 || h <= 0 || srcWidth <= 0 || srcHeight <= 0) {
+    if (w <= 0 || h <= 0 || srcWidth <= 0 || srcHeight <= 0 || srcOffset < 0) {
         return mcdr::err("copyBufferToTexture", "copyBufferToTexture: non-positive size");
     }
-    UINT block = blockSizeFor(dstTex->dxgiFormat);
-    UINT rowBytes = static_cast<UINT>(w) * block;
-    UINT srcRowBytes = static_cast<UINT>(srcWidth) * block;  // 源 buffer 每行实际间距（texel*block）
+    const auto textureDesc = dstTex->resource->GetDesc();
+    D3D12_FEATURE_DATA_FORMAT_INFO formatInfo{textureDesc.Format};
+    if (FAILED(gCtx.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &formatInfo, sizeof(formatInfo)))
+        || formatInfo.PlaneCount != 1 || textureDesc.SampleDesc.Count != 1) {
+        return mcdr::err("copyBufferToTexture", "buffer upload requires a single-plane, single-sample texture");
+    }
+    if (mip < 0 || mip >= textureDesc.MipLevels || layer < 0 ||
+        layer >= textureDesc.DepthOrArraySize) {
+        return mcdr::err("copyBufferToTexture", "copyBufferToTexture: subresource is out of range");
+    }
+    if (dstX < 0 || dstY < 0) {
+        return mcdr::err("copyBufferToTexture", "copyBufferToTexture: negative destination offset");
+    }
+    const UINT mipWidth = static_cast<UINT>(std::max<UINT64>(1, textureDesc.Width >> mip));
+    const UINT mipHeight = std::max<UINT>(1, textureDesc.Height >> mip);
+    if (static_cast<UINT64>(dstX) + static_cast<UINT64>(w) > mipWidth
+        || static_cast<UINT64>(dstY) + static_cast<UINT64>(h) > mipHeight) {
+        return mcdr::err("copyBufferToTexture", "copyBufferToTexture: destination region is out of range");
+    }
+    const UINT blockWidth = blockWidthFor(dstTex->dxgiFormat);
+    if (blockWidth > 1 && ((dstX % static_cast<int>(blockWidth)) != 0 || (dstY % static_cast<int>(blockWidth)) != 0
+        || (w % static_cast<int>(blockWidth)) != 0 && dstX + w != static_cast<int>(mipWidth)
+        || (h % static_cast<int>(blockWidth)) != 0 && dstY + h != static_cast<int>(mipHeight))) {
+        return mcdr::err("copyBufferToTexture", "copyBufferToTexture: compressed region is not block aligned");
+    }
+    const UINT64 rowBytes64 = compactRowBytesFor(dstTex->dxgiFormat, static_cast<UINT>(w));
+    const UINT64 srcRowBytes64 = compactRowBytesFor(dstTex->dxgiFormat, static_cast<UINT>(srcWidth));
+    const UINT rows = compactRowsFor(dstTex->dxgiFormat, static_cast<UINT>(h));
+    if (rowBytes64 > UINT_MAX || srcRowBytes64 > UINT_MAX || w > srcWidth || h > srcHeight
+        || static_cast<UINT64>(srcOffset) > static_cast<UINT64>(srcBuf->size)) {
+        return mcdr::err("copyBufferToTexture", "source buffer does not contain the requested footprint");
+    }
+    const UINT64 sourceRemaining = static_cast<UINT64>(srcBuf->size) - static_cast<UINT64>(srcOffset);
+    if (rowBytes64 > sourceRemaining
+        || (rows > 1 && srcRowBytes64 > (sourceRemaining - rowBytes64) / (rows - 1))) {
+        return mcdr::err("copyBufferToTexture", "source buffer does not contain the requested footprint");
+    }
+    if (isDepthStencilFormat(dstTex->dxgiFormat)
+        && (dstX != 0 || dstY != 0 || w != static_cast<int>(mipWidth) || h != static_cast<int>(mipHeight))) {
+        return mcdr::err("copyBufferToTexture", "depth/stencil uploads require a complete subresource");
+    }
 
     // D3D12 要求 footprint RowPitch 为 256 的倍数；Minecraft 的 CPU 侧数据是
     // 紧凑打包的，因此整块 RowPitch 未对齐时逐行拷贝以保证正确。
     constexpr UINT kPitchAlign = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
-    bool aligned = (srcRowBytes % kPitchAlign) == 0 && srcWidth == w;
-
-    transitionBufferTo(ctx, srcBuf, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    transitionTextureTo(ctx, dstTex, D3D12_RESOURCE_STATE_COPY_DEST);
+    const UINT rowBytes = static_cast<UINT>(rowBytes64);
+    const UINT srcRowBytes = static_cast<UINT>(srcRowBytes64);
+    bool aligned = (srcRowBytes % kPitchAlign) == 0 && srcWidth == w && (srcOffset % 512) == 0;
 
     UINT subresource = static_cast<UINT>(mip + layer * dstTex->resource->GetDesc().MipLevels);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT copyFootprint{};
+    UINT footprintRows = 0;
+    UINT64 footprintRowBytes = 0;
+    UINT64 footprintBytes = 0;
+    gCtx.device->GetCopyableFootprints(&textureDesc, subresource, 1, 0, &copyFootprint,
+                                       &footprintRows, &footprintRowBytes, &footprintBytes);
+    if (footprintBytes == UINT64_MAX || footprintRows == 0 || footprintRowBytes == 0
+        || (w == static_cast<int>(mipWidth) && footprintRowBytes != rowBytes64)) {
+        return mcdr::err("copyBufferToTexture", "texture footprint does not match the compact buffer layout");
+    }
+    if (prepareSampledTextureWrite(ctx, dstTex, subresource, 1) != SampledTextureContentStatus::Ready)
+        return mcdr::err("copyBufferToTexture", "sampled texture write ordering failed");
+    SampledWriteRecording writeRecording{ctx};
+    transitionBufferTo(ctx, srcBuf, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transitionTextureTo(ctx, dstTex, D3D12_RESOURCE_STATE_COPY_DEST);
     if (dstTex->usage & 16) {  // CUBEMAP_COMPATIBLE：确认 6 个面是否逐一上传
         DBG_LOG_DEBUG("copyBufferToTexture: CUBE dst=%p mip=%d layer=%d subres=%u srcOff=%lld srcW=%d "
                       "srcH=%d w=%d h=%d rowBytes=%u aligned=%d",
@@ -3433,40 +4778,71 @@ mcdr::Result<void> copyBufferToTexture(CommandContext* ctx, Dx12Object* srcBuf, 
         src.pResource = srcBuf->resource.Get();
         src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         src.PlacedFootprint.Offset = static_cast<UINT64>(srcOffset);
-        src.PlacedFootprint.Footprint.Format = dstTex->dxgiFormat;
+        src.PlacedFootprint.Footprint.Format = copyFootprint.Footprint.Format;
         src.PlacedFootprint.Footprint.Width = static_cast<UINT>(w);
         src.PlacedFootprint.Footprint.Height = static_cast<UINT>(h);
         src.PlacedFootprint.Footprint.Depth = 1;
-        src.PlacedFootprint.Footprint.RowPitch = srcRowBytes;
+        src.PlacedFootprint.Footprint.RowPitch =
+            (w == static_cast<int>(mipWidth)) ? copyFootprint.Footprint.RowPitch : alignedPitch(rowBytes);
         D3D12_TEXTURE_COPY_LOCATION dst{};
         dst.pResource = dstTex->resource.Get();
         dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         dst.SubresourceIndex = subresource;
         ctx->commandList->CopyTextureRegion(&dst, dstX, dstY, 0, &src, nullptr);
     } else {
-        // 逐行拷贝：每行 1 像素高，footprint 行距 = 源行距（可能未 256 对齐，
-        // 部分驱动允许；这是紧凑数据上传的常见做法）。
-        for (int row = 0; row < h; ++row) {
-            D3D12_TEXTURE_COPY_LOCATION src{};
-            src.pResource = srcBuf->resource.Get();
-            src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            src.PlacedFootprint.Offset =
-                static_cast<UINT64>(srcOffset) + static_cast<UINT64>(row) * srcRowBytes;
-            src.PlacedFootprint.Footprint.Format = dstTex->dxgiFormat;
-            src.PlacedFootprint.Footprint.Width = static_cast<UINT>(w);
-            src.PlacedFootprint.Footprint.Height = 1;
-            src.PlacedFootprint.Footprint.Depth = 1;
-            src.PlacedFootprint.Footprint.RowPitch = rowBytes;
-            D3D12_TEXTURE_COPY_LOCATION dst{};
-            dst.pResource = dstTex->resource.Get();
-            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            dst.SubresourceIndex = subresource;
-            ctx->commandList->CopyTextureRegion(&dst, dstX, dstY + row, 0, &src, nullptr);
+        const UINT pitch = alignedPitch(rowBytes);
+        const UINT64 scratchSize = static_cast<UINT64>(pitch) * rows;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = scratchSize;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ComPtr<ID3D12Resource> scratch;
+        if (FAILED(gCtx.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                        IID_PPV_ARGS(&scratch)))) {
+            ctx->recordingFailed.store(true, std::memory_order_release);
+            return mcdr::err("copyBufferToTexture", "aligned upload footprint allocation failed");
         }
+        ctx->recordingLeases[ctx->currentListSlot].push_back(
+            std::make_shared<ComPtr<ID3D12Resource>>(scratch));
+        for (UINT row = 0; row < rows; ++row) {
+            ctx->commandList->CopyBufferRegion(scratch.Get(), static_cast<UINT64>(row) * pitch,
+                                               srcBuf->resource.Get(),
+                                               static_cast<UINT64>(srcOffset) + static_cast<UINT64>(row) * srcRowBytes,
+                                               rowBytes);
+        }
+        D3D12_RESOURCE_BARRIER scratchBarrier{};
+        scratchBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        scratchBarrier.Transition.pResource = scratch.Get();
+        scratchBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        scratchBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        scratchBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        ctx->commandList->ResourceBarrier(1, &scratchBarrier);
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = scratch.Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Offset = 0;
+        src.PlacedFootprint.Footprint.Format = copyFootprint.Footprint.Format;
+        src.PlacedFootprint.Footprint.Width = static_cast<UINT>(w);
+        src.PlacedFootprint.Footprint.Height = static_cast<UINT>(h);
+        src.PlacedFootprint.Footprint.Depth = 1;
+        src.PlacedFootprint.Footprint.RowPitch = pitch;
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = dstTex->resource.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = subresource;
+        ctx->commandList->CopyTextureRegion(&dst, dstX, dstY, 0, &src, nullptr);
     }
     // P11：目标纹理显式回切 COMMON（显式进入的 COPY_DEST 不会随命令列表完成
     // decay；回切后下一 command list 的 Before=COMMON 假设才成立）。
     transitionTextureTo(ctx, dstTex, D3D12_RESOURCE_STATE_COMMON);
+    writeRecording.completed = true;
     return {};
 }
 
@@ -3480,22 +4856,62 @@ mcdr::Result<void> copyTextureToBuffer(CommandContext* ctx, Dx12Object* srcTex, 
         || dstBuf->kind != Dx12Object::Kind::Buffer) {
         return mcdr::err("copyTextureToBuffer", "copyTextureToBuffer: invalid handle");
     }
-    if (w <= 0 || h <= 0) {
+    if (w <= 0 || h <= 0 || dstOffset < 0) {
         return mcdr::err("copyTextureToBuffer", "copyTextureToBuffer: non-positive size");
     }
-    UINT block = blockSizeFor(srcTex->dxgiFormat);
-    UINT rowBytes = static_cast<UINT>(w) * block;
+    const auto textureDesc = srcTex->resource->GetDesc();
+    D3D12_FEATURE_DATA_FORMAT_INFO formatInfo{textureDesc.Format};
+    if (FAILED(gCtx.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &formatInfo, sizeof(formatInfo)))
+        || formatInfo.PlaneCount != 1 || textureDesc.SampleDesc.Count != 1) {
+        return mcdr::err("copyTextureToBuffer", "buffer readback requires a single-plane, single-sample texture");
+    }
+    if (mip < 0 || mip >= textureDesc.MipLevels || layer < 0 ||
+        layer >= textureDesc.DepthOrArraySize) {
+        return mcdr::err("copyTextureToBuffer", "copyTextureToBuffer: subresource is out of range");
+    }
+    const UINT mipWidth = static_cast<UINT>(std::max<UINT64>(1, textureDesc.Width >> mip));
+    const UINT mipHeight = std::max<UINT>(1, textureDesc.Height >> mip);
+    if (srcX < 0 || srcY < 0 || static_cast<UINT64>(srcX) + static_cast<UINT64>(w) > mipWidth
+        || static_cast<UINT64>(srcY) + static_cast<UINT64>(h) > mipHeight) {
+        return mcdr::err("copyTextureToBuffer", "copyTextureToBuffer: source region is out of range");
+    }
+    const UINT blockWidth = blockWidthFor(srcTex->dxgiFormat);
+    if (blockWidth > 1 && ((srcX % static_cast<int>(blockWidth)) != 0 || (srcY % static_cast<int>(blockWidth)) != 0
+        || (w % static_cast<int>(blockWidth)) != 0 && srcX + w != static_cast<int>(mipWidth)
+        || (h % static_cast<int>(blockWidth)) != 0 && srcY + h != static_cast<int>(mipHeight))) {
+        return mcdr::err("copyTextureToBuffer", "copyTextureToBuffer: compressed region is not block aligned");
+    }
+    const UINT64 rowBytes64 = compactRowBytesFor(srcTex->dxgiFormat, static_cast<UINT>(w));
+    const UINT rows = compactRowsFor(srcTex->dxgiFormat, static_cast<UINT>(h));
+    if (rowBytes64 > UINT_MAX) {
+        return mcdr::err("copyTextureToBuffer", "copyTextureToBuffer: row footprint is too large");
+    }
+    const UINT rowBytes = static_cast<UINT>(rowBytes64);
+    if (isDepthStencilFormat(srcTex->dxgiFormat)
+        && (srcX != 0 || srcY != 0 || w != static_cast<int>(mipWidth) || h != static_cast<int>(mipHeight))) {
+        return mcdr::err("copyTextureToBuffer", "depth/stencil readback requires a complete subresource");
+    }
 
     transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COPY_SOURCE);
     transitionBufferTo(ctx, dstBuf, D3D12_RESOURCE_STATE_COPY_DEST);
 
     UINT subresource = static_cast<UINT>(mip + layer * srcTex->resource->GetDesc().MipLevels);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT copyFootprint{};
+    UINT footprintRows = 0;
+    UINT64 footprintRowBytes = 0;
+    UINT64 footprintBytes = 0;
+    gCtx.device->GetCopyableFootprints(&textureDesc, subresource, 1, 0, &copyFootprint,
+                                       &footprintRows, &footprintRowBytes, &footprintBytes);
+    if (footprintBytes == UINT64_MAX || footprintRows == 0 || footprintRowBytes == 0
+        || (w == static_cast<int>(mipWidth) && footprintRowBytes != rowBytes64)) {
+        return mcdr::err("copyTextureToBuffer", "texture footprint does not match the compact buffer layout");
+    }
     // 客户端（Minecraft）按紧凑行距访问读回数据，且读回 buffer 只分配了
     // 紧凑大小（rowBytes*h）。D3D12 要求 footprint RowPitch 为 256 的倍数，
     // 因此行距未对齐时逐行紧凑拷贝（每行 Height=1）。
-    constexpr UINT kPitchAlign = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
-    bool aligned = (rowBytes % kPitchAlign) == 0;
-    if (dstOffset + static_cast<UINT64>(rowBytes) * h > static_cast<UINT64>(dstBuf->size)) {
+    bool aligned = (rowBytes % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) == 0 && (dstOffset % 512) == 0;
+    if (static_cast<UINT64>(dstOffset) > static_cast<UINT64>(dstBuf->size)
+        || static_cast<UINT64>(rowBytes) * rows > static_cast<UINT64>(dstBuf->size) - static_cast<UINT64>(dstOffset)) {
         return mcdr::err("copyTextureToBuffer", "copyTextureToBuffer: destination buffer too small");
     }
 
@@ -3508,29 +4924,61 @@ mcdr::Result<void> copyTextureToBuffer(CommandContext* ctx, Dx12Object* srcTex, 
         dst.pResource = dstBuf->resource.Get();
         dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         dst.PlacedFootprint.Offset = static_cast<UINT64>(dstOffset);
-        dst.PlacedFootprint.Footprint.Format = srcTex->dxgiFormat;
+        dst.PlacedFootprint.Footprint.Format = copyFootprint.Footprint.Format;
         dst.PlacedFootprint.Footprint.Width = static_cast<UINT>(w);
         dst.PlacedFootprint.Footprint.Height = static_cast<UINT>(h);
         dst.PlacedFootprint.Footprint.Depth = 1;
-        dst.PlacedFootprint.Footprint.RowPitch = rowBytes;
+        dst.PlacedFootprint.Footprint.RowPitch =
+            (w == static_cast<int>(mipWidth)) ? copyFootprint.Footprint.RowPitch : alignedPitch(rowBytes);
         D3D12_BOX srcBox{static_cast<UINT>(srcX),     static_cast<UINT>(srcY),     0,
                          static_cast<UINT>(srcX + w), static_cast<UINT>(srcY + h), 1};
-        ctx->commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, &srcBox);
+        ctx->commandList->CopyTextureRegion(&dst, 0, 0, 0, &src,
+            isDepthStencilFormat(srcTex->dxgiFormat) ? nullptr : &srcBox);
     } else {
-        // 逐行拷贝：目标 buffer 紧凑布局，RowPitch=rowBytes（每行 1 像素高）。
-        for (int row = 0; row < h; ++row) {
-            D3D12_TEXTURE_COPY_LOCATION dst{};
-            dst.pResource = dstBuf->resource.Get();
-            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            dst.PlacedFootprint.Offset = static_cast<UINT64>(dstOffset) + static_cast<UINT64>(row) * rowBytes;
-            dst.PlacedFootprint.Footprint.Format = srcTex->dxgiFormat;
-            dst.PlacedFootprint.Footprint.Width = static_cast<UINT>(w);
-            dst.PlacedFootprint.Footprint.Height = 1;
-            dst.PlacedFootprint.Footprint.Depth = 1;
-            dst.PlacedFootprint.Footprint.RowPitch = rowBytes;
-            D3D12_BOX srcBox{static_cast<UINT>(srcX),     static_cast<UINT>(srcY + row),     0,
-                             static_cast<UINT>(srcX + w), static_cast<UINT>(srcY + row + 1), 1};
-            ctx->commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, &srcBox);
+        const UINT pitch = alignedPitch(rowBytes);
+        const UINT64 scratchSize = static_cast<UINT64>(pitch) * rows;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = scratchSize;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ComPtr<ID3D12Resource> scratch;
+        if (FAILED(gCtx.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                        IID_PPV_ARGS(&scratch)))) {
+            return mcdr::err("copyTextureToBuffer", "aligned readback footprint allocation failed");
+        }
+        ctx->recordingLeases[ctx->currentListSlot].push_back(
+            std::make_shared<ComPtr<ID3D12Resource>>(scratch));
+        D3D12_TEXTURE_COPY_LOCATION scratchLocation{};
+        scratchLocation.pResource = scratch.Get();
+        scratchLocation.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        scratchLocation.PlacedFootprint.Offset = 0;
+        scratchLocation.PlacedFootprint.Footprint.Format = copyFootprint.Footprint.Format;
+        scratchLocation.PlacedFootprint.Footprint.Width = static_cast<UINT>(w);
+        scratchLocation.PlacedFootprint.Footprint.Height = static_cast<UINT>(h);
+        scratchLocation.PlacedFootprint.Footprint.Depth = 1;
+        scratchLocation.PlacedFootprint.Footprint.RowPitch = pitch;
+        D3D12_BOX srcBox{static_cast<UINT>(srcX), static_cast<UINT>(srcY), 0,
+                         static_cast<UINT>(srcX + w), static_cast<UINT>(srcY + h), 1};
+        ctx->commandList->CopyTextureRegion(&scratchLocation, 0, 0, 0, &src,
+            isDepthStencilFormat(srcTex->dxgiFormat) ? nullptr : &srcBox);
+        D3D12_RESOURCE_BARRIER scratchBarrier{};
+        scratchBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        scratchBarrier.Transition.pResource = scratch.Get();
+        scratchBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        scratchBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        scratchBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        ctx->commandList->ResourceBarrier(1, &scratchBarrier);
+        for (UINT row = 0; row < rows; ++row) {
+            ctx->commandList->CopyBufferRegion(dstBuf->resource.Get(),
+                                               static_cast<UINT64>(dstOffset) + static_cast<UINT64>(row) * rowBytes,
+                                               scratch.Get(), static_cast<UINT64>(row) * pitch, rowBytes);
         }
     }
     // P11：源纹理显式回切 COMMON（显式进入的 COPY_SOURCE 不会随命令列表完成
@@ -3554,11 +5002,59 @@ mcdr::Result<void> copyTextureToTexture(CommandContext* ctx, Dx12Object* srcTex,
     if (srcTex->dxgiFormat != dstTex->dxgiFormat) {
         return mcdr::err("copyTextureToTexture", "copyTextureToTexture: format mismatch");
     }
-    transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    transitionTextureTo(ctx, dstTex, D3D12_RESOURCE_STATE_COPY_DEST);
-
+    const auto sourceDesc = srcTex->resource->GetDesc();
+    const auto destinationDesc = dstTex->resource->GetDesc();
+    D3D12_FEATURE_DATA_FORMAT_INFO sourceFormatInfo{sourceDesc.Format};
+    if (FAILED(gCtx.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &sourceFormatInfo, sizeof(sourceFormatInfo))) ||
+        sourceFormatInfo.PlaneCount == 0) {
+        return mcdr::err("copyTextureToTexture", "cannot determine texture plane count");
+    }
+    if (mip < 0 || mip >= sourceDesc.MipLevels || mip >= destinationDesc.MipLevels || layer < 0
+        || layer >= sourceDesc.DepthOrArraySize || layer >= destinationDesc.DepthOrArraySize) {
+        return mcdr::err("copyTextureToTexture", "copyTextureToTexture: subresource is out of range");
+    }
+    const UINT sourceWidth = static_cast<UINT>(std::max<UINT64>(1, sourceDesc.Width >> mip));
+    const UINT sourceHeight = std::max<UINT>(1, sourceDesc.Height >> mip);
+    const UINT destinationWidth = static_cast<UINT>(std::max<UINT64>(1, destinationDesc.Width >> mip));
+    const UINT destinationHeight = std::max<UINT>(1, destinationDesc.Height >> mip);
+    if (srcX < 0 || srcY < 0 || dstX < 0 || dstY < 0
+        || static_cast<UINT64>(srcX) + static_cast<UINT64>(w) > sourceWidth
+        || static_cast<UINT64>(srcY) + static_cast<UINT64>(h) > sourceHeight
+        || static_cast<UINT64>(dstX) + static_cast<UINT64>(w) > destinationWidth
+        || static_cast<UINT64>(dstY) + static_cast<UINT64>(h) > destinationHeight) {
+        return mcdr::err("copyTextureToTexture", "copyTextureToTexture: copy region is out of range");
+    }
+    const UINT blockWidth = blockWidthFor(srcTex->dxgiFormat);
+    if (blockWidth > 1 && ((srcX % static_cast<int>(blockWidth)) != 0 || (srcY % static_cast<int>(blockWidth)) != 0
+        || (dstX % static_cast<int>(blockWidth)) != 0 || (dstY % static_cast<int>(blockWidth)) != 0
+        || (w % static_cast<int>(blockWidth)) != 0
+            && (srcX + w != static_cast<int>(sourceWidth) || dstX + w != static_cast<int>(destinationWidth))
+        || (h % static_cast<int>(blockWidth)) != 0
+            && (srcY + h != static_cast<int>(sourceHeight) || dstY + h != static_cast<int>(destinationHeight)))) {
+        return mcdr::err("copyTextureToTexture", "copyTextureToTexture: compressed region is not block aligned");
+    }
+    const bool wholeSubresource =
+        ((sourceDesc.Flags | destinationDesc.Flags) & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0 ||
+        isDepthStencilFormat(srcTex->dxgiFormat) ||
+        sourceDesc.SampleDesc.Count > 1 || destinationDesc.SampleDesc.Count > 1;
+    if (wholeSubresource &&
+        (mip < 0 || mip >= sourceDesc.MipLevels || mip >= destinationDesc.MipLevels ||
+         srcX != 0 || srcY != 0 || dstX != 0 || dstY != 0 ||
+         static_cast<UINT64>(w) != sourceWidth ||
+         static_cast<UINT>(h) != sourceHeight ||
+         sourceDesc.Width != destinationDesc.Width || sourceDesc.Height != destinationDesc.Height ||
+         sourceDesc.SampleDesc.Count != destinationDesc.SampleDesc.Count)) {
+        return mcdr::err("copyTextureToTexture", "depth/MSAA copy requires a complete matching subresource");
+    }
     UINT srcSub = static_cast<UINT>(mip + layer * srcTex->resource->GetDesc().MipLevels);
     UINT dstSub = static_cast<UINT>(mip + layer * dstTex->resource->GetDesc().MipLevels);
+    for (UINT plane = 0; plane < sourceFormatInfo.PlaneCount; ++plane) {
+        if (prepareSampledTextureWrite(ctx, dstTex,
+                dstSub + plane * destinationDesc.MipLevels * destinationDesc.DepthOrArraySize, 1) != SampledTextureContentStatus::Ready)
+            return mcdr::err("copyTextureToTexture", "sampled texture write ordering failed");
+    }
+    transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transitionTextureTo(ctx, dstTex, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_TEXTURE_COPY_LOCATION src{};
     src.pResource = srcTex->resource.Get();
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -3569,11 +5065,130 @@ mcdr::Result<void> copyTextureToTexture(CommandContext* ctx, Dx12Object* srcTex,
     dst.SubresourceIndex = dstSub;
     D3D12_BOX srcBox{static_cast<UINT>(srcX),     static_cast<UINT>(srcY),     0,
                      static_cast<UINT>(srcX + w), static_cast<UINT>(srcY + h), 1};
-    ctx->commandList->CopyTextureRegion(&dst, dstX, dstY, 0, &src, &srcBox);
+    for (UINT plane = 0; plane < sourceFormatInfo.PlaneCount; ++plane) {
+        src.SubresourceIndex = srcSub + plane * sourceDesc.MipLevels * sourceDesc.DepthOrArraySize;
+        dst.SubresourceIndex = dstSub + plane * destinationDesc.MipLevels * destinationDesc.DepthOrArraySize;
+        ctx->commandList->CopyTextureRegion(&dst, dstX, dstY, 0, &src, wholeSubresource ? nullptr : &srcBox);
+    }
     // P11：src/dst 显式回切 COMMON（显式进入的 COPY_SOURCE/COPY_DEST 不会随
     // 命令列表完成 decay；回切后下一 command list 的 Before=COMMON 假设才成立）。
     transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COMMON);
     transitionTextureTo(ctx, dstTex, D3D12_RESOURCE_STATE_COMMON);
+    return {};
+}
+
+mcdr::Result<void> setRasterMotionTarget(void* rawContext, void* rawWorldColor, void* rawWorldDepth,
+                                        void* rawMotion) {
+    auto* context = static_cast<CommandContext*>(rawContext);
+    if (!context) return mcdr::err("setRasterMotionTarget", "null command context");
+    if (!rawWorldColor && !rawWorldDepth && !rawMotion) {
+        if (context->activeMotionTarget) {
+            if (!context->listOpen || !context->commandList) {
+                return mcdr::err("setRasterMotionTarget", "active motion attachment has no recording context");
+            }
+            auto targets = context->activePassRtvs;
+            if (context->additionalColorTarget) targets.push_back(context->additionalColorRtv);
+            context->commandList->OMSetRenderTargets(static_cast<UINT>(targets.size()),
+                targets.empty() ? nullptr : targets.data(), FALSE,
+                context->activeDepthTarget ? &context->activePassDsv : nullptr);
+            if (const auto result = transitionAttachmentRanges(context, context->activeMotionTarget, true); !result) return result;
+            context->activeMotionTarget = nullptr;
+            context->activeMotionRtv = {};
+            context->rasterMotionSelected = false;
+            context->activePassBoundColorCount = static_cast<UINT>(targets.size());
+            context->cachedPso = nullptr;
+            context->currentPipeline = nullptr;
+            invalidateGraphicsInputBindings(context, false);
+        }
+        context->rasterMotionWorldColor = nullptr;
+        context->rasterMotionWorldDepth = nullptr;
+        context->rasterMotionTarget = nullptr;
+        context->rasterMotionLeases.clear();
+        return {};
+    }
+    if (!context->listOpen || !context->commandList || context->submissionFailed || context->inRenderPass ||
+        !rawWorldColor || !rawWorldDepth || !rawMotion) {
+        return mcdr::err("setRasterMotionTarget", "registration requires a complete target and idle recording pass");
+    }
+    auto* worldColor = static_cast<Dx12Object*>(rawWorldColor);
+    auto* worldDepth = static_cast<Dx12Object*>(rawWorldDepth);
+    auto* motion = static_cast<Dx12Object*>(rawMotion);
+    auto valid = [](Dx12Object* texture) {
+        if (texture->kind != Dx12Object::Kind::Texture || !texture->resource || !(texture->usage & 8)) return false;
+        const auto description = texture->resource->GetDesc();
+        return description.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && description.Width > 0 &&
+            description.Height > 0 && description.MipLevels == 1 && description.DepthOrArraySize == 1 &&
+            description.SampleDesc.Count == 1;
+    };
+    if (!valid(worldColor) || !valid(worldDepth) || !valid(motion) ||
+        worldDepth->dxgiFormat != DXGI_FORMAT_D32_FLOAT || isDepthStencilFormat(worldColor->dxgiFormat) ||
+        motion->dxgiFormat != DXGI_FORMAT_R32G32B32A32_FLOAT ||
+        worldColor->resource.Get() == worldDepth->resource.Get() ||
+        worldColor->resource.Get() == motion->resource.Get() ||
+        worldDepth->resource.Get() == motion->resource.Get()) {
+        return mcdr::err("setRasterMotionTarget", "invalid texture format, usage, shape or alias");
+    }
+    const auto colorDescription = worldColor->resource->GetDesc();
+    const auto depthDescription = worldDepth->resource->GetDesc();
+    const auto motionDescription = motion->resource->GetDesc();
+    if (colorDescription.Width != depthDescription.Width || colorDescription.Height != depthDescription.Height ||
+        colorDescription.Width != motionDescription.Width || colorDescription.Height != motionDescription.Height ||
+        !(colorDescription.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
+        !(depthDescription.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
+        !(motionDescription.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
+        return mcdr::err("setRasterMotionTarget", "motion and world attachments have incompatible dimensions or flags");
+    }
+    std::vector<std::shared_ptr<void>> leases;
+    leases.push_back(retainObjectLease(worldColor));
+    leases.push_back(retainObjectLease(worldDepth));
+    leases.push_back(retainObjectLease(motion));
+    context->rasterMotionLeases = std::move(leases);
+    context->rasterMotionWorldColor = worldColor;
+    context->rasterMotionWorldDepth = worldDepth;
+    context->rasterMotionTarget = motion;
+    if (context->vanillaDepthSeedBind)
+        context->vanillaDepthSeedBind(context->vanillaDepthSeedState, context, worldDepth);
+    return {};
+}
+
+mcdr::Result<void> setAdditionalColorTarget(void* rawContext, void* rawTarget) {
+    auto* context = static_cast<CommandContext*>(rawContext);
+    auto* target = static_cast<Dx12Object*>(rawTarget);
+    if (!context || !context->listOpen || !context->inRenderPass)
+        return mcdr::err("setAdditionalColorTarget", "an open render pass is required");
+    if (context->additionalColorTarget == target) return {};
+    auto targets = context->activePassRtvs;
+    D3D12_CPU_DESCRIPTOR_HANDLE additional{};
+    if (target) {
+        if (targets.empty() || targets.size() + 1u + (context->rasterMotionSelected ? 1u : 0u) >
+                D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT ||
+            target->kind != Dx12Object::Kind::Texture || !(target->usage & 8))
+            return mcdr::err("setAdditionalColorTarget", "additional color attachment is incompatible");
+        const auto source = context->activeColorTargets.front()->resource->GetDesc();
+        const auto destination = target->resource->GetDesc();
+        if (source.Width != destination.Width || source.Height != destination.Height ||
+            source.SampleDesc.Count != destination.SampleDesc.Count ||
+            destination.DepthOrArraySize != 1 ||
+            (context->activeMotionTarget && target->resource.Get() == context->activeMotionTarget->resource.Get()) ||
+            (context->activeDepthTarget && target->resource.Get() == context->activeDepthTarget->resource.Get()) ||
+            std::any_of(context->activeColorTargets.begin(), context->activeColorTargets.end(),
+                [&](const auto* color) { return color->resource.Get() == target->resource.Get(); }))
+            return mcdr::err("setAdditionalColorTarget", "additional color extent or alias is invalid");
+        auto rtv = frameRtvFor(context, target, 0);
+        if (!rtv) return std::unexpected<mcdr::Error>(std::move(rtv.error()));
+        additional = *rtv;
+        if (const auto result = addAttachmentRanges(context, target, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, false); !result)
+            return result;
+        if (const auto result = transitionAttachmentRanges(context, target, false); !result) return result;
+        retainObjectForRecording(context, target);
+        targets.push_back(additional);
+    }
+    if (context->rasterMotionSelected) targets.push_back(context->activeMotionRtv);
+    context->additionalColorTarget = target;
+    context->additionalColorRtv = additional;
+    context->commandList->OMSetRenderTargets(static_cast<UINT>(targets.size()), targets.data(), FALSE,
+        context->activeDepthTarget ? &context->activePassDsv : nullptr);
+    context->activePassBoundColorCount = static_cast<UINT>(targets.size());
     return {};
 }
 
@@ -3587,15 +5202,25 @@ mcdr::Result<void> beginRenderPass(CommandContext* ctx, Dx12Object* const* color
     if (ctx->inRenderPass) {
         return mcdr::err("beginRenderPass", "beginRenderPass: render pass already open");
     }
-    if (colorCount < 0) {
+    if (colorCount < 0 || colorCount > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT ||
+        (colorCount > 0 && !colorViews)) {
         return mcdr::err("beginRenderPass", "beginRenderPass: negative color count");
     }
+    SampledWriteRecording writeRecording{ctx};
 
     // P11：本 pass 的附件在 endRenderPass 时需显式回切 COMMON（见 endRenderPass），
     // 先清空上次记录（防御：上次 pass 未正常 end）。
     ctx->activeColorTargets.clear();
     ctx->activeColorTargetsTouched.clear();
     ctx->activeDepthTarget = nullptr;
+    ctx->activeAttachmentRanges.clear();
+    ctx->activePassRtvs.clear();
+    ctx->additionalColorTarget = nullptr;
+    ctx->additionalColorRtv = {};
+    ctx->activePassDsv = {};
+    ctx->activeMotionRtv = {};
+    ctx->activeMotionTarget = nullptr;
+    ctx->rasterMotionSelected = false;
 
     std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rtvs;
     rtvs.reserve(static_cast<size_t>(colorCount));
@@ -3622,8 +5247,15 @@ mcdr::Result<void> beginRenderPass(CommandContext* ctx, Dx12Object* const* color
         DBG_LOG_DEBUG("beginRenderPass color[%d] tex=%p rtv=%p mip=%d dims=%ux%u fmt=%d", i, (void*)tex,
                       (void*)cpu.ptr, mip, (UINT)tex->resource->GetDesc().Width,
                       (UINT)tex->resource->GetDesc().Height, (int)tex->dxgiFormat);
-        transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        if (const auto result = addAttachmentRanges(ctx, tex, mip, D3D12_RESOURCE_STATE_RENDER_TARGET, false); !result) return result;
+        if (const auto result = transitionAttachmentRanges(ctx, tex, false); !result) return result;
+        retainObjectForRecording(ctx, tex);
         if (colorClearFlags && colorClearFlags[i] && clearColors) {
+            for (const auto& range : ctx->activeAttachmentRanges) {
+                if (range.object == tex && prepareSampledTextureWrite(ctx, tex, range.firstSubresource,
+                        range.subresourceCount) != SampledTextureContentStatus::Ready)
+                    return mcdr::err("beginRenderPass", "sampled texture load clear ordering failed");
+            }
             const float* c = clearColors + i * 4;
             ctx->commandList->ClearRenderTargetView(cpu, c, 0, nullptr);
             // P6 诊断：每 60 帧打印一次 clear 颜色（确认画面底色=clear 值）。
@@ -3653,7 +5285,9 @@ mcdr::Result<void> beginRenderPass(CommandContext* ctx, Dx12Object* const* color
         dsv = *dsvRes;
         hasDsv = true;
         ctx->activeDepthTarget = depthView;
-        transitionTextureTo(ctx, depthView, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        if (const auto result = addAttachmentRanges(ctx, depthView, depthMip, D3D12_RESOURCE_STATE_DEPTH_WRITE, true); !result) return result;
+        if (const auto result = transitionAttachmentRanges(ctx, depthView, false); !result) return result;
+        retainObjectForRecording(ctx, depthView);
         // reverse-Z 修复：Minecraft 26.x 使用反向深度（depthFunc=GREATER_EQUAL），
         // 深度 clear 值为 0.0（远平面）。vanilla 在创建主渲染 pass 前已通过
         // clearDepthTexture(..., 0.0) pre-clear（同一 command encoder，顺序有保证），
@@ -3662,8 +5296,18 @@ mcdr::Result<void> beginRenderPass(CommandContext* ctx, Dx12Object* const* color
         // GREATER_EQUAL 深度测试丢弃几乎所有片元 → 全黑屏。
         // 正确行为：LOAD 不 clear（保持 pre-clear 值），仅显式 CLEAR 时 clear。
         if (depthClearFlag) {
-            ctx->commandList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+            if (depthView->dxgiFormat == DXGI_FORMAT_D32_FLOAT) {
+                for (const auto& range : ctx->activeAttachmentRanges) {
+                    if (range.object == depthView && prepareSampledTextureWrite(ctx, depthView,
+                            range.firstSubresource, range.subresourceCount) != SampledTextureContentStatus::Ready)
+                        return mcdr::err("beginRenderPass", "sampled depth load clear ordering failed");
+                }
+            }
+            ctx->commandList->ClearDepthStencilView(dsv, depthClearFlags(depthView->dxgiFormat),
                                                     static_cast<FLOAT>(depthClearValue), 0, 0, nullptr);
+            if (ctx->vanillaDepthSeedClear)
+                ctx->vanillaDepthSeedClear(ctx->vanillaDepthSeedState, ctx, depthView,
+                                           static_cast<UINT>(depthMip), depthClearValue, nullptr, dsv);
             // P27：降级（数千次 pass 调用 × 高频写文件）。
             DBG_LOG_DEBUG("beginRenderPass depth clear=explicit val=%.3f", (FLOAT)depthClearValue);
         } else {
@@ -3671,6 +5315,22 @@ mcdr::Result<void> beginRenderPass(CommandContext* ctx, Dx12Object* const* color
         }
     }
 
+    if (colorCount == 1 && rtvs.size() == 1 && colorViews[0] == ctx->rasterMotionWorldColor &&
+        depthView == ctx->rasterMotionWorldDepth && ctx->rasterMotionTarget &&
+        (!colorMips || colorMips[0] == 0) && depthMip == 0) {
+        auto motionRtv = frameRtvFor(ctx, ctx->rasterMotionTarget, 0);
+        if (!motionRtv) return std::unexpected<mcdr::Error>(std::move(motionRtv.error()));
+        ctx->activeMotionRtv = *motionRtv;
+        ctx->activeMotionTarget = ctx->rasterMotionTarget;
+        if (const auto result = addAttachmentRanges(ctx, ctx->activeMotionTarget, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, false); !result) return result;
+        if (const auto result = transitionAttachmentRanges(ctx, ctx->activeMotionTarget, false); !result) return result;
+        retainObjectForRecording(ctx, ctx->rasterMotionWorldColor);
+        retainObjectForRecording(ctx, ctx->rasterMotionWorldDepth);
+        retainObjectForRecording(ctx, ctx->activeMotionTarget);
+    }
+    ctx->activePassRtvs = rtvs;
+    ctx->activePassDsv = dsv;
+    ctx->activePassBoundColorCount = static_cast<UINT>(rtvs.size());
     ctx->commandList->OMSetRenderTargets(static_cast<UINT>(rtvs.size()), rtvs.empty() ? nullptr : rtvs.data(),
                                          false, hasDsv ? &dsv : nullptr);
     D3D12_VIEWPORT vp{static_cast<FLOAT>(x),
@@ -3682,6 +5342,10 @@ mcdr::Result<void> beginRenderPass(CommandContext* ctx, Dx12Object* const* color
     ctx->commandList->RSSetViewports(1, &vp);
     D3D12_RECT scissor{x, y, x + w, y + h};
     ctx->commandList->RSSetScissorRects(1, &scissor);
+    ctx->graphicsDrawState.viewport = vp;
+    ctx->graphicsDrawState.scissor = scissor;
+    ctx->graphicsDrawState.viewportValid = true;
+    ctx->graphicsDrawState.scissorValid = true;
     ctx->inRenderPass = 1;
     // P6 诊断：确认渲染 pass 绑定的附件（blit 源纹理应出现在 color[0]）。
     // P27：降级为 DBG_LOG_DEBUG（数千次 pass 调用 × 高频写文件拖死主线程）。
@@ -3703,6 +5367,7 @@ mcdr::Result<void> beginRenderPass(CommandContext* ctx, Dx12Object* const* color
             // BUG-01 fix：diag loop 只打印日志，不再重复 push_back（主循环 L1701 已添加）。
         }
     }
+    writeRecording.completed = true;
     return {};
 }
 
@@ -3720,12 +5385,7 @@ mcdr::Result<void> endRenderPass(CommandContext* ctx) {
     // GPU 状态错乱 → TDR 冻结（游戏挂死，启动器同 GPU 渲染也卡死）。
     // transitionTextureTo 按本 list 已跟踪状态回切（进入时为 RENDER_TARGET/
     // DEPTH_WRITE），from==to 时自动跳过，幂等。
-    for (Dx12Object* tex : ctx->activeColorTargets) {
-        if (tex) transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_COMMON);
-    }
-    if (ctx->activeDepthTarget) {
-        transitionTextureTo(ctx, ctx->activeDepthTarget, D3D12_RESOURCE_STATE_COMMON);
-    }
+    if (const auto result = transitionAttachmentRanges(ctx, nullptr, true); !result) return result;
     // P6 诊断：记录 endRenderPass 前绑定的颜色附件，便于确认渲染目标正确性。
     // P27：降级为 DBG_LOG_DEBUG（数千次 pass 调用 × 高频写文件拖死主线程）。
     if (ctx->activeColorTargets.size() > 0) {
@@ -3743,6 +5403,15 @@ mcdr::Result<void> endRenderPass(CommandContext* ctx) {
     ctx->activeColorTargets.clear();
     ctx->activeColorTargetsTouched.clear();
     ctx->activeDepthTarget = nullptr;
+    ctx->activeAttachmentRanges.clear();
+    ctx->activePassRtvs.clear();
+    ctx->additionalColorTarget = nullptr;
+    ctx->additionalColorRtv = {};
+    ctx->activePassDsv = {};
+    ctx->activeMotionRtv = {};
+    ctx->activeMotionTarget = nullptr;
+    ctx->rasterMotionSelected = false;
+    ctx->activePassBoundColorCount = UINT_MAX;
     ctx->inRenderPass = 0;
     return {};
 }
@@ -3880,7 +5549,7 @@ D3D12_PRIMITIVE_TOPOLOGY toPrimitiveTopology(int t) {
 //   "6_9" —— 可以继续建 PSO；
 //   ""    —— 不满足，调用方必须报错（sm69RequirementText 说清缺哪一条）。
 // 两个前置条件，缺一不可：
-//   1) 这台 DXC 能产出 6_9 的 DXIL（caps.dxcSupportsSm69()，probeDxc 的 ms_6_9 冒烟）；
+//   1) DXC 编译器接口可用，实际 shader 固定使用 6_9 并传播编译错误；
 //   2) 设备自己报 HighestShaderModel >= 6.9 —— 只有 Agility SDK 1.619 的 core 才有，
 //      inbox D3D12Core 最高 6.8（P110 / known_bugs §D.18）。这种情况下 D3D12 后端
 //      直接报错，而不是偷偷降级。
@@ -3899,36 +5568,44 @@ D3D12_PRIMITIVE_TOPOLOGY toPrimitiveTopology(int t) {
 // ring：一次 dispatch 占 1～3 格；同一帧内多次 dispatch 各占各的格，避免后一次
 // 覆盖前一次"已录制、未执行"的描述符。
 // ---------------------------------------------------------------------------
-bool ensureComputeHeap() {
-    if (gCtx.computeUavHeap) return true;
+bool ensureComputeHeap(CommandContext* ctx, UINT required) {
+    if (!ctx || required == 0) return false;
+    if (ctx->resourceComputeHeap && ctx->resourceComputeNext <= ctx->resourceComputeCapacity
+        && required <= ctx->resourceComputeCapacity - ctx->resourceComputeNext) {
+        return true;
+    }
+    const UINT oldCapacity = ctx->resourceComputeCapacity;
+    if (required > UINT_MAX - ctx->resourceComputeNext) return false;
+    const UINT requested = ctx->resourceComputeNext + required;
+    const UINT doubled = oldCapacity <= UINT_MAX / 2 ? oldCapacity * 2u : UINT_MAX;
+    const UINT capacity = std::max(requested, std::max(64u, doubled));
+    if (capacity == UINT_MAX) return false;
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heapDesc.NumDescriptors = 64;
+    heapDesc.NumDescriptors = capacity;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    const HRESULT hr =
-        gCtx.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&gCtx.computeUavHeap));
-    if (FAILED(hr)) {
-        dbgLogError("compute: CreateDescriptorHeap hr=0x%s", formatBackendResult(hr).c_str());
+    auto page = std::make_shared<ComPtr<ID3D12DescriptorHeap>>();
+    if (FAILED(gCtx.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(page->GetAddressOf())))) {
         return false;
     }
-    gCtx.computeUavStride =
-        gCtx.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    gCtx.computeUavNext = 0;
-    dbgLogInfo("compute: descriptor heap ready (64 slots, stride=%u)", gCtx.computeUavStride);
+    ctx->recordingLeases[ctx->currentListSlot].push_back(page);
+    ctx->resourceComputeHeap = *page;
+    ctx->resourceComputeCapacity = capacity;
+    ctx->resourceComputeNext = 0;
     return true;
 }
 
-UINT computeHeapSlot() { return gCtx.computeUavNext++ % 64; }
-
-D3D12_CPU_DESCRIPTOR_HANDLE computeHeapCpu(UINT slot) {
-    D3D12_CPU_DESCRIPTOR_HANDLE h = gCtx.computeUavHeap->GetCPUDescriptorHandleForHeapStart();
-    h.ptr += static_cast<SIZE_T>(slot) * gCtx.computeUavStride;
+D3D12_CPU_DESCRIPTOR_HANDLE computeHeapCpu(CommandContext* ctx, UINT slot) {
+    D3D12_CPU_DESCRIPTOR_HANDLE h = ctx->resourceComputeHeap->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += static_cast<SIZE_T>(slot)
+        * gCtx.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     return h;
 }
 
-D3D12_GPU_DESCRIPTOR_HANDLE computeHeapGpu(UINT slot) {
-    D3D12_GPU_DESCRIPTOR_HANDLE h = gCtx.computeUavHeap->GetGPUDescriptorHandleForHeapStart();
-    h.ptr += static_cast<UINT64>(slot) * gCtx.computeUavStride;
+D3D12_GPU_DESCRIPTOR_HANDLE computeHeapGpu(CommandContext* ctx, UINT slot) {
+    D3D12_GPU_DESCRIPTOR_HANDLE h = ctx->resourceComputeHeap->GetGPUDescriptorHandleForHeapStart();
+    h.ptr += static_cast<UINT64>(slot)
+        * gCtx.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     return h;
 }
 
@@ -4020,6 +5697,75 @@ mcdr::Result<void*> createComputePipeline(const void* dxil, int32_t dxilSize) {
     return static_cast<void*>(obj.release());
 }
 
+mcdr::Result<void*> createTerrainTileBinningPipeline(const void* dxil, int32_t dxilSize) {
+    if (auto d = ensureDevice(); !d) return mcdr::err("createTerrainTileBinningPipeline", errorMessage(d.error()));
+    if (dxil == nullptr || dxilSize <= 0)
+        return mcdr::err("createTerrainTileBinningPipeline", "empty DXIL bytecode");
+
+    D3D12_ROOT_PARAMETER params[8]{};
+    const auto setCbv = [](D3D12_ROOT_PARAMETER& parameter, UINT shaderRegister) {
+        parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        parameter.Descriptor.ShaderRegister = shaderRegister;
+        parameter.Descriptor.RegisterSpace = 3;
+        parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    };
+    const auto setSrv = [](D3D12_ROOT_PARAMETER& parameter, UINT shaderRegister) {
+        parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        parameter.Descriptor.ShaderRegister = shaderRegister;
+        parameter.Descriptor.RegisterSpace = 3;
+        parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    };
+    const auto setUav = [](D3D12_ROOT_PARAMETER& parameter, UINT shaderRegister) {
+        parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        parameter.Descriptor.ShaderRegister = shaderRegister;
+        parameter.Descriptor.RegisterSpace = 3;
+        parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    };
+    setCbv(params[0], 0); // McdrTileDrawV1
+    setCbv(params[1], 1); // McdrTileBatchV1
+    setCbv(params[2], 2); // McdrTileBinBatchV1
+    setSrv(params[3], 8); // McdrTileEnvelopesV1
+    setUav(params[4], 0); // McdrTileMasksV1
+    setUav(params[5], 1); // McdrTilePrefixesV1
+    setUav(params[6], 2); // McdrTileCommandsV1
+    setUav(params[7], 3); // McdrTileControlV1
+
+    D3D12_ROOT_SIGNATURE_DESC rootDescription{};
+    rootDescription.NumParameters = static_cast<UINT>(std::size(params));
+    rootDescription.pParameters = params;
+    ComPtr<ID3DBlob> serialized;
+    ComPtr<ID3DBlob> errors;
+    HRESULT result = D3D12SerializeRootSignature(&rootDescription, D3D_ROOT_SIGNATURE_VERSION_1,
+        &serialized, &errors);
+    if (FAILED(result))
+        return mcdr::err("createTerrainTileBinningPipeline", "Root signature serialization failed hr=0x" +
+            formatBackendResult(result));
+
+    auto object = std::make_unique<Dx12Object>();
+    object->kind = Dx12Object::Kind::ComputePipeline;
+    object->size = dxilSize;
+    object->terrainTileBinning = true;
+    result = gCtx.device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+        IID_PPV_ARGS(&object->computeRootSignature));
+    if (FAILED(result))
+        return mcdr::err("createTerrainTileBinningPipeline", "Root signature creation failed hr=0x" +
+            formatBackendResult(result));
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline{};
+    pipeline.pRootSignature = object->computeRootSignature.Get();
+    pipeline.CS.pShaderBytecode = dxil;
+    pipeline.CS.BytecodeLength = static_cast<SIZE_T>(dxilSize);
+    result = gCtx.device->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&object->computePipelineState));
+    if (FAILED(result)) {
+        dumpInfoQueueMessages();
+        return mcdr::err("createTerrainTileBinningPipeline", "Compute PSO creation failed hr=0x" +
+            formatBackendResult(result));
+    }
+    dbgLogInfo("createTerrainTileBinningPipeline: PSO handle=%p dxil=%d bytes (space3 b0/b1/b2 + t8 + u0..u3)",
+        static_cast<void*>(object.get()), dxilSize);
+    return static_cast<void*>(object.release());
+}
+
 int dispatchCompute(CommandContext* ctx, Dx12Object* pipeline, Dx12Object* uavTexture,
                     const int32_t* constants, int32_t constantCount, int32_t x, int32_t y, int32_t z) {
     if (ctx == nullptr || !ctx->commandList || !ctx->listOpen) {
@@ -4058,12 +5804,13 @@ int dispatchCompute(CommandContext* ctx, Dx12Object* pipeline, Dx12Object* uavTe
     // P234：typed UAV 必须经描述符表绑定（见根签名里 uavRange 的注释）。堆懒建，
     // 64 槽 ring —— 一次 dispatch 占一格；同一帧内多次 dispatch 各自占格，避免
     // 覆盖前一次已录制但未执行的描述符。
-    if (!ensureComputeHeap()) {
+    if (!ensureComputeHeap(ctx, 1)) {
         return 0;
     }
-    const UINT uavSlot = computeHeapSlot();
-    const D3D12_CPU_DESCRIPTOR_HANDLE uavCpu = computeHeapCpu(uavSlot);
-    const D3D12_GPU_DESCRIPTOR_HANDLE uavGpu = computeHeapGpu(uavSlot);
+    if (prepareSampledTextureWrite(ctx, uavTexture, 0, 1) != SampledTextureContentStatus::Ready) return 0;
+    const UINT uavSlot = ctx->resourceComputeNext++;
+    const D3D12_CPU_DESCRIPTOR_HANDLE uavCpu = computeHeapCpu(ctx, uavSlot);
+    const D3D12_GPU_DESCRIPTOR_HANDLE uavGpu = computeHeapGpu(ctx, uavSlot);
     D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
     uavDesc.Format = uavTexture->dxgiFormat;
     uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
@@ -4076,7 +5823,7 @@ int dispatchCompute(CommandContext* ctx, Dx12Object* pipeline, Dx12Object* uavTe
     transitionTextureTo(ctx, uavTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list->SetPipelineState(pipeline->computePipelineState.Get());
     list->SetComputeRootSignature(pipeline->computeRootSignature.Get());
-    ID3D12DescriptorHeap* heaps[1] = {gCtx.computeUavHeap.Get()};
+    ID3D12DescriptorHeap* heaps[1] = {ctx->resourceComputeHeap.Get()};
     list->SetDescriptorHeaps(1, heaps);
     list->SetComputeRootDescriptorTable(0, uavGpu);
     if (constantCount > 0) {
@@ -4216,22 +5963,23 @@ int dispatchComputeShadingRate(CommandContext* ctx, Dx12Object* pipeline, Dx12Ob
         return 0;
     }
 
-    if (!ensureComputeHeap()) return 0;
+    if (!ensureComputeHeap(ctx, 4)) return 0;
     ID3D12GraphicsCommandList* list = ctx->commandList;
 
+    if (prepareSampledTextureWrite(ctx, image, 0, 1) != SampledTextureContentStatus::Ready) return 0;
     // 三张 SRV 必须落在同一条连续区间（根参数 [0] 是 3 个描述符的表）。
-    const UINT srvSlot = computeHeapSlot();
+    const UINT srvSlot = ctx->resourceComputeNext;
     const UINT uavSlot = srvSlot + 3;
-    gCtx.computeUavNext = srvSlot + 4;
-    const D3D12_CPU_DESCRIPTOR_HANDLE srvCpu = computeHeapCpu(srvSlot);
-    const D3D12_CPU_DESCRIPTOR_HANDLE uavCpu = computeHeapCpu(uavSlot);
+    ctx->resourceComputeNext = srvSlot + 4;
+    const D3D12_CPU_DESCRIPTOR_HANDLE srvCpu = computeHeapCpu(ctx, srvSlot);
+    const D3D12_CPU_DESCRIPTOR_HANDLE uavCpu = computeHeapCpu(ctx, uavSlot);
     if (srvDepth->cpuHandle.ptr != 0) {
         gCtx.device->CopyDescriptorsSimple(1, srvCpu, srvDepth->cpuHandle,
                                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
     if (srvMotion->cpuHandle.ptr != 0) {
         D3D12_CPU_DESCRIPTOR_HANDLE second{};
-        second.ptr = srvCpu.ptr + gCtx.computeUavStride;
+        second = computeHeapCpu(ctx, srvSlot + 1);
         gCtx.device->CopyDescriptorsSimple(1, second, srvMotion->cpuHandle,
                                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
@@ -4239,11 +5987,12 @@ int dispatchComputeShadingRate(CommandContext* ctx, Dx12Object* pipeline, Dx12Ob
     // 着色器里由 constants 的 bit1 决定要不要读它。
     if (srvPrevious->cpuHandle.ptr != 0) {
         D3D12_CPU_DESCRIPTOR_HANDLE third{};
-        third.ptr = srvCpu.ptr + 2 * gCtx.computeUavStride;
+        third = computeHeapCpu(ctx, srvSlot + 2);
         gCtx.device->CopyDescriptorsSimple(1, third, srvPrevious->cpuHandle,
                                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     } else {
         dbgLogError("dispatchComputeShadingRate: previous image view has no CPU handle");
+        ctx->recordingFailed.store(true, std::memory_order_release);
         return 0;
     }
     D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
@@ -4270,16 +6019,17 @@ int dispatchComputeShadingRate(CommandContext* ctx, Dx12Object* pipeline, Dx12Ob
 
     list->SetPipelineState(pipeline->computePipelineState.Get());
     list->SetComputeRootSignature(pipeline->computeRootSignature.Get());
-    ID3D12DescriptorHeap* heaps[1] = {gCtx.computeUavHeap.Get()};
+    ID3D12DescriptorHeap* heaps[1] = {ctx->resourceComputeHeap.Get()};
     list->SetDescriptorHeaps(1, heaps);
-    list->SetComputeRootDescriptorTable(0, computeHeapGpu(srvSlot));
-    list->SetComputeRootDescriptorTable(1, computeHeapGpu(uavSlot));
+    list->SetComputeRootDescriptorTable(0, computeHeapGpu(ctx, srvSlot));
+    list->SetComputeRootDescriptorTable(1, computeHeapGpu(ctx, uavSlot));
     if (constantCount > 0) {
         list->SetComputeRoot32BitConstants(2, static_cast<UINT>(constantCount), constants, 0);
     }
     list->Dispatch(static_cast<UINT>(x), static_cast<UINT>(y), static_cast<UINT>(z));
     // 图像留在 COMMON：绑定前由 setShadingRateImage 单独转到 SHADING_RATE_SOURCE。
     transitionTextureTo(ctx, image, D3D12_RESOURCE_STATE_COMMON);
+    restoreDrawHeap(ctx);
     return 1;
 }
 
@@ -4329,52 +6079,85 @@ mcdr::Result<void*> createShadingRateImage(int32_t width, int32_t height) {
 // 把图像挂到命令列表的 SRI 槽位（image == nullptr 表示摘掉）。
 // SHADING_RATE_SOURCE 是 D3D12_RESOURCE_STATES 里一个普通位（0x1000000），
 // transitionTo 直接能用 —— 本模块没有别的 barrier ABI。
-int setShadingRateImage(CommandContext* ctx, Dx12Object* image) {
-    if (ctx == nullptr || !ctx->commandList || !ctx->listOpen) {
-        dbgLogError("setShadingRateImage: called without an open command list");
-        return -2;
-    }
-    ComPtr<ID3D12GraphicsCommandList5> list5;
-    if (FAILED(ctx->commandList->QueryInterface(IID_PPV_ARGS(&list5))) || !list5) {
-        dbgLogWarn("setShadingRateImage: command list is not ID3D12GraphicsCommandList5");
-        return 0;
-    }
+namespace {
+void setCommandShadingRateImage(CommandContext* ctx, ID3D12GraphicsCommandList5* list5, Dx12Object* image) {
     if (image == nullptr) {
         list5->RSSetShadingRateImage(nullptr);
         // P235：解绑必须把图像转回 COMMON —— SHADING_RATE_SOURCE 只在"绑定期间"
         // 合法，其余代码路径一律按 COMMON 做状态转换（读回就是其中之一）。
-        if (gCtx.shadingRateImageBound != nullptr && gCtx.shadingRateImageBound->resource) {
-            transitionTo(ctx, gCtx.shadingRateImageBound->resource.Get(),
+        if (ctx->shadingRateImageBound != nullptr && ctx->shadingRateImageBound->resource) {
+            transitionTo(ctx, ctx->shadingRateImageBound->resource.Get(),
                          D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-            gCtx.shadingRateImageBound = nullptr;
+            ctx->shadingRateImageBound = nullptr;
         }
-        return 1;
-    }
-    if (image->kind != Dx12Object::Kind::Texture || !image->resource) {
-        dbgLogError("setShadingRateImage: handle is not a texture");
-        return -1;
+        return;
     }
     // 换绑：先把上一张转回 COMMON，再推新的这张。
-    if (gCtx.shadingRateImageBound != nullptr && gCtx.shadingRateImageBound != image
-        && gCtx.shadingRateImageBound->resource) {
-        transitionTo(ctx, gCtx.shadingRateImageBound->resource.Get(),
+    if (ctx->shadingRateImageBound != nullptr && ctx->shadingRateImageBound != image
+        && ctx->shadingRateImageBound->resource) {
+        transitionTo(ctx, ctx->shadingRateImageBound->resource.Get(),
                      D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-        gCtx.shadingRateImageBound = nullptr;
+        ctx->shadingRateImageBound = nullptr;
     }
+    retainObjectForRecording(ctx, image);
     transitionTo(ctx, image->resource.Get(), D3D12_RESOURCE_STATE_COMMON,
                  D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE);
-    gCtx.shadingRateImageBound = image;
+    ctx->shadingRateImageBound = image;
     list5->RSSetShadingRateImage(image->resource.Get());
     static bool logged = false;
     if (!logged) {
         logged = true;
         dbgLogInfo("setShadingRateImage: RSSetShadingRateImage bound");
     }
+}
+}
+
+int setShadingRateImage(CommandContext* ctx, Dx12Object* image) {
+    if (ctx == nullptr || !ctx->commandList || !ctx->listOpen) {
+        dbgLogError("setShadingRateImage: called without an open command list");
+        return -2;
+    }
+    if (image && (image->kind!=Dx12Object::Kind::Texture || !image->resource)) {
+        dbgLogError("setShadingRateImage: handle is not a texture");
+        return -1;
+    }
+    if (!gCtx.caps.shadingRateImageSupported()) return 0;
+    ComPtr<ID3D12GraphicsCommandList5> list5;
+    if (FAILED(ctx->commandList->QueryInterface(IID_PPV_ARGS(&list5))) || !list5) {
+        dbgLogWarn("setShadingRateImage: command list is not ID3D12GraphicsCommandList5");
+        return 0;
+    }
+    setCommandShadingRateImage(ctx,list5.Get(),image);
     return 1;
 }
 
 mcdr::Result<void*> createGraphicsPipeline(const PipelineDesc& desc) {
     if (auto d = ensureDevice(); !d) return mcdr::err("createGraphicsPipeline", errorMessage(d.error()));
+    if (desc.captureHash) {
+        if (const auto supported = requireCaptureBarycentrics(); !supported)
+            return std::unexpected(supported.error());
+    }
+    if (desc.colorCount < 0 || desc.colorCount > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT ||
+        desc.colorTargets.size() < static_cast<size_t>(desc.colorCount)) {
+        return mcdr::err("createGraphicsPipeline", "invalid color target count");
+    }
+    if (desc.rasterMotion) {
+        if (desc.colorCount < 2 ||
+            toDxgiFormat(desc.colorTargets[desc.colorCount - 1].format) != DXGI_FORMAT_R32G32B32A32_FLOAT ||
+            desc.colorTargets[desc.colorCount - 1].writeMask != D3D12_COLOR_WRITE_ENABLE_ALL)
+            return mcdr::err("createGraphicsPipeline", "raster motion requires a world target and a final full RGBA32_FLOAT MRT");
+        const auto& motion = desc.colorTargets[desc.colorCount - 1];
+        if (motion.blendEnabled) {
+            if (motion.srcColor != 11 || motion.dstColor != 9 || motion.colorOp != 0 ||
+                motion.srcAlpha != 11 || motion.dstAlpha != 9 || motion.alphaOp != 0)
+                return mcdr::err("createGraphicsPipeline", "raster motion only supports source-alpha gated blending");
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT support{};
+            support.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            if (FAILED(gCtx.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+                (support.Support1 & D3D12_FORMAT_SUPPORT1_BLENDABLE) == 0)
+                return mcdr::err("createGraphicsPipeline", "RGBA32_FLOAT motion blending is unavailable on this device");
+        }
+    }
 
     std::vector<uint8_t> vsBytes = desc.vsBytes;
     std::vector<uint8_t> psBytes = desc.psBytes;
@@ -4423,6 +6206,10 @@ mcdr::Result<void*> createGraphicsPipeline(const PipelineDesc& desc) {
                    smProfile.c_str(), vsDxil.size(), psDxil.size());
     }
 
+    if (desc.captureHash) {
+        if (const auto capture=validateCapturePixelShader(psDxil.data(),static_cast<uint32_t>(psDxil.size())); !capture)
+            return std::unexpected(capture.error());
+    }
     // 2) root signature：CBV 走 root descriptor（每 draw 直接
     //    SetGraphicsRootConstantBufferView，地址烘焙进命令列表，零描述符堆写入）；
     //    SRV 汇入单个 descriptor table（每批只写一次 + 一次
@@ -4497,7 +6284,31 @@ mcdr::Result<void*> createGraphicsPipeline(const PipelineDesc& desc) {
     rsDesc.NumStaticSamplers = static_cast<UINT>(staticSamplers.size());
     rsDesc.pStaticSamplers = staticSamplers.empty() ? nullptr : staticSamplers.data();
     rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    if (desc.pushConstantBytes > 128 || desc.pushConstantBytes % 4 != 0 ||
+        cbvRegs.size() * 2 + (srvRanges.empty() ? 0 : 1) + desc.pushConstantBytes / 4 + (desc.captureHash ? 4 : 0) > 64) {
+        return mcdr::err("createGraphicsPipeline", "root constant size or root DWORD budget exceeded");
+    }
+    const UINT constantParam = static_cast<UINT>(params.size());
+    if (desc.pushConstantBytes != 0) {
+        D3D12_ROOT_PARAMETER parameter{};
+        parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        parameter.Constants = {0, 1, desc.pushConstantBytes / 4};
+        parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params.push_back(parameter);
+        rsDesc.NumParameters = static_cast<UINT>(params.size());
+        rsDesc.pParameters = params.data();
+    }
 
+    D3D12_DESCRIPTOR_RANGE captureRanges[2]{};
+    UINT captureParam = UINT_MAX;
+    if (desc.captureHash != 0) {
+        if (desc.captureHash != mcdr::oit_shader::contractHash || !desc.hasDepth || desc.depthWrite ||
+            desc.psBytes.empty() || desc.rasterMotion || desc.captureGeneration == 0)
+            return mcdr::err("createGraphicsPipeline", "Capture requires a matching shader contract and read-only depth");
+        captureParam = mcdr::graphics_capture::appendParameters(params, captureRanges);
+        rsDesc.NumParameters = static_cast<UINT>(params.size());
+        rsDesc.pParameters = params.data();
+    }
     ComPtr<ID3DBlob> rsBlob, rsErr;
     HRESULT hr = D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1_0, &rsBlob, &rsErr);
     if (FAILED(hr)) {
@@ -4767,7 +6578,34 @@ mcdr::Result<void*> createGraphicsPipeline(const PipelineDesc& desc) {
     //    仅当管线无深度状态时再创建 withoutDepth（DSV=UNKNOWN，无深度附件）。
     auto pipeline = std::make_unique<Dx12Pipeline>();
     pipeline->rootSignature = rootSig;
+    pipeline->shaderGeneration = allocateGraphicsPipelineGeneration();
+    if (!pipeline->shaderGeneration)
+        return mcdr::err("createGraphicsPipeline", "Graphics shader generation exhausted");
+    pipeline->graphicsBindingLayoutKnown = true;
+    for (const auto& binding : desc.bindings) {
+        pipeline->graphicsBindingTypes.push_back(binding.type);
+        pipeline->graphicsBindingRegisters.push_back(binding.reg);
+    }
+    pipeline->pushConstantBytes = desc.pushConstantBytes;
+    pipeline->pushConstantParam = desc.pushConstantBytes ? constantParam : UINT_MAX;
+    pipeline->captureParam = captureParam;
+    pipeline->captureHash = desc.captureHash;
+    pipeline->captureGeneration = desc.captureGeneration;
+    pipeline->normalizationProvenance = desc.normalizationProvenance;
+    if (desc.captureHash) {
+        pipeline->captureBudget = mcdr::oit_budget::reserve(1024 * 1024);
+        if (!pipeline->captureBudget) return mcdr::err("createGraphicsPipeline", "Capture pipeline budget exceeded");
+    }
     pipeline->topology = desc.topology;
+    pipeline->rasterMotion = desc.rasterMotion;
+    pipeline->depthWrite = desc.hasDepth && desc.depthWrite;
+    pipeline->rasterMotionWritesWorldColor = false;
+    const int worldColorCount = desc.colorCount - (desc.rasterMotion ? 1 : 0);
+    for (int targetIndex = 0; targetIndex < worldColorCount; ++targetIndex) {
+        const auto& target = desc.colorTargets[targetIndex];
+        if (target.format >= 0 && target.writeMask != 0) pipeline->rasterMotionWritesWorldColor = true;
+    }
+    pipeline->colorTargetCount = static_cast<UINT>(numRT);
 
     // P192：每个 slot 用自己的步长（详见上面 slotStride 的注释）。
     for (UINT slot = 0; slot < 16; ++slot) {
@@ -4910,10 +6748,35 @@ mcdr::Result<void*> createGraphicsPipeline(const PipelineDesc& desc) {
     return static_cast<void*>(pipeline.release());
 }
 
+mcdr::Result<void> pushGraphicsConstants(void* rawContext, const void* data, uint32_t byteSize) {
+    auto* context = static_cast<CommandContext*>(rawContext);
+    if (!context || !context->listOpen || !context->currentPipeline || !data || byteSize == 0 ||
+        byteSize != context->currentPipeline->pushConstantBytes || byteSize > 128 || byteSize % 4 != 0 ||
+        context->currentPipeline->pushConstantParam == UINT_MAX) {
+        return mcdr::err("pushGraphicsConstants", "invalid context, active pipeline, or constant byte size");
+    }
+    context->commandList->SetGraphicsRoot32BitConstants(context->currentPipeline->pushConstantParam,
+        byteSize / 4, data, 0);
+    std::memcpy(context->graphicsDrawState.pushConstants.data(), data, byteSize);
+    context->graphicsDrawState.pushConstantBytes = byteSize;
+    context->graphicsDrawState.pushRoot = context->currentPipeline->rootSignature.Get();
+    context->graphicsDrawState.pushConstantsValid = true;
+    return {};
+}
+
 void destroyPipeline(Dx12Pipeline* pipeline) {
     DBG_LOG_DEBUG("destroyPipeline: pso=%p", (void*)pipeline);
-    delete pipeline;
+    if (pipeline && pipeline->lifetimeReferences.fetch_sub(1, std::memory_order_acq_rel) == 1) delete pipeline;
     DBG_LOG_DEBUG("destroyPipeline: done");
+}
+
+uint64_t allocateGraphicsPipelineGeneration() {
+    static std::atomic<uint64_t> nextGeneration{1};
+    auto generation = nextGeneration.load(std::memory_order_relaxed);
+    do {
+        if (generation == UINT64_MAX) return 0;
+    } while (!nextGeneration.compare_exchange_weak(generation, generation + 1, std::memory_order_relaxed));
+    return generation;
 }
 
 // ---------------------------------------------------------------------------
@@ -4932,20 +6795,69 @@ mcdr::Result<void> setPipeline(CommandContext* ctx, Dx12Pipeline* pipeline, bool
     if (!pipeline->rootSignature) {
         return mcdr::err("setPipeline", "setPipeline: null root signature");
     }
+    if (pipeline->rasterMotion && (!ctx->inRenderPass || !ctx->activeMotionTarget || !hasDepth)) {
+        return mcdr::err("setPipeline", "raster motion pipeline requires its registered world pass");
+    }
+    if (ctx->activeMotionTarget || ctx->additionalColorTarget) {
+        const UINT expected = static_cast<UINT>(ctx->activePassRtvs.size()) +
+            (pipeline->rasterMotion ? 1u : 0u) + (ctx->additionalColorTarget ? 1u : 0u);
+        const bool depthOnly = !pipeline->rasterMotion && pipeline->colorTargetCount == 0;
+        if (pipeline->colorTargetCount != UINT_MAX && pipeline->colorTargetCount != expected && !depthOnly) {
+            return mcdr::err("setPipeline", "pipeline color target count differs from the active world attachments");
+        }
+        const UINT targetCount = depthOnly ? 0u : expected;
+        if (ctx->cachedPso == nullptr || ctx->rasterMotionSelected != pipeline->rasterMotion ||
+            ctx->activePassBoundColorCount != targetCount) {
+            auto targets = depthOnly ? std::vector<D3D12_CPU_DESCRIPTOR_HANDLE>{} : ctx->activePassRtvs;
+            if (!depthOnly && ctx->additionalColorTarget) {
+                if (const auto result = transitionAttachmentRanges(ctx, ctx->additionalColorTarget, false); !result) return result;
+                targets.push_back(ctx->additionalColorRtv);
+            }
+            if (pipeline->rasterMotion) {
+                if (const auto result = transitionAttachmentRanges(ctx, ctx->activeMotionTarget, false); !result) return result;
+                targets.push_back(ctx->activeMotionRtv);
+            }
+            ctx->commandList->OMSetRenderTargets(static_cast<UINT>(targets.size()), targets.empty() ? nullptr : targets.data(), FALSE,
+                ctx->activeDepthTarget ? &ctx->activePassDsv : nullptr);
+            ctx->rasterMotionSelected = pipeline->rasterMotion;
+            ctx->activePassBoundColorCount = targetCount;
+        }
+    }
+    if (ctx->retainedGraphicsPipelines.emplace(pipeline, true).second) {
+        pipeline->lifetimeReferences.fetch_add(1, std::memory_order_relaxed);
+        ctx->recordingLeases[ctx->currentListSlot].push_back(std::shared_ptr<void>(pipeline, [](void* retained) {
+            destroyPipeline(static_cast<Dx12Pipeline*>(retained));
+        }));
+    }
     // P64：快速路径——同一命令列表内重复设置同一 PSO 时，root signature / PSO /
     // topology 三者均未变，跳过 3 次驱动调用（GUI/串行路径同一管线连续 draw 常见）。
     // 比较 PSO 裸指针：管线被销毁重建会得到新的 ID3D12PipelineState，不会误命中。
     if (pso == ctx->cachedPso) {
+        ctx->graphicsHasDepth = hasDepth;
         ctx->currentPipeline = pipeline;  // 保持 setVertexBuffer 的 stride 修正
         return {};
     }
     // P6 崩溃修复（第 5 轮）：D3D12 规定使用任何 root 参数（SetGraphicsRootDescriptorTable
     // 等）前必须先 SetGraphicsRootSignature。此前缺失 → UMD 首次真实 draw 时对 NULL root
     // signature 解引用崩溃（hs_err：NVIDIA UMD 内读 NULL+0x2b88，AV，PC 0x7ffcd70e8fa3）。
+    if (ctx->graphicsBindingRoot != pipeline->rootSignature.Get()) {
+        const bool viewportValid = ctx->graphicsDrawState.viewportValid;
+        const bool scissorValid = ctx->graphicsDrawState.scissorValid;
+        invalidateGraphicsInputBindings(ctx, false);
+        ctx->graphicsDrawState.viewportValid = viewportValid;
+        ctx->graphicsDrawState.scissorValid = scissorValid;
+    }
     ctx->commandList->SetGraphicsRootSignature(pipeline->rootSignature.Get());
+    ctx->graphicsBindingRoot = pipeline->rootSignature.Get();
+    if (pipeline->pushConstantBytes == 0) {
+        ctx->graphicsDrawState.pushConstantBytes = 0;
+        ctx->graphicsDrawState.pushRoot = pipeline->rootSignature.Get();
+        ctx->graphicsDrawState.pushConstantsValid = true;
+    }
     ctx->commandList->SetPipelineState(pso);
     ctx->currentPipeline = pipeline;
     ctx->cachedPso = pso;
+    ctx->graphicsHasDepth = hasDepth;
     // P6 纯色黑屏修复：D3D12 命令列表初始 topology 是 UNDEFINED，必须显式
     // IASetPrimitiveTopology，否则 GPU 丢弃全部图元（只有 clear 色可见）。
     // P72：mesh 管线（AS/MS）没有 IA 阶段，PSO 里也没有输入布局，跳过 IA 状态设置。
@@ -4968,6 +6880,8 @@ mcdr::Result<void> setScissor(CommandContext* ctx, int x, int y, int w, int h) {
     D3D12_RECT rect{static_cast<LONG>(x), static_cast<LONG>(y), static_cast<LONG>(x) + w,
                     static_cast<LONG>(y) + h};
     ctx->commandList->RSSetScissorRects(1, &rect);
+    ctx->graphicsDrawState.scissor = rect;
+    ctx->graphicsDrawState.scissorValid = true;
     return {};
 }
 
@@ -4986,6 +6900,8 @@ mcdr::Result<void> setViewport(CommandContext* ctx, int x, int y, int w, int h) 
                       0.0f,
                       1.0f};
     ctx->commandList->RSSetViewports(1, &vp);
+    ctx->graphicsDrawState.viewport = vp;
+    ctx->graphicsDrawState.viewportValid = true;
     return {};
 }
 
@@ -4997,7 +6913,8 @@ mcdr::Result<void> setVertexBuffer(CommandContext* ctx, int slot, Dx12Object* bu
     if (slot < 0 || slot >= 16) {
         return mcdr::err("setVertexBuffer", "setVertexBuffer: slot out of range");
     }
-    if (!buffer || buffer->kind != Dx12Object::Kind::Buffer) {
+    if (!buffer || buffer->kind != Dx12Object::Kind::Buffer || !buffer->resource ||
+        buffer->heapType == D3D12_HEAP_TYPE_READBACK) {
         return mcdr::err("setVertexBuffer", "setVertexBuffer: invalid buffer handle");
     }
     if (offset < 0 || offset >= buffer->size) {
@@ -5013,6 +6930,9 @@ mcdr::Result<void> setVertexBuffer(CommandContext* ctx, int slot, Dx12Object* bu
     vb.SizeInBytes = static_cast<UINT>(buffer->size - offset);
     vb.StrideInBytes = effectiveStride;
     ctx->commandList->IASetVertexBuffers(static_cast<UINT>(slot), 1, &vb);
+    ctx->graphicsVertexBuffers[slot] = buffer;
+    ctx->graphicsVertexViews[slot] = vb;
+    retainObjectForRecording(ctx, buffer);
     DBG_LOG_DEBUG("setVertexBuffer: slot=%d buf=%p size=%lld off=%lld javaStride=%d effStride=%d heap=%d",
                   slot, (void*)buffer, (long long)buffer->size, (long long)offset, (int)stride,
                   (int)effectiveStride, (int)buffer->heapType);
@@ -5023,7 +6943,8 @@ mcdr::Result<void> setIndexBuffer(CommandContext* ctx, Dx12Object* buffer, int i
     if (!ctx || !ctx->listOpen) {
         return mcdr::err("setIndexBuffer", "setIndexBuffer: no open command list");
     }
-    if (!buffer || buffer->kind != Dx12Object::Kind::Buffer) {
+    if (!buffer || buffer->kind != Dx12Object::Kind::Buffer || !buffer->resource ||
+        buffer->heapType == D3D12_HEAP_TYPE_READBACK) {
         return mcdr::err("setIndexBuffer", "setIndexBuffer: invalid buffer handle");
     }
     transitionBufferTo(ctx, buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
@@ -5032,6 +6953,9 @@ mcdr::Result<void> setIndexBuffer(CommandContext* ctx, Dx12Object* buffer, int i
     ib.SizeInBytes = static_cast<UINT>(buffer->size);
     ib.Format = indexType == 1 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
     ctx->commandList->IASetIndexBuffer(&ib);
+    ctx->graphicsIndexBuffer = buffer;
+    ctx->graphicsIndexView = ib;
+    retainObjectForRecording(ctx, buffer);
     // P6 诊断：确认每帧 draw 前确实绑定了索引缓冲（内容尺寸/索引宽度）。
     DBG_LOG_DEBUG("setIndexBuffer: buf=%p size=%lld idxWidth=%d heap=%d", (void*)buffer,
                   (long long)buffer->size, indexType == 1 ? 4 : 2, (int)buffer->heapType);
@@ -5070,12 +6994,367 @@ mcdr::Result<D3D12_SHADER_RESOURCE_VIEW_DESC> bufferSrvDescription(
 
 }
 
+namespace {
+
+ID3D12DescriptorHeap* drawHeapFor(CommandContext* ctx) {
+    return ctx->resourceDrawHeap ? ctx->resourceDrawHeap.Get() : gCtx.drawHeap.Get();
+}
+
+UINT drawHeapSlotFor(CommandContext* ctx, UINT offset) {
+    return ctx->resourceDrawHeap ? offset : ctx->drawHeapSlotBase + offset;
+}
+
+UINT drawHeapCapacityFor(CommandContext* ctx) {
+    return ctx->resourceDrawHeap ? ctx->resourceDrawCapacity : syncRingCapacity();
+}
+
+bool growDrawHeap(CommandContext* ctx, UINT required) {
+    if (!ctx || required == 0) return false;
+    if (required > UINT_MAX - ctx->nextDrawSlot) return false;
+    const UINT needed = ctx->nextDrawSlot + required;
+    const UINT current = ctx->resourceDrawHeap ? ctx->resourceDrawCapacity : 0;
+    if (ctx->resourceDrawHeap && needed <= current) return true;
+    if (ctx->resourceDrawHeap && ctx->currentPipeline && ctx->currentPipeline->isMesh &&
+        !ctx->currentPipeline->meshVisibleWork) return false;
+    const UINT doubled = current > 0 && current <= UINT_MAX / 2 ? current * 2 : 0;
+    const UINT capacity = std::max(needed, std::max(256u, doubled));
+    D3D12_DESCRIPTOR_HEAP_DESC desc{};
+    desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    desc.NumDescriptors = capacity;
+    desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    auto page = std::make_shared<ComPtr<ID3D12DescriptorHeap>>();
+    if (FAILED(gCtx.device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(page->GetAddressOf())))) return false;
+    ctx->recordingLeases[ctx->currentListSlot].push_back(page);
+    ctx->resourceDrawHeap = *page;
+    ctx->resourceDrawCapacity = capacity;
+    ctx->nextDrawSlot = 0;
+    ctx->lastSrvSlotOffset = 0;
+    ctx->lastSrvCount = 0;
+    ctx->lastSrvCbvCount = 0;
+    ctx->lastSrvViews.clear();
+    ID3D12DescriptorHeap* heaps[] = {ctx->resourceDrawHeap.Get()};
+    ctx->commandList->SetDescriptorHeaps(1, heaps);
+    return true;
+}
+
+}
+
+mcdr::Result<DrawDescriptorRange> allocateDrawDescriptors(CommandContext* context, UINT count) {
+    if (!context || !context->listOpen || !context->commandList || count == 0) {
+        return mcdr::err("allocateDrawDescriptors", "Draw descriptor allocation requires an open recording and a nonempty range");
+    }
+    if (!growDrawHeap(context, count)) {
+        return mcdr::err("allocateDrawDescriptors", "Draw descriptor heap growth failed");
+    }
+    const UINT offset = context->nextDrawSlot;
+    const SIZE_T byteOffset = static_cast<SIZE_T>(drawHeapSlotFor(context, offset)) * gCtx.drawInc;
+    DrawDescriptorRange range{drawHeapFor(context)->GetCPUDescriptorHandleForHeapStart(),
+                              drawHeapFor(context)->GetGPUDescriptorHandleForHeapStart(), offset};
+    range.cpu.ptr += byteOffset;
+    range.gpu.ptr += byteOffset;
+    context->nextDrawSlot += count;
+    return range;
+}
+
+namespace {
+
+mcdr::Result<void> mergeGraphicsReads(CommandContext* context,
+    std::vector<GraphicsResourceRange>& destination, const std::vector<GraphicsResourceRange>& source) {
+    for (const auto& range : source) {
+        for (const auto& attachment : context->activeAttachmentRanges) {
+            if (range.object->resource.Get() == attachment.object->resource.Get() &&
+                uint64_t(range.firstSubresource) < uint64_t(attachment.firstSubresource) + attachment.subresourceCount &&
+                uint64_t(attachment.firstSubresource) < uint64_t(range.firstSubresource) + range.subresourceCount) {
+                return mcdr::err("graphicsInputs", "graphics input overlaps an active color, depth or motion attachment");
+            }
+        }
+    }
+    for (const auto& range : source) {
+        for (uint32_t subresource = range.firstSubresource;
+             subresource < range.firstSubresource + range.subresourceCount; ++subresource) {
+            auto found = std::find_if(destination.begin(), destination.end(), [&](const auto& existing) {
+                return existing.object->resource.Get() == range.object->resource.Get() &&
+                    existing.firstSubresource == subresource;
+            });
+            if (found == destination.end()) destination.push_back({range.object, subresource, 1, range.state});
+            else found->state |= range.state;
+        }
+    }
+    return {};
+}
+
+mcdr::Result<void> addBufferRead(std::vector<GraphicsResourceRange>& ranges,
+                                Dx12Object* object, uint32_t state) {
+    if (!object || object->kind != Dx12Object::Kind::Buffer || !object->resource) {
+        return mcdr::err("graphicsInputs", "graphics input buffer is invalid");
+    }
+    if (object->heapType == D3D12_HEAP_TYPE_READBACK) {
+        return mcdr::err("graphicsInputs", "READBACK buffers cannot be graphics inputs");
+    }
+    ranges.push_back({object, 0, 1, object->heapType == D3D12_HEAP_TYPE_UPLOAD
+        ? uint32_t(D3D12_RESOURCE_STATE_GENERIC_READ) : state});
+    return {};
+}
+
+mcdr::Result<void> bindingReadRanges(CommandContext* context, const DrawBinding* bindings,
+    uint32_t count, std::vector<GraphicsResourceRange>& ranges, bool complete) {
+    const auto* pipeline = context->currentPipeline;
+    if (complete && pipeline && pipeline->graphicsBindingLayoutKnown) {
+        if (count != pipeline->graphicsBindingTypes.size()) {
+            return mcdr::err("graphicsInputs", "graphics binding packet does not match the current root layout");
+        }
+        for (uint32_t index = 0; index < count; ++index) {
+            if (bindings[index].type != pipeline->graphicsBindingTypes[index]) {
+                return mcdr::err("graphicsInputs", "graphics binding type differs from the current root layout");
+            }
+        }
+    }
+    auto& pending = context->graphicsBindingPendingScratch;
+    pending.clear();
+    for (uint32_t index = 0; index < count; ++index) {
+        const auto& binding = bindings[index];
+        if (binding.type == 0 || binding.type == 2) {
+            const auto state = binding.type == 0 ? D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER
+                : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            if (const auto result = addBufferRead(pending, binding.buffer, state); !result) return result;
+            if (binding.type == 0) {
+                if (binding.offset < 0 || binding.offset >= binding.buffer->size || binding.length < 0 ||
+                    binding.length > binding.buffer->size - binding.offset ||
+                    (binding.buffer->resource->GetGPUVirtualAddress() + static_cast<UINT64>(binding.offset)) % 256 != 0) {
+                    return mcdr::err("graphicsInputs", "graphics CBV offset, length or alignment is invalid");
+                }
+            } else if (const auto description = bufferSrvDescription(binding.buffer, binding.offset,
+                binding.length, binding.texelFormat); !description) return std::unexpected(description.error());
+        } else if (binding.type == 1) {
+            const auto* view = binding.view;
+            if (!view || view->kind != Dx12Object::Kind::TextureView || !view->hasSrvDesc ||
+                !view->cpuHandle.ptr || !view->sourceTexture) {
+                return mcdr::err("graphicsInputs", "graphics texture view has no valid SRV metadata");
+            }
+            const auto& description = view->srvDesc;
+            mcdr::Result<void> result;
+            constexpr uint32_t state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            if (description.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) {
+                result = textureSubresourceRanges(pending, view->sourceTexture,
+                    description.Texture2D.MostDetailedMip, description.Texture2D.MipLevels,
+                    0, 1, description.Texture2D.PlaneSlice, 1, state);
+            } else if (description.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE) {
+                result = textureSubresourceRanges(pending, view->sourceTexture,
+                    description.TextureCube.MostDetailedMip, description.TextureCube.MipLevels,
+                    0, 6, 0, 1, state);
+            } else return mcdr::err("graphicsInputs", "graphics SRV dimension is unsupported");
+            if (!result) return result;
+        } else return mcdr::err("graphicsInputs", "unknown graphics binding type");
+    }
+    return mergeGraphicsReads(context, ranges, pending);
+}
+
+mcdr::Result<void> applyGraphicsRanges(CommandContext* context,
+                                      const std::vector<GraphicsResourceRange>& ranges) {
+    for (const auto& range : ranges) {
+        if (!range.owner) retainObjectForRecording(context, range.object);
+        if (range.object->heapType == D3D12_HEAP_TYPE_UPLOAD) continue;
+        if (resourceSubresourceState(context, range.object->resource.Get(), range.firstSubresource,
+            D3D12_RESOURCE_STATE_COMMON) == range.state && range.subresourceCount == 1) continue;
+        if (const auto result = transitionResourceRange(context, range.object->resource.Get(),
+            range.firstSubresource, range.subresourceCount, D3D12_RESOURCE_STATE_COMMON, range.state); !result) return result;
+    }
+    return {};
+}
+
+}
+
+void invalidateGraphicsInputBindings(void* rawContext, bool invalidateIa) {
+    auto* context = static_cast<CommandContext*>(rawContext);
+    if (!context) return;
+    context->graphicsBindings.clear();
+    context->graphicsBindingsValid = false;
+    context->graphicsBindingRoot = nullptr;
+    context->graphicsBindingTable = {};
+    context->graphicsDrawState.pushConstantsValid = false;
+    context->graphicsDrawState.viewportValid = false;
+    context->graphicsDrawState.scissorValid = false;
+    context->cachedPso = nullptr;
+    if (invalidateIa) {
+        for (auto& buffer : context->graphicsVertexBuffers) buffer = nullptr;
+        context->graphicsIndexBuffer = nullptr;
+        for (auto& view : context->graphicsVertexViews) view = {};
+        context->graphicsIndexView = {};
+    }
+}
+
+void restoreGraphicsInputAssembly(void* rawContext) {
+    auto* context = static_cast<CommandContext*>(rawContext);
+    if (!context || !context->listOpen || !context->commandList) return;
+    for (UINT slot = 0; slot < 16; ++slot) {
+        if (context->graphicsVertexBuffers[slot]) {
+            context->commandList->IASetVertexBuffers(slot, 1, &context->graphicsVertexViews[slot]);
+        }
+    }
+    if (context->graphicsIndexBuffer) context->commandList->IASetIndexBuffer(&context->graphicsIndexView);
+}
+
+mcdr::Result<void> collectGraphicsInputs(void* rawContext, bool indexed, void* indirectCommands) {
+    auto* context = static_cast<CommandContext*>(rawContext);
+    if (!context || !context->listOpen || !context->commandList || !context->currentPipeline) {
+        return mcdr::err("graphicsInputs", "graphics input collection requires an active pipeline and recording");
+    }
+    context->graphicsInputRanges.clear();
+    const auto* pipeline = context->currentPipeline;
+    if (!pipeline->graphicsBindingLayoutKnown) {
+        return mcdr::err("graphicsInputs", "graphics pipeline has no declared binding layout");
+    }
+    if (pipeline->isMesh && indexed) {
+        return mcdr::err("graphicsInputs", "mesh pipelines cannot consume IA index input");
+    }
+    if (!pipeline->graphicsBindingTypes.empty() && (!context->graphicsBindingsValid ||
+        context->graphicsBindingRoot != pipeline->rootSignature.Get())) {
+        return mcdr::err("graphicsInputs", "effective graphics bindings were invalidated");
+    }
+    auto& pending = context->graphicsCollectScratch;
+    pending.clear();
+    if (const auto result = bindingReadRanges(context, context->graphicsBindings.data(),
+        static_cast<uint32_t>(context->graphicsBindings.size()), pending, true); !result) return result;
+    if (!pipeline->isMesh) {
+        for (const auto& input : pipeline->vertexStrides) {
+            const int slot = input.first;
+            if (slot < 0 || slot >= 16 || !context->graphicsVertexBuffers[slot]) {
+                return mcdr::err("graphicsInputs", "effective graphics vertex input is missing");
+            }
+            if (const auto result = addBufferRead(pending, context->graphicsVertexBuffers[slot],
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER); !result) return result;
+        }
+        if (indexed) {
+            if (const auto result = addBufferRead(pending, context->graphicsIndexBuffer,
+                D3D12_RESOURCE_STATE_INDEX_BUFFER); !result) return result;
+        }
+    }
+    if (indirectCommands) {
+        if (const auto result = addBufferRead(pending, static_cast<Dx12Object*>(indirectCommands),
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT); !result) return result;
+    }
+    if (const auto result = mergeGraphicsReads(context, context->graphicsInputRanges, pending); !result) return result;
+    if (pipeline->captureHash) {
+        const auto& capture = context->graphicsCapture;
+        if (!capture.lease || capture.contractHash != pipeline->captureHash || capture.generation != pipeline->captureGeneration)
+            return mcdr::err("graphicsInputs", "Capture pipeline has no matching immutable draw lease");
+        for (const auto& range : capture.resources) {
+            for (const auto& attachment : context->activeAttachmentRanges)
+                if (range.object->resource == attachment.object->resource)
+                    return mcdr::err("graphicsInputs", "Capture resources alias a raster attachment");
+            context->graphicsInputRanges.push_back(range);
+        }
+    }
+    return {};
+}
+
+mcdr::Result<void> appendGraphicsInputBindings(void* rawContext, const void* rawBindings, uint32_t count) {
+    auto* context = static_cast<CommandContext*>(rawContext);
+    if (!context || !context->listOpen || !context->commandList || (count != 0 && !rawBindings)) {
+        return mcdr::err("graphicsInputs", "additional graphics binding input is invalid");
+    }
+    return bindingReadRanges(context, static_cast<const DrawBinding*>(rawBindings), count,
+        context->graphicsInputRanges, false);
+}
+
+mcdr::Result<void> applyGraphicsInputReads(void* rawContext) {
+    auto* context = static_cast<CommandContext*>(rawContext);
+    if (!context || !context->listOpen || !context->commandList) {
+        return mcdr::err("graphicsInputs", "graphics input reads require an open recording");
+    }
+    if (prepareSampledRenderPassWrites(context) != SampledTextureContentStatus::Ready)
+        return mcdr::err("graphicsInputs", "sampled render attachment write ordering failed");
+    if (const auto result = applyGraphicsRanges(context, context->graphicsInputRanges); !result) return result;
+    return applyGraphicsCapture(rawContext);
+}
+
+void restoreGraphicsCaptureRate(void* rawContext) {
+    auto* context = static_cast<CommandContext*>(rawContext);
+    if (!context || !context->listOpen || !context->commandList) return;
+    auto& saved=context->captureShadingRate;
+    if (!saved.commandList || saved.recording!=context->commandList) return;
+    if (gCtx.caps.shadingRateImageSupported())
+        setCommandShadingRateImage(context,saved.commandList.Get(),saved.image);
+    saved.commandList->RSSetShadingRate(saved.rate,saved.combiners);
+    context->recordedShadingRate=saved.rate;
+    context->recordedShadingCombiners[0]=saved.combiners[0];
+    context->recordedShadingCombiners[1]=saved.combiners[1];
+    saved={};
+}
+
+mcdr::Result<void> applyGraphicsCapture(void* rawContext) {
+    auto* context = static_cast<CommandContext*>(rawContext);
+    if (!context || !context->currentPipeline) return mcdr::err("capture.bind", "Missing graphics pipeline");
+    auto* pipeline = context->currentPipeline;
+    if (!pipeline->captureHash) return {};
+    auto& capture = context->graphicsCapture;
+    if (!capture.lease || !capture.remainingDraws || capture.contractHash != pipeline->captureHash || capture.generation != pipeline->captureGeneration)
+        return mcdr::err("capture.bind", "Capture draw lease does not match the selected pipeline");
+    auto* oldHeap = context->resourceDrawHeap.Get();
+    const auto ordinarySrvCount = std::count_if(context->graphicsBindings.begin(), context->graphicsBindings.end(),
+        [](const DrawBinding& binding) { return binding.type != 0; });
+    const uint64_t requiredDescriptors = 14u + static_cast<uint64_t>(ordinarySrvCount);
+    if (requiredDescriptors > UINT_MAX || !growDrawHeap(context, static_cast<UINT>(requiredDescriptors)))
+        return mcdr::err("capture.bind", "Capture and graphics descriptor reservation failed");
+    auto allocated = allocateDrawDescriptors(context, 14);
+    if (!allocated) return std::unexpected(allocated.error());
+    auto range = *allocated;
+    if (oldHeap != context->resourceDrawHeap.Get() && !context->graphicsBindings.empty()) {
+        const auto bindings = context->graphicsBindings;
+        if (const auto restored = pushDescriptors(context, bindings); !restored) return restored;
+    }
+    auto destination = range.cpu;
+    auto source = capture.descriptors;
+    for (UINT index = 0; index != 14; ++index) {
+        gCtx.device->CopyDescriptorsSimple(1, destination, source, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        destination.ptr += gCtx.srvInc;
+        source.ptr += gCtx.srvInc;
+    }
+    context->commandList->SetGraphicsRootConstantBufferView(pipeline->captureParam, capture.constants);
+    context->commandList->SetGraphicsRootDescriptorTable(pipeline->captureParam + 1, range.gpu);
+    auto uav = range.gpu;
+    uav.ptr += static_cast<uint64_t>(gCtx.srvInc) * 11;
+    context->commandList->SetGraphicsRootDescriptorTable(pipeline->captureParam + 2, uav);
+    if (gCtx.caps.shadingRateSupported()) {
+        if (context->captureShadingRate.commandList)
+            return mcdr::err("capture.bind", "A previous capture shading scope is still active");
+        ComPtr<ID3D12GraphicsCommandList5> list;
+        if (FAILED(context->commandList->QueryInterface(IID_PPV_ARGS(&list))))
+            return mcdr::err("capture.bind", "Capture requires a shading-rate-capable command list");
+        auto& saved=context->captureShadingRate;
+        saved.commandList=list;
+        saved.recording=context->commandList;
+        saved.image=context->shadingRateImageBound;
+        saved.rate=context->recordedShadingRate;
+        saved.combiners[0]=context->recordedShadingCombiners[0];
+        saved.combiners[1]=context->recordedShadingCombiners[1];
+        if (gCtx.caps.shadingRateImageSupported())
+            setCommandShadingRateImage(context,list.Get(),nullptr);
+        const D3D12_SHADING_RATE_COMBINER combiners[2] = {D3D12_SHADING_RATE_COMBINER_PASSTHROUGH, D3D12_SHADING_RATE_COMBINER_PASSTHROUGH};
+        list->RSSetShadingRate(D3D12_SHADING_RATE_1X1, combiners);
+        context->recordedShadingRate=D3D12_SHADING_RATE_1X1;
+        context->recordedShadingCombiners[0]=combiners[0];
+        context->recordedShadingCombiners[1]=combiners[1];
+    }
+    --capture.remainingDraws;
+    return {};
+}
+
 mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindings) {
     if (!ctx || !ctx->listOpen) {
         return mcdr::err("pushDescriptors", "pushDescriptors: no open command list");
     }
     UINT count = static_cast<UINT>(bindings.size());
-    if (count == 0) return {};
+    auto& bindingReads = ctx->graphicsBindingReadScratch;
+    bindingReads.clear();
+    if (const auto result = bindingReadRanges(ctx, bindings.data(), count, bindingReads, true); !result) return result;
+    if (const auto result = applyGraphicsRanges(ctx, bindingReads); !result) return result;
+    if (count == 0) {
+        ctx->graphicsBindings.clear();
+        ctx->graphicsBindingsValid = true;
+        ctx->graphicsBindingTable = {};
+        return {};
+    }
     // B：CBV 走 root descriptor（不占堆槽位），只有 SRV 需要写瞬时描述符堆。
     UINT cbvCount = 0;
     UINT srvCount = 0;
@@ -5091,7 +7370,7 @@ mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBi
     // SRV 表（整张图集只有一张 view），旧逻辑每次新分配槽位，最终把每帧段用尽并抛异常。
     // 槽位在列表内只增不减，旧内容不会被覆写，所以复用是安全的；CBV 仍逐次重写 root 描述符。
     bool reuseSrvTable = false;
-    if (srvCount > 0 && ctx->lastSrvCount == srvCount) {
+    if (srvCount > 0 && ctx->lastSrvCount == srvCount && ctx->lastSrvCbvCount == cbvCount) {
         reuseSrvTable = true;
         size_t viewIndex = 0;
         for (const DrawBinding& b : bindings) {
@@ -5107,30 +7386,19 @@ mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBi
             ++viewIndex;
         }
     }
-    if (!reuseSrvTable && ctx->nextDrawSlot + srvCount > syncRingCapacity()) {
-        // 兜底：真到上限也不要把渲染线程打死。复用上一张同样大的表并告警——这一批 draw 的
-        // 贴图可能不对（加载屏阶段可接受），但不会像旧逻辑那样抛异常让客户端崩掉。
-        static int p243ExhaustWarned = 0;
-        if (p243ExhaustWarned < 8) {
-            ++p243ExhaustWarned;
-            dbgLogWarn("descriptor ring exhausted (next=%u need=%u cap=%u fence=%llu) - "
-                       "reusing previous SRV table",
-                       static_cast<unsigned>(ctx->nextDrawSlot), static_cast<unsigned>(srvCount),
-                       static_cast<unsigned>(syncRingCapacity()),
-                       static_cast<unsigned long long>(ctx->fenceValue));
-        }
-        if (ctx->lastSrvCount == srvCount && srvCount > 0) {
-            reuseSrvTable = true;
+    DrawDescriptorRange descriptors{};
+    if (srvCount > 0) {
+        if (reuseSrvTable) {
+            descriptors.offset = ctx->lastSrvSlotOffset;
+            const SIZE_T byteOffset = static_cast<SIZE_T>(drawHeapSlotFor(ctx, descriptors.offset)) * gCtx.drawInc;
+            descriptors.cpu = drawHeapFor(ctx)->GetCPUDescriptorHandleForHeapStart();
+            descriptors.gpu = drawHeapFor(ctx)->GetGPUDescriptorHandleForHeapStart();
+            descriptors.cpu.ptr += byteOffset;
+            descriptors.gpu.ptr += byteOffset;
         } else {
-            // 诊断：带上槽位画像，便于定位是哪条路径的 burst 超限（图集上传等）。
-            return mcdr::err("pushDescriptors",
-                             "pushDescriptors: draw descriptor heap exhausted for this frame (next="
-                                 + std::to_string(static_cast<long long>(ctx->nextDrawSlot))
-                                 + " need=" + std::to_string(static_cast<long long>(srvCount))
-                                 + " cap=" + std::to_string(static_cast<long long>(syncRingCapacity()))
-                                 + " section=" + std::to_string(static_cast<long long>(kDrawHeapPerFrame))
-                                 + " fence=" + std::to_string(static_cast<long long>(ctx->fenceValue))
-                                 + ")");
+            auto allocated = allocateDrawDescriptors(ctx, srvCount);
+            if (!allocated) return std::unexpected(allocated.error());
+            descriptors = allocated.value();
         }
     }
     // P16 诊断：每帧首 pushDescriptors 打印 binding 数量（确认 uniform/texture 被推送）
@@ -5152,10 +7420,10 @@ mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBi
                         (bj.buffer ? bj.buffer->heapType : -1));
         }
     }
-    const UINT srvSlotOffset = reuseSrvTable ? ctx->lastSrvSlotOffset : ctx->nextDrawSlot;
-    SIZE_T base = static_cast<SIZE_T>(ctx->drawHeapSlotBase + srvSlotOffset) * gCtx.drawInc;
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.drawHeap->GetCPUDescriptorHandleForHeapStart();
-    cpu.ptr += base;
+    const UINT srvSlotOffset = descriptors.offset;
+    ctx->graphicsBindingTable = srvCount ? descriptors.gpu : D3D12_GPU_DESCRIPTOR_HANDLE{};
+    const SIZE_T base = static_cast<SIZE_T>(drawHeapSlotFor(ctx, srvSlotOffset)) * gCtx.drawInc;
+    const D3D12_CPU_DESCRIPTOR_HANDLE cpu = descriptors.cpu;
     // 稠密编号：cbvIdx -> root 参数索引；srvIdx -> SRV 堆槽 / SRV 表内序号。
     UINT cbvIdx = 0;
     UINT srvIdx = 0;
@@ -5171,7 +7439,6 @@ mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBi
                     return mcdr::err("pushDescriptors",
                                      "pushDescriptors: invalid buffer for CBV entry " + std::to_string(i));
                 }
-                transitionBufferTo(ctx, b.buffer, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
                 D3D12_GPU_VIRTUAL_ADDRESS va =
                     b.buffer->resource->GetGPUVirtualAddress() + static_cast<UINT64>(b.offset);
                 // D3D12 要求 CBV 的 GPU 地址 256 字节对齐（root descriptor 走同一条约束）。
@@ -5217,50 +7484,6 @@ mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBi
                     return mcdr::err("pushDescriptors",
                                      "pushDescriptors: missing view for SRV entry " + std::to_string(i));
                 }
-                // 关键修复：普通纹理（字体/logo/panorama 等）上传后处于 COMMON，
-                // 采样前必须显式 transition 到 SHADER_RESOURCE，否则 D3D12 在
-                // COMMON 状态采样是未定义行为（NVIDIA 驱动静默返回黑）→ 全黑屏。
-                if (b.view->sourceTexture) {
-                    if (b.view->sourceTexture->usage & 16) {
-                        dbgLogDebug("pushDesc SRV: CUBE view=%p srcTex=%p -> SHADER_RESOURCE",
-                                    reinterpret_cast<void*>(b.view),
-                                    reinterpret_cast<void*>(b.view->sourceTexture));
-                    }
-                    // P109（#538 取证）：若这条 SRV 的源纹理正是**当前 render pass 的附件**，
-                    // 把它切到 SHADER_RESOURCE 就会让"仍绑定着的 RTV/DSV"处于非附件状态 ⇒
-                    // 之后每一条 draw 都会被调试层判成 #538（把 0xC0 当 RENDER_TARGET /
-                    // DEPTH_WRITE）。这在 D3D12 里是非法自采样（sampling a bound attachment）。
-                    // 这里只记账不改行为：先拿到"是谁在采样自己的附件"，再决定是跳过过渡还是
-                    // 拆 pass —— 盲目跳过会让采样读到未定义内容，比报错更难查。
-                    {
-                        ID3D12Resource* srvRes = b.view->sourceTexture->resource.Get();
-                        bool p109IsAttachment = false;
-                        for (Dx12Object* p109Att : ctx->activeColorTargets) {
-                            if (p109Att && p109Att->resource.Get() == srvRes) {
-                                p109IsAttachment = true;
-                                break;
-                            }
-                        }
-                        if (!p109IsAttachment && ctx->activeDepthTarget
-                            && ctx->activeDepthTarget->resource.Get() == srvRes) {
-                            p109IsAttachment = true;
-                        }
-                        if (p109IsAttachment) {
-                            static int p109SelfSamples = 0;
-                            if (p109SelfSamples < 5) {
-                                ++p109SelfSamples;
-                                dbgLogWarn("SRV self-sample: pushDescriptors is about to move an ACTIVE "
-                                           "pass attachment (res=%p) to SHADER_RESOURCE (ctx=%p inPass=%d) - "
-                                           "this is the state divergence behind #538",
-                                           reinterpret_cast<void*>(srvRes), reinterpret_cast<void*>(ctx),
-                                           static_cast<int>(ctx->inRenderPass));
-                            }
-                        }
-                    }
-                    transitionTextureTo(ctx, b.view->sourceTexture,
-                                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-                                            | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-                }
                 if (!reuseSrvTable) {
                     gCtx.device->CopyDescriptorsSimple(1, dst, b.view->cpuHandle,
                                                        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -5274,9 +7497,6 @@ mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBi
                     dbgLogError("pushDesc[%u] INVALID texel buffer", static_cast<unsigned>(i));
                     return mcdr::err("pushDescriptors", "pushDescriptors: invalid texel buffer handle");
                 }
-                transitionBufferTo(ctx, b.buffer,
-                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-                                       | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 auto description = bufferSrvDescription(b.buffer, b.offset, b.length, b.texelFormat);
                 if (!description) return std::unexpected(description.error());
                 gCtx.device->CreateShaderResourceView(b.buffer->resource.Get(), &description.value(), dst);
@@ -5292,6 +7512,7 @@ mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBi
         // P243：记下这次分配，供后续同集合的 push 复用同一张表。
         ctx->lastSrvSlotOffset = srvSlotOffset;
         ctx->lastSrvCount = srvCount;
+        ctx->lastSrvCbvCount = cbvCount;
         ctx->lastSrvViews.clear();
         ctx->lastSrvViews.reserve(srvCount);
         for (const DrawBinding& b : bindings) {
@@ -5299,25 +7520,28 @@ mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBi
                 ctx->lastSrvViews.emplace_back(b.view, b.view ? b.view->cpuHandle.ptr : 0);
             }
         }
-        ctx->nextDrawSlot += srvCount;
     }
     // SRV 表位于 root 参数索引 cbvCount（在 CBV root descriptor 之后）。
     // gpuRoot 必须指向本帧实际写入位置（ring buffer 偏移 base），
     // 而不是 heap 起始处。否则多帧飞环时每帧的命令列表都把根表绑定到
     // 同一 GPU 地址（heap start），导致 GPU 读到前帧残留的描述符 → 黑屏。
     if (srvCount > 0) {
-        D3D12_GPU_DESCRIPTOR_HANDLE gpuRoot = gCtx.drawHeap->GetGPUDescriptorHandleForHeapStart();
-        gpuRoot.ptr += base;
+        const D3D12_GPU_DESCRIPTOR_HANDLE gpuRoot = descriptors.gpu;
         // P20：诊断 root descriptor table 绑定地址（指向本帧写入位置）
         static UINT64 lastGpuFrame = 0;
         if (ctx->fenceValue != lastGpuFrame) {
             lastGpuFrame = ctx->fenceValue;
             dbgLogDebug(
                 "pushDesc SET_ROOT_TABLE[%u]: heapBase=%llx writeBase=%llx slotCount=%u", cbvCount,
-                static_cast<unsigned long long>(gCtx.drawHeap->GetGPUDescriptorHandleForHeapStart().ptr),
+                 static_cast<unsigned long long>(drawHeapFor(ctx)->GetGPUDescriptorHandleForHeapStart().ptr),
                 static_cast<unsigned long long>(base), static_cast<unsigned>(srvCount));
         }
         ctx->commandList->SetGraphicsRootDescriptorTable(cbvCount, gpuRoot);
+    }
+    ctx->graphicsBindings = bindings;
+    ctx->graphicsBindingsValid = true;
+    for (const auto& binding : bindings) {
+        retainObjectForRecording(ctx, binding.type == 1 ? binding.view : binding.buffer);
     }
     return {};
 }
@@ -5421,6 +7645,519 @@ long long remainingToEnd(const Dx12Object* buf, long long offset) {
 
 }  // namespace
 
+namespace {
+struct GraphicsCommandRead {
+    ComPtr<ID3D12Resource> resource;
+    std::shared_ptr<void> owner;
+    uint64_t offset = 0, bytes = 0;
+    uint32_t firstSubresource = 0, subresourceCount = 1, state = 0, access = 1;
+    D3D12_SHADER_RESOURCE_VIEW_DESC textureView{};
+    bool hasTextureView = false;
+};
+
+struct GraphicsCommandPacket {
+    mcdr::graphics_recording::PacketFacts facts;
+    bool confirmed = false;
+    GraphicsDrawState state;
+    std::shared_ptr<const void> recordingIdentity;
+    ComPtr<ID3D12Fence> fence;
+    uint64_t submission = 0;
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> pso;
+    ComPtr<ID3D12DescriptorHeap> descriptors;
+    ComPtr<ID3D12DescriptorHeap> colorDescriptors, depthDescriptors;
+    ComPtr<ID3D12CommandSignature> commandSignature;
+    std::shared_ptr<void> pipelineOwner, captureOwner, routeOwner;
+    std::weak_ptr<void> observerOwner;
+    int (*confirm)(void*, void*, const void*) = nullptr;
+    std::shared_ptr<mcdr::oit_budget::Reservation> budget;
+    std::vector<DrawBinding> bindings;
+    std::vector<DrawBinding> contentBindings;
+    std::vector<std::shared_ptr<const void>> sampledReads;
+    std::vector<std::unique_ptr<Dx12Object>> frozenBuffers;
+    std::vector<std::shared_ptr<mcdr::oit_budget::Reservation>> contentBudgets;
+    std::vector<GraphicsCommandRead> reads;
+    std::vector<GraphicsResourceRange> attachments;
+    std::vector<std::shared_ptr<void>> objectOwners;
+    std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> renderTargets;
+    D3D12_CPU_DESCRIPTOR_HANDLE depthTarget{};
+    D3D12_VERTEX_BUFFER_VIEW vertices[16]{};
+    D3D12_INDEX_BUFFER_VIEW indices{};
+    std::array<UINT, 16> vertexStrides{};
+    std::vector<uint8_t> bindingTypes;
+    D3D12_GPU_VIRTUAL_ADDRESS captureConstants = 0, meshGlobals = 0;
+    D3D12_CPU_DESCRIPTOR_HANDLE captureDescriptors{};
+    D3D12_GPU_DESCRIPTOR_HANDLE meshGeometry{};
+    D3D12_GPU_DESCRIPTOR_HANDLE bindingTable{};
+    uint64_t shaderContract = 0, shaderGeneration = 0, pipelineGeneration = 0;
+    int topology = 0;
+    UINT pushConstantParam = UINT_MAX, geometryParam = 0, segmentParam = 0;
+    D3D12_SHADING_RATE shadingRate = D3D12_SHADING_RATE_1X1;
+    D3D12_SHADING_RATE_COMBINER shadingCombiners[2]{};
+    ~GraphicsCommandPacket() {
+        for (const auto& read : sampledReads) if (read) cancelSampledTextureContent(read);
+    }
+};
+
+mcdr::Result<void> freezeGraphicsCommandContent(CommandContext* context,
+    GraphicsCommandPacket& packet, uint64_t budgetLimit) {
+    using mcdr::graphics_recording::CommandFamily;
+    using mcdr::graphics_recording::ContentState;
+    packet.facts.content = ContentState::Unsupported;
+    if (packet.facts.command.family != CommandFamily::Draw || context->currentPipeline->isMesh ||
+        !context->currentPipeline->vertexStrides.empty() || context->currentPipeline->captureHash ||
+        context->shadingRateImageBound) return {};
+    for (const auto& binding : packet.bindings) {
+        if (binding.type == 1) continue;
+        if (binding.type != 0 && binding.type != 2) return {};
+        const auto* buffer = binding.buffer;
+        if (!buffer || !buffer->resource || buffer->kind != Dx12Object::Kind::Buffer ||
+            (buffer->heapType != D3D12_HEAP_TYPE_UPLOAD && buffer->heapType != D3D12_HEAP_TYPE_DEFAULT) ||
+            binding.offset < 0 || binding.length <= 0 || binding.offset > buffer->size ||
+            binding.length > buffer->size - binding.offset ||
+            uint64_t(binding.length) > UINT64_MAX - 255u || uint64_t(binding.length) > SIZE_MAX) return {};
+    }
+    packet.contentBindings = packet.bindings;
+    packet.sampledReads.resize(packet.bindings.size());
+    packet.frozenBuffers.reserve(packet.bindings.size());
+    packet.contentBudgets.reserve(packet.bindings.size());
+    for (size_t index = 0; index < packet.bindings.size(); ++index) {
+        const auto& source = packet.bindings[index];
+        if (source.type == 1) {
+            auto captured = captureSampledTextureContent(context, source.view, budgetLimit);
+            if (captured.status != SampledTextureContentStatus::Ready) {
+                for (const auto& read : packet.sampledReads) if (read) cancelSampledTextureContent(read);
+                packet.sampledReads.clear();
+                packet.contentBindings.clear();
+                if (captured.status == SampledTextureContentStatus::BudgetExceeded ||
+                    captured.status == SampledTextureContentStatus::RecordingFailed)
+                    return mcdr::err("graphics.content", "Sampled content capture failed or exceeded its budget");
+                return {};
+            }
+            packet.sampledReads[index] = std::move(captured.lease);
+            continue;
+        }
+        auto object = std::make_unique<Dx12Object>();
+        D3D12_RESOURCE_DESC description{};
+        description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        description.Width = (uint64_t(source.length) + 255u) & ~255ull;
+        description.Height = 1;
+        description.DepthOrArraySize = 1;
+        description.MipLevels = 1;
+        description.SampleDesc.Count = 1;
+        description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const auto allocation = gCtx.device->GetResourceAllocationInfo(0, 1, &description);
+        if (!allocation.SizeInBytes || allocation.SizeInBytes == UINT64_MAX)
+            return mcdr::err("graphics.content", "Frozen buffer allocation size is invalid");
+        auto budget = mcdr::oit_budget::reserve(allocation.SizeInBytes, budgetLimit);
+        if (!budget) return mcdr::err("graphics.content", "Frozen buffer budget exceeded");
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = source.buffer->heapType;
+        const auto state = heap.Type == D3D12_HEAP_TYPE_UPLOAD ? D3D12_RESOURCE_STATE_GENERIC_READ
+            : D3D12_RESOURCE_STATE_COPY_DEST;
+        if (FAILED(gCtx.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &description,
+                state, nullptr, IID_PPV_ARGS(&object->resource))))
+            return mcdr::err("graphics.content", "Frozen buffer allocation failed");
+        object->kind = Dx12Object::Kind::Buffer;
+        object->heapType = heap.Type;
+        object->size = source.length;
+        if (heap.Type == D3D12_HEAP_TYPE_UPLOAD) {
+            void* mappedSource = source.buffer->mappedPtr;
+            bool unmapSource = false;
+            if (!mappedSource) {
+                if (FAILED(source.buffer->resource->Map(0, nullptr, &mappedSource)))
+                    return mcdr::err("graphics.content", "Source upload mapping failed");
+                unmapSource = true;
+            }
+            void* mappedDestination = nullptr;
+            const D3D12_RANGE noRead{0, 0};
+            const auto mapped = object->resource->Map(0, &noRead, &mappedDestination);
+            if (FAILED(mapped)) {
+                if (unmapSource) source.buffer->resource->Unmap(0, nullptr);
+                return mcdr::err("graphics.content", "Frozen upload mapping failed");
+            }
+            std::memcpy(mappedDestination, static_cast<const std::byte*>(mappedSource) + source.offset,
+                static_cast<size_t>(source.length));
+            object->resource->Unmap(0, nullptr);
+            if (unmapSource) source.buffer->resource->Unmap(0, nullptr);
+        }
+        auto& destination = packet.contentBindings[index];
+        destination.buffer = object.get();
+        destination.offset = 0;
+        packet.contentBudgets.push_back(std::move(budget));
+        packet.frozenBuffers.push_back(std::move(object));
+    }
+    for (size_t index = 0; index < packet.bindings.size(); ++index) {
+        const auto& source = packet.bindings[index];
+        if (source.type == 1 || source.buffer->heapType == D3D12_HEAP_TYPE_UPLOAD) continue;
+        const auto& destination = packet.contentBindings[index];
+        const auto previous = resourceSubresourceState(context, source.buffer->resource.Get(), 0,
+            D3D12_RESOURCE_STATE_COMMON);
+        if (const auto result = transitionResourceRange(context, source.buffer->resource.Get(), 0, 1,
+                previous, D3D12_RESOURCE_STATE_COPY_SOURCE); !result) return result;
+        context->commandList->CopyBufferRegion(destination.buffer->resource.Get(), 0,
+            source.buffer->resource.Get(), static_cast<uint64_t>(source.offset), static_cast<uint64_t>(source.length));
+        if (const auto result = transitionResourceRange(context, destination.buffer->resource.Get(), 0, 1,
+                D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON); !result) return result;
+        if (const auto result = transitionResourceRange(context, source.buffer->resource.Get(), 0, 1,
+                D3D12_RESOURCE_STATE_COPY_SOURCE, previous); !result) return result;
+    }
+    packet.facts.content = ContentState::Frozen;
+    return {};
+}
+
+mcdr::Result<std::shared_ptr<GraphicsCommandPacket>> prepareGraphicsCommand(CommandContext* context,
+    const mcdr::graphics_recording::Command& command, const DrawBinding* meshBindings = nullptr,
+    uint32_t meshBindingCount = 0, D3D12_GPU_DESCRIPTOR_HANDLE meshGeometry = {},
+    D3D12_GPU_VIRTUAL_ADDRESS meshGlobals = 0,
+    const mcdr::graphics_recording::AdapterFacts& adapter = {}) {
+    using mcdr::graphics_recording::CommandFamily;
+    const auto observer = context->graphicsCommandObserver;
+    if (!observer.prepare) return std::shared_ptr<GraphicsCommandPacket>{};
+    auto owner = observer.owner.lock();
+    if (!owner || !observer.confirm || !observer.complete || !context->recordingIdentity || !context->fence ||
+        context->submissionFailed.load() || context->recordingFailed.load() ||
+        !context->currentPipeline || !context->cachedPso)
+        return mcdr::err("graphics.record", "Graphics command observer or recording is stale");
+    const bool indexed = command.family == CommandFamily::DrawIndexed || command.family == CommandFamily::DrawIndexedIndirect;
+    if (const auto result = collectGraphicsInputs(context, indexed, command.indirectBuffer); !result)
+        return std::unexpected(result.error());
+    auto* pipeline = context->currentPipeline;
+    const uint64_t bindingCount = context->graphicsBindings.size() + meshBindingCount;
+    const uint64_t readCapacity = context->graphicsInputRanges.size() + bindingCount + 18;
+    const uint64_t ownerCapacity = bindingCount + readCapacity + context->activeAttachmentRanges.size() + 20;
+    const uint64_t budgetBytes = sizeof(GraphicsCommandPacket) + 512 +
+        bindingCount * (2 * sizeof(DrawBinding) + sizeof(std::shared_ptr<const void>) +
+            sizeof(std::unique_ptr<Dx12Object>) + sizeof(std::shared_ptr<mcdr::oit_budget::Reservation>) + sizeof(Dx12Object)) +
+        readCapacity * sizeof(GraphicsCommandRead) +
+        pipeline->graphicsBindingTypes.size() * sizeof(uint8_t) +
+        ownerCapacity * (sizeof(std::shared_ptr<void>) + 128) +
+        context->activeAttachmentRanges.size() * sizeof(GraphicsResourceRange) +
+        (context->activePassRtvs.size() + 2) * sizeof(D3D12_CPU_DESCRIPTOR_HANDLE);
+    auto budget = mcdr::oit_budget::reserve(budgetBytes, observer.totalBudgetBytes);
+    if (!budget) return mcdr::err("graphics.record", "Graphics command packet budget exceeded");
+    auto packet = std::make_shared<GraphicsCommandPacket>();
+    packet->budget = std::move(budget);
+    packet->reads.reserve(static_cast<size_t>(readCapacity));
+    packet->objectOwners.reserve(static_cast<size_t>(ownerCapacity));
+    packet->bindings.reserve(static_cast<size_t>(bindingCount));
+    packet->attachments.reserve(context->activeAttachmentRanges.size());
+    packet->renderTargets.reserve(context->activePassRtvs.size() + 2);
+    packet->bindings.assign(context->graphicsBindings.begin(), context->graphicsBindings.end());
+    for (uint32_t index = 0; index < meshBindingCount; ++index) packet->bindings.push_back(meshBindings[index]);
+    packet->state = context->graphicsDrawState;
+    packet->recordingIdentity = context->recordingIdentity;
+    packet->fence = context->fence;
+    packet->submission = context->fenceValue + 1;
+    packet->root = pipeline->rootSignature;
+    packet->pso = context->cachedPso;
+    packet->descriptors = drawHeapFor(context);
+    packet->colorDescriptors = gCtx.frameRtvHeap;
+    packet->depthDescriptors = gCtx.dsvHeap;
+    packet->bindingTable = context->graphicsBindingTable;
+    packet->captureOwner = context->graphicsCapture.lease;
+    packet->routeOwner = pipeline->terrainTileRoute;
+    packet->observerOwner = observer.owner;
+    packet->confirm = observer.confirm;
+    packet->captureConstants = context->graphicsCapture.constants;
+    packet->captureDescriptors = context->graphicsCapture.descriptors;
+    packet->meshGeometry = meshGeometry;
+    packet->meshGlobals = meshGlobals;
+    packet->shaderContract = pipeline->captureHash;
+    packet->shaderGeneration = pipeline->captureGeneration;
+    packet->pipelineGeneration = pipeline->shaderGeneration;
+    packet->pushConstantParam = pipeline->pushConstantParam;
+    packet->geometryParam = pipeline->geometryParam;
+    packet->segmentParam = pipeline->segmentParam;
+    packet->topology = pipeline->topology;
+    packet->bindingTypes = pipeline->graphicsBindingTypes;
+    for (const auto& input : pipeline->vertexStrides)
+        if (input.first >= 0 && input.first < 16) packet->vertexStrides[input.first] = input.second;
+    packet->shadingRate = context->recordedShadingRate;
+    std::copy_n(context->recordedShadingCombiners, 2, packet->shadingCombiners);
+    std::copy_n(context->graphicsVertexViews, 16, packet->vertices);
+    packet->indices = context->graphicsIndexView;
+    if (pipeline->colorTargetCount != 0) {
+        packet->renderTargets = context->activePassRtvs;
+        if (context->additionalColorTarget) packet->renderTargets.push_back(context->additionalColorRtv);
+        if (context->rasterMotionSelected) packet->renderTargets.push_back(context->activeMotionRtv);
+    }
+    packet->depthTarget = context->activePassDsv;
+    pipeline->lifetimeReferences.fetch_add(1, std::memory_order_relaxed);
+    packet->pipelineOwner = std::shared_ptr<void>(pipeline, [](void* retained) {
+        destroyPipeline(static_cast<Dx12Pipeline*>(retained));
+    });
+    for (const auto& range : context->graphicsInputRanges) {
+        GraphicsCommandRead read;
+        read.resource = range.object->resource;
+        read.owner = range.owner ? range.owner : retainObjectLease(range.object);
+        read.firstSubresource = range.firstSubresource;
+        read.subresourceCount = range.subresourceCount;
+        read.state = range.state;
+        read.access = range.access;
+        packet->reads.push_back(std::move(read));
+    }
+    for (const auto& binding : packet->bindings) {
+        auto* object = binding.type == 1 ? binding.view : binding.buffer;
+        if (!object || (binding.type == 1 && !object->sourceTexture))
+            return mcdr::err("graphics.record", "Graphics command binding is invalid");
+        packet->objectOwners.push_back(retainObjectLease(object));
+        GraphicsCommandRead read;
+        if (binding.type == 1) {
+            read.resource = object->sourceTexture->resource;
+            read.textureView = object->srvDesc;
+            read.hasTextureView = object->hasSrvDesc;
+        } else {
+            if (binding.offset < 0 || binding.length < 0 || binding.offset > object->size ||
+                binding.length > object->size - binding.offset)
+                return mcdr::err("graphics.record", "Graphics command buffer range is invalid");
+            read.resource = object->resource;
+            read.offset = static_cast<uint64_t>(binding.offset);
+            read.bytes = static_cast<uint64_t>(binding.length ? binding.length : object->size - binding.offset);
+        }
+        packet->reads.push_back(std::move(read));
+    }
+    if (!pipeline->isMesh) {
+        for (const auto& input : pipeline->vertexStrides) {
+            const auto slot = input.first;
+            auto* buffer = context->graphicsVertexBuffers[slot];
+            GraphicsCommandRead read;
+            read.resource = buffer->resource;
+            read.offset = packet->vertices[slot].BufferLocation - buffer->resource->GetGPUVirtualAddress();
+            read.bytes = packet->vertices[slot].SizeInBytes;
+            packet->reads.push_back(std::move(read));
+        }
+        if (indexed) {
+            auto* buffer = context->graphicsIndexBuffer;
+            GraphicsCommandRead read;
+            read.resource = buffer->resource;
+            read.offset = packet->indices.BufferLocation - buffer->resource->GetGPUVirtualAddress();
+            read.bytes = packet->indices.SizeInBytes;
+            packet->reads.push_back(std::move(read));
+        }
+    }
+    if (command.indirectBuffer) {
+        auto* buffer = static_cast<Dx12Object*>(command.indirectBuffer);
+        GraphicsCommandRead read;
+        read.resource = buffer->resource;
+        read.offset = command.indirectOffset;
+        read.bytes = uint64_t(command.count) * (indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS) : sizeof(D3D12_DRAW_ARGUMENTS));
+        if (read.offset > static_cast<uint64_t>(buffer->size) || read.bytes > static_cast<uint64_t>(buffer->size) - read.offset)
+            return mcdr::err("graphics.record", "Graphics indirect command range is invalid");
+        packet->reads.push_back(std::move(read));
+        packet->commandSignature = indexed ? gCtx.cmdSigIndexed : gCtx.cmdSigNonIndexed;
+    }
+    packet->attachments = context->activeAttachmentRanges;
+    for (auto& attachment : packet->attachments)
+        if (!attachment.owner) attachment.owner = retainObjectLease(attachment.object);
+    for (auto* buffer : context->graphicsVertexBuffers)
+        if (buffer) packet->objectOwners.push_back(retainObjectLease(buffer));
+    if (context->graphicsIndexBuffer) packet->objectOwners.push_back(retainObjectLease(context->graphicsIndexBuffer));
+    if (context->shadingRateImageBound) packet->objectOwners.push_back(retainObjectLease(context->shadingRateImageBound));
+    static std::atomic<uint64_t> nextIdentity{1};
+    auto identity = nextIdentity.load(std::memory_order_relaxed);
+    do {
+        if (identity == UINT64_MAX) return mcdr::err("graphics.record", "Graphics command packet identity exhausted");
+    } while (!nextIdentity.compare_exchange_weak(identity, identity + 1, std::memory_order_relaxed));
+    packet->facts.command = command;
+    packet->facts.adapterFacts = adapter;
+    packet->facts.adapter = adapter.state;
+    packet->facts.pipelineIdentity = reinterpret_cast<uintptr_t>(pipeline);
+    packet->facts.packetIdentity = identity;
+    packet->facts.readSetIdentity = identity;
+    packet->facts.empty = command.family == CommandFamily::Mesh
+        ? command.meshGroups[0] == 0 || command.meshGroups[1] == 0 || command.meshGroups[2] == 0
+        : command.count == 0 || ((command.family == CommandFamily::Draw || command.family == CommandFamily::DrawIndexed) && command.instanceCount == 0);
+    auto& leases = context->recordingLeases[context->currentListSlot];
+    leases.reserve(leases.size() + 1);
+    leases.push_back(packet);
+    if (observer.contentPolicy == mcdr::graphics_recording::ContentPolicy::FreezeBindings) {
+        if (const auto frozen = freezeGraphicsCommandContent(context, *packet, observer.totalBudgetBytes); !frozen)
+            return std::unexpected(frozen.error());
+    }
+    if (observer.prepare(owner.get(), context, packet->facts, packet) != 1)
+        return mcdr::err("graphics.record", "Graphics command observer preparation failed");
+    return packet;
+}
+
+}
+
+int bindGraphicsCommandObserver(void* opaqueContext, const mcdr::graphics_recording::Observer& observer) {
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    if (!context || !context->listOpen || !context->recordingIdentity || context->graphicsCommandObserver.prepare ||
+        !context->commandList || !context->fence ||
+        !observer.prepare || !observer.confirm || !observer.complete || observer.owner.expired() || !observer.totalBudgetBytes ||
+        context->submissionFailed.load() || context->recordingFailed.load()) return -1;
+    context->graphicsCommandObserver = observer;
+    return 1;
+}
+
+void unbindGraphicsCommandObserver(void* opaqueContext) {
+    if (auto* context = static_cast<CommandContext*>(opaqueContext)) context->graphicsCommandObserver = {};
+}
+
+int prepareGraphicsCommandCapture(void* opaqueContext, const mcdr::graphics_recording::Command& command,
+    std::shared_ptr<const void>* output) {
+    return prepareGraphicsCommandCaptureWithInputs(opaqueContext, command, nullptr, 0, {}, 0, {}, output);
+}
+
+int prepareGraphicsCommandCaptureWithInputs(void* opaqueContext, const mcdr::graphics_recording::Command& command,
+    const DrawBinding* bindings, uint32_t bindingCount, D3D12_GPU_DESCRIPTOR_HANDLE geometry,
+    D3D12_GPU_VIRTUAL_ADDRESS globals, const mcdr::graphics_recording::AdapterFacts& adapter,
+    std::shared_ptr<const void>* output) {
+    if (output) output->reset();
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    if (!context || !output || !context->listOpen || !context->commandList || !context->inRenderPass) return -1;
+    try {
+        auto prepared = prepareGraphicsCommand(context, command, bindings, bindingCount, geometry, globals, adapter);
+        if (prepared) {
+            *output = std::move(*prepared);
+            return 1;
+        }
+    } catch (...) {
+        context->recordingFailed.store(true, std::memory_order_release);
+        return -1;
+    }
+    context->recordingFailed.store(true, std::memory_order_release);
+    return -1;
+}
+
+int confirmGraphicsCommandCapture(void* opaqueContext, const std::shared_ptr<const void>& opaquePacket) {
+    if (!opaquePacket) return 1;
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    if (!context) return -1;
+    try {
+        auto packet = std::static_pointer_cast<GraphicsCommandPacket>(std::const_pointer_cast<void>(opaquePacket));
+        auto owner = packet->observerOwner.lock();
+        if (owner && packet->confirm && packet->recordingIdentity == context->recordingIdentity &&
+            packet->fence == context->fence && packet->submission == context->fenceValue + 1 &&
+            !context->submissionFailed.load() && !context->recordingFailed.load() &&
+            packet->confirm(owner.get(), context, packet.get()) == 1) {
+            packet->confirmed = true;
+            return 1;
+        }
+    } catch (...) {
+        context->recordingFailed.store(true, std::memory_order_release);
+        return -1;
+    }
+    context->recordingFailed.store(true, std::memory_order_release);
+    return -1;
+}
+
+bool graphicsCommandPacketMatchesObserver(void* opaqueContext, const std::shared_ptr<const void>& opaquePacket,
+    const mcdr::graphics_recording::Observer& observer, uint32_t commandFamily) {
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    if (!context || !opaquePacket || !context->currentPipeline || !context->cachedPso) return false;
+    const auto& bound = context->graphicsCommandObserver;
+    auto expectedOwner = observer.owner.lock();
+    auto boundOwner = bound.owner.lock();
+    if (!expectedOwner || expectedOwner != boundOwner || bound.prepare != observer.prepare ||
+        bound.confirm != observer.confirm || bound.complete != observer.complete ||
+        bound.totalBudgetBytes != observer.totalBudgetBytes || bound.contentPolicy != observer.contentPolicy) return false;
+    const auto packet = std::static_pointer_cast<const GraphicsCommandPacket>(opaquePacket);
+    auto packetOwner = packet->observerOwner.lock();
+    return packetOwner == expectedOwner && packet->confirm == observer.confirm &&
+        packet->recordingIdentity == context->recordingIdentity && packet->fence == context->fence &&
+        packet->submission == context->fenceValue + 1 && packet->pso.Get() == context->cachedPso &&
+        packet->pipelineGeneration == context->currentPipeline->shaderGeneration &&
+        packet->facts.pipelineIdentity == reinterpret_cast<uintptr_t>(context->currentPipeline) &&
+        static_cast<uint32_t>(packet->facts.command.family) == commandFamily &&
+        !context->recordingFailed.load(std::memory_order_acquire) &&
+        !context->submissionFailed.load(std::memory_order_acquire);
+}
+
+GraphicsPacketInspection inspectGraphicsCommandPacket(void* opaqueContext,
+    const std::shared_ptr<const void>& opaquePacket) {
+    GraphicsPacketInspection result;
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    if (!context || !opaquePacket || !context->listOpen || !context->commandList ||
+        context->recordingFailed.load(std::memory_order_acquire) ||
+        context->submissionFailed.load(std::memory_order_acquire)) {
+        result.status = context && context->recordingFailed.load(std::memory_order_acquire)
+            ? GraphicsPacketInspectionStatus::RecordingFailed : GraphicsPacketInspectionStatus::StaleRecording;
+        return result;
+    }
+    try {
+        const auto packet = std::static_pointer_cast<const GraphicsCommandPacket>(opaquePacket);
+        if (packet->recordingIdentity != context->recordingIdentity || packet->fence != context->fence ||
+            packet->submission != context->fenceValue + 1) {
+            result.status = GraphicsPacketInspectionStatus::StaleRecording;
+            return result;
+        }
+        result.confirmed = packet->confirmed;
+        result.content = packet->facts.content;
+        result.adapter = packet->facts.adapterFacts;
+        result.depthWrite = packet->pipelineOwner &&
+            static_cast<const Dx12Pipeline*>(packet->pipelineOwner.get())->depthWrite;
+        const auto depthAttachment = std::find_if(packet->attachments.begin(), packet->attachments.end(),
+            [&](const auto& range) {
+                return range.object && range.object->resource && range.firstSubresource == 0 &&
+                    range.subresourceCount == 1 && range.state == D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            });
+        result.depthTargetBound = packet->depthTarget.ptr != 0 && depthAttachment != packet->attachments.end();
+        result.depthObject = result.depthTargetBound ? depthAttachment->object : nullptr;
+        result.routeBound = static_cast<bool>(packet->routeOwner);
+        result.pipelineIdentity = packet->facts.pipelineIdentity;
+        result.shaderGeneration = packet->pipelineGeneration;
+        result.commandFamily = static_cast<uint32_t>(packet->facts.command.family);
+        result.depthTarget = packet->depthTarget;
+        result.pso = packet->pso;
+        result.status = GraphicsPacketInspectionStatus::Ready;
+        return result;
+    } catch (...) {
+        result.status = GraphicsPacketInspectionStatus::Unsupported;
+        return result;
+    }
+}
+
+mcdr::Result<GraphicsCommandContentView> resolveGraphicsCommandContent(
+    void* opaqueContext, const std::shared_ptr<const void>& opaquePacket) {
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    if (!context || !opaquePacket || !context->listOpen || !context->commandList ||
+        context->recordingFailed.load(std::memory_order_acquire) ||
+        context->submissionFailed.load(std::memory_order_acquire))
+        return GraphicsCommandContentView{PacketContentStatus::StaleRecording};
+    const auto packet = std::static_pointer_cast<GraphicsCommandPacket>(
+        std::const_pointer_cast<void>(opaquePacket));
+    if (packet->recordingIdentity != context->recordingIdentity || packet->fence != context->fence ||
+        packet->submission != context->fenceValue + 1)
+        return GraphicsCommandContentView{PacketContentStatus::StaleRecording};
+    if (packet->facts.content != mcdr::graphics_recording::ContentState::Frozen)
+        return GraphicsCommandContentView{PacketContentStatus::UnsupportedContent};
+    for (size_t index = 0; index < packet->sampledReads.size(); ++index) {
+        if (!packet->sampledReads[index]) continue;
+        const auto resolved = resolveSampledTextureContent(context, packet->sampledReads[index]);
+        if (resolved.status == SampledTextureContentStatus::BudgetExceeded ||
+            resolved.status == SampledTextureContentStatus::RecordingFailed)
+            return mcdr::err("graphics.content", "Frozen sampled content resolution failed or exceeded its budget");
+        if (resolved.status != SampledTextureContentStatus::Ready || !resolved.view)
+            return GraphicsCommandContentView{PacketContentStatus::StaleRecording};
+        packet->contentBindings[index].view = static_cast<Dx12Object*>(resolved.view);
+    }
+    return GraphicsCommandContentView{PacketContentStatus::Frozen,
+        packet->contentBindings.data(), static_cast<uint32_t>(packet->contentBindings.size())};
+}
+
+int completeGraphicsCommandRecording(void* opaqueContext, mcdr::graphics_recording::Completion completion) {
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    if (!context) return -1;
+    const auto observer = context->graphicsCommandObserver;
+    if (!observer.prepare) return 1;
+    try {
+        auto owner = observer.owner.lock();
+        if (owner && observer.complete && observer.complete(owner.get(), context, completion) == 1) {
+            if (completion == mcdr::graphics_recording::Completion::Failed)
+                context->recordingFailed.store(true, std::memory_order_release);
+            return 1;
+        }
+    } catch (...) {
+        context->recordingFailed.store(true, std::memory_order_release);
+        return -1;
+    }
+    context->recordingFailed.store(true, std::memory_order_release);
+    return -1;
+}
+
 // ---------------------------------------------------------------------------
 // P217：meshlet 地形派发（一次 DispatchMesh 覆盖整批 meshlet）
 // ---------------------------------------------------------------------------
@@ -5439,17 +8176,19 @@ void prepareMeshBuffer(CommandContext* ctx, Dx12Object* obj, D3D12_RESOURCE_STAT
 // 与 drawIndexedInstanced 一致：标记所有 color target 已写入（render pass 结束时的
 // 存/清决策依赖它）。
 void markMeshColorTargets(CommandContext* ctx) {
-    for (size_t i = 0; i < ctx->activeColorTargets.size(); ++i) {
-        if (i < ctx->activeColorTargetsTouched.size()) ctx->activeColorTargetsTouched[i] = true;
+    if (!ctx->currentPipeline || ctx->currentPipeline->rasterMotionWritesWorldColor) {
+        for (size_t index = 0; index < ctx->activeColorTargets.size(); ++index) {
+            if (index < ctx->activeColorTargetsTouched.size()) ctx->activeColorTargetsTouched[index] = true;
+        }
+        if (!ctx->activeColorTargets.empty()) ctx->colorTargetsWritten = true;
     }
-    ctx->colorTargetsWritten = true;
 }
 
 }  // namespace
 
 // P217：meshlet 版地形派发。
 //   * 不绑索引缓冲（MS 算术展开 quad 索引）；
-//   * 段表换成 32 B 的 SectionDesc 表、另加 32 B 的 MeshletDesc 表（t15/t16）；
+//   * t15 是 32 B 实例表 + 8 B work 表，t16 是 16 B 静态 MeshletDesc 表；
 //   * b8 放的是 256 B 对齐的小常量（meshlet 总数），不是段表基址。
 // 三个 SRV 的顺序必须与 createMeshRootSignature 的 extras 一致：t14 顶点、t15 段、t16 meshlet。
 mcdr::Result<void> drawMeshlets(CommandContext* ctx, Dx12Object* vertexBuffer, long long vertexOffset,
@@ -5466,8 +8205,10 @@ mcdr::Result<void> drawMeshlets(CommandContext* ctx, Dx12Object* vertexBuffer, l
     if (!ctx->currentPipeline || !ctx->currentPipeline->isMesh || ctx->currentPipeline->geometryParam == 0) {
         return mcdr::err(kApi, "meshletDispatch: current pipeline is not a mesh PSO with mesh extras");
     }
-    if (meshletCount <= 0) {
-        return mcdr::err(kApi, "meshletDispatch: meshletCount must be positive");
+    constexpr UINT maxGroups = 1u << 22;
+    constexpr UINT dispatchRowWidth = 256u;
+    if (meshletCount <= 0 || static_cast<UINT>(meshletCount) > maxGroups) {
+        return mcdr::err(kApi, "meshletDispatch: group count must be in [1, 4194304]");
     }
     for (const Dx12Object* buf : {vertexBuffer, sections, meshlets, globals}) {
         if (!buf || buf->kind != Dx12Object::Kind::Buffer || !buf->resource) {
@@ -5477,7 +8218,8 @@ mcdr::Result<void> drawMeshlets(CommandContext* ctx, Dx12Object* vertexBuffer, l
     const long long vbBytes = remainingToEnd(vertexBuffer, vertexOffset);
     const long long secBytes = sectionsLength > 0 ? sectionsLength : remainingToEnd(sections, sectionsOffset);
     const long long meshletBytes = meshletsLength > 0 ? meshletsLength : remainingToEnd(meshlets, meshletsOffset);
-    if (vbBytes < 4 || secBytes < 32 || meshletBytes < 32) {
+    if (vbBytes < 4 || secBytes < 40 || secBytes % 8 != 0 || meshletBytes < 16 ||
+        meshletBytes % 16 != 0 || meshletsOffset < 0 || meshletsOffset % 16 != 0) {
         return mcdr::err(kApi, "meshletDispatch: empty vertex/section/meshlet range");
     }
     if (sectionsLength > 0 && sectionsLength > remainingToEnd(sections, sectionsOffset)) {
@@ -5488,7 +8230,8 @@ mcdr::Result<void> drawMeshlets(CommandContext* ctx, Dx12Object* vertexBuffer, l
     }
 
     const UINT slotCount = 3u;
-    if (ctx->nextDrawSlot + slotCount > syncRingCapacity()) {
+    if (ctx->nextDrawSlot > drawHeapCapacityFor(ctx) ||
+        slotCount > drawHeapCapacityFor(ctx) - ctx->nextDrawSlot) {
         return mcdr::err(kApi, "meshletDispatch: draw descriptor heap exhausted for this frame");
     }
 
@@ -5500,9 +8243,9 @@ mcdr::Result<void> drawMeshlets(CommandContext* ctx, Dx12Object* vertexBuffer, l
                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     prepareMeshBuffer(ctx, globals, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
 
-    const UINT slot = ctx->drawHeapSlotBase + ctx->nextDrawSlot;
+    const UINT slot = drawHeapSlotFor(ctx, ctx->nextDrawSlot);
     const SIZE_T base = static_cast<SIZE_T>(slot) * gCtx.drawInc;
-    D3D12_CPU_DESCRIPTOR_HANDLE cpuRoot = gCtx.drawHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE cpuRoot = drawHeapFor(ctx)->GetCPUDescriptorHandleForHeapStart();
     cpuRoot.ptr += base;
     writeRawBufferSRV(cpuRoot, vertexBuffer, vertexOffset, vbBytes);
     cpuRoot.ptr += gCtx.drawInc;
@@ -5511,7 +8254,7 @@ mcdr::Result<void> drawMeshlets(CommandContext* ctx, Dx12Object* vertexBuffer, l
     writeRawBufferSRV(cpuRoot, meshlets, meshletsOffset, meshletBytes);
     ctx->nextDrawSlot += slotCount;
 
-    D3D12_GPU_DESCRIPTOR_HANDLE gpuRoot = gCtx.drawHeap->GetGPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE gpuRoot = drawHeapFor(ctx)->GetGPUDescriptorHandleForHeapStart();
     gpuRoot.ptr += base;
     ctx->commandList->SetGraphicsRootDescriptorTable(ctx->currentPipeline->geometryParam, gpuRoot);
 
@@ -5525,9 +8268,49 @@ mcdr::Result<void> drawMeshlets(CommandContext* ctx, Dx12Object* vertexBuffer, l
 
     ComPtr<ID3D12GraphicsCommandList6> list6;
     if (FAILED(ctx->commandList->QueryInterface(IID_PPV_ARGS(&list6))) || !list6) {
+        ctx->recordingFailed.store(true, std::memory_order_release);
         return mcdr::err(kApi, "meshletDispatch: ID3D12GraphicsCommandList6 is not available on this command list");
     }
-    list6->DispatchMesh(static_cast<UINT>(meshletCount), 1, 1);
+    const UINT groupCount = static_cast<UINT>(meshletCount);
+    const UINT groupsX = groupCount <= 65535u ? groupCount : dispatchRowWidth;
+    const UINT groupsY = groupCount <= 65535u ? 1u : (groupCount + dispatchRowWidth - 1u) / dispatchRowWidth;
+    if (prepareSampledRenderPassWrites(ctx) != SampledTextureContentStatus::Ready)
+        return mcdr::err(kApi, "sampled render attachment write ordering failed");
+    std::shared_ptr<const void> graphicsPacket;
+    if (ctx->graphicsCommandObserver.prepare) {
+        mcdr::graphics_recording::Command command;
+        command.family = mcdr::graphics_recording::CommandFamily::Mesh;
+        command.count = groupCount;
+        command.meshGroups[0] = groupsX;
+        command.meshGroups[1] = groupsY;
+        command.meshGroups[2] = 1;
+        const DrawBinding meshBindings[] = {
+            {2, vertexBuffer, vertexOffset, vbBytes}, {2, sections, sectionsOffset, secBytes},
+            {2, meshlets, meshletsOffset, meshletBytes}, {0, globals, globalsOffset, remainingToEnd(globals, globalsOffset)}
+        };
+        try {
+            auto prepared = prepareGraphicsCommand(ctx, command, meshBindings, 4, gpuRoot, globalsVA);
+            if (!prepared) {
+                ctx->recordingFailed.store(true, std::memory_order_release);
+                return std::unexpected(prepared.error());
+            }
+            graphicsPacket = std::move(*prepared);
+        } catch (...) {
+            ctx->recordingFailed.store(true, std::memory_order_release);
+            return mcdr::err(kApi, "graphics command capture preparation failed");
+        }
+    }
+    list6->DispatchMesh(groupsX, groupsY, 1);
+    if (graphicsPacket) {
+        if (confirmGraphicsCommandCapture(ctx, graphicsPacket) != 1)
+            return mcdr::err(kApi, "graphics command capture confirmation failed");
+        if (completeGraphicsCommandRecording(ctx, mcdr::graphics_recording::Completion::Succeeded) != 1)
+            return mcdr::err(kApi, "graphics command capture completion failed");
+    }
+    if (ctx->vanillaDepthSeedDraw && ctx->activeDepthTarget)
+        ctx->vanillaDepthSeedDraw(ctx->vanillaDepthSeedState, ctx, ctx->activeDepthTarget,
+            ctx->currentPipeline, static_cast<uint32_t>(mcdr::graphics_recording::CommandFamily::Mesh),
+            ++ctx->vanillaDepthSeedOrdinal, graphicsPacket);
     markMeshColorTargets(ctx);
     return {};
 }
@@ -5563,14 +8346,34 @@ mcdr::Result<void> drawIndexedInstanced(CommandContext* ctx, UINT indexCount, UI
                       (int)(ctx->currentPipeline ? ctx->currentPipeline->topology : -1));
     }
     // P17：标记当前 render pass 的所有 color target 为"已写入"
-    for (size_t i = 0; i < ctx->activeColorTargets.size(); ++i) {
-        if (i < ctx->activeColorTargetsTouched.size()) ctx->activeColorTargetsTouched[i] = true;
+    if (!ctx->currentPipeline || ctx->currentPipeline->rasterMotionWritesWorldColor) {
+        for (size_t index = 0; index < ctx->activeColorTargets.size(); ++index) {
+            if (index < ctx->activeColorTargetsTouched.size()) ctx->activeColorTargetsTouched[index] = true;
+        }
+        if (!ctx->activeColorTargets.empty()) ctx->colorTargetsWritten = true;
     }
-    ctx->colorTargetsWritten = true;
     DBG_LOG_DEBUG("drawIndexed[%llu] colorTargetsWritten -> %d", (unsigned long long)ctx->fenceValue,
                   (int)ctx->colorTargetsWritten);
+    if (indexCount && instanceCount && prepareSampledRenderPassWrites(ctx) != SampledTextureContentStatus::Ready)
+        return mcdr::err("drawIndexedInstanced", "sampled render attachment write ordering failed");
+    std::shared_ptr<const void> graphicsPacket;
+    if (ctx->graphicsCommandObserver.prepare) {
+        mcdr::graphics_recording::Command command;
+        command.family = mcdr::graphics_recording::CommandFamily::DrawIndexed;
+        command.count = indexCount;
+        command.instanceCount = instanceCount;
+        command.firstVertexOrIndex = static_cast<UINT>(startIndexLocation);
+        command.baseVertex = baseVertexLocation;
+        command.firstInstance = startInstanceLocation;
+        if (prepareGraphicsCommandCapture(ctx, command, &graphicsPacket) != 1) return mcdr::err("drawIndexedInstanced", "graphics command capture preparation failed");
+    }
     ctx->commandList->DrawIndexedInstanced(indexCount, instanceCount, startIndexLocation, baseVertexLocation,
                                            startInstanceLocation);
+    if (graphicsPacket && confirmGraphicsCommandCapture(ctx, graphicsPacket) != 1) return mcdr::err("drawIndexedInstanced", "graphics command capture confirmation failed");
+    if (ctx->vanillaDepthSeedDraw && ctx->activeDepthTarget)
+        ctx->vanillaDepthSeedDraw(ctx->vanillaDepthSeedState, ctx, ctx->activeDepthTarget,
+            ctx->currentPipeline, static_cast<uint32_t>(mcdr::graphics_recording::CommandFamily::DrawIndexed),
+            ++ctx->vanillaDepthSeedOrdinal, graphicsPacket);
     return {};
 }
 
@@ -5583,7 +8386,24 @@ mcdr::Result<void> drawInstanced(CommandContext* ctx, UINT vertexCount, UINT ins
         return mcdr::err("drawInstanced", "draw: no open render pass");
     }
     DBG_LOG_DEBUG("draw: vertexCount=%u instance=%u firstVertex=%u", vertexCount, instanceCount, firstVertex);
+    if (vertexCount && instanceCount && prepareSampledRenderPassWrites(ctx) != SampledTextureContentStatus::Ready)
+        return mcdr::err("drawInstanced", "sampled render attachment write ordering failed");
+    std::shared_ptr<const void> graphicsPacket;
+    if (ctx->graphicsCommandObserver.prepare) {
+        mcdr::graphics_recording::Command command;
+        command.family = mcdr::graphics_recording::CommandFamily::Draw;
+        command.count = vertexCount;
+        command.instanceCount = instanceCount;
+        command.firstVertexOrIndex = firstVertex;
+        command.firstInstance = startInstanceLocation;
+        if (prepareGraphicsCommandCapture(ctx, command, &graphicsPacket) != 1) return mcdr::err("drawInstanced", "graphics command capture preparation failed");
+    }
     ctx->commandList->DrawInstanced(vertexCount, instanceCount, firstVertex, startInstanceLocation);
+    if (graphicsPacket && confirmGraphicsCommandCapture(ctx, graphicsPacket) != 1) return mcdr::err("drawInstanced", "graphics command capture confirmation failed");
+    if (ctx->vanillaDepthSeedDraw && ctx->activeDepthTarget)
+        ctx->vanillaDepthSeedDraw(ctx->vanillaDepthSeedState, ctx, ctx->activeDepthTarget,
+            ctx->currentPipeline, static_cast<uint32_t>(mcdr::graphics_recording::CommandFamily::Draw),
+            ++ctx->vanillaDepthSeedOrdinal, graphicsPacket);
     return {};
 }
 
@@ -5601,8 +8421,24 @@ mcdr::Result<void> drawIndexedIndirect(CommandContext* ctx, Dx12Object* commands
     if (!gCtx.cmdSigIndexed) {
         return mcdr::err("drawIndexedIndirect", "drawIndexedIndirect: no indexed command signature");
     }
+    if (drawCount && prepareSampledRenderPassWrites(ctx) != SampledTextureContentStatus::Ready)
+        return mcdr::err("drawIndexedIndirect", "sampled render attachment write ordering failed");
+    std::shared_ptr<const void> graphicsPacket;
+    if (ctx->graphicsCommandObserver.prepare) {
+        mcdr::graphics_recording::Command command;
+        command.family = mcdr::graphics_recording::CommandFamily::DrawIndexedIndirect;
+        command.count = drawCount;
+        command.indirectBuffer = commands;
+        command.indirectOffset = static_cast<uint64_t>(offset);
+        if (prepareGraphicsCommandCapture(ctx, command, &graphicsPacket) != 1) return mcdr::err("drawIndexedIndirect", "graphics command capture preparation failed");
+    }
     ctx->commandList->ExecuteIndirect(gCtx.cmdSigIndexed.Get(), drawCount, commands->resource.Get(),
                                       static_cast<UINT64>(offset), nullptr, 0);
+    if (graphicsPacket && confirmGraphicsCommandCapture(ctx, graphicsPacket) != 1) return mcdr::err("drawIndexedIndirect", "graphics command capture confirmation failed");
+    if (ctx->vanillaDepthSeedDraw && ctx->activeDepthTarget)
+        ctx->vanillaDepthSeedDraw(ctx->vanillaDepthSeedState, ctx, ctx->activeDepthTarget,
+            ctx->currentPipeline, static_cast<uint32_t>(mcdr::graphics_recording::CommandFamily::DrawIndexedIndirect),
+            ++ctx->vanillaDepthSeedOrdinal, graphicsPacket);
     return {};
 }
 
@@ -5619,8 +8455,24 @@ mcdr::Result<void> drawIndirect(CommandContext* ctx, Dx12Object* commands, long 
     if (!gCtx.cmdSigNonIndexed) {
         return mcdr::err("drawIndirect", "drawIndirect: no non-indexed command signature");
     }
+    if (drawCount && prepareSampledRenderPassWrites(ctx) != SampledTextureContentStatus::Ready)
+        return mcdr::err("drawIndirect", "sampled render attachment write ordering failed");
+    std::shared_ptr<const void> graphicsPacket;
+    if (ctx->graphicsCommandObserver.prepare) {
+        mcdr::graphics_recording::Command command;
+        command.family = mcdr::graphics_recording::CommandFamily::DrawIndirect;
+        command.count = drawCount;
+        command.indirectBuffer = commands;
+        command.indirectOffset = static_cast<uint64_t>(offset);
+        if (prepareGraphicsCommandCapture(ctx, command, &graphicsPacket) != 1) return mcdr::err("drawIndirect", "graphics command capture preparation failed");
+    }
     ctx->commandList->ExecuteIndirect(gCtx.cmdSigNonIndexed.Get(), drawCount, commands->resource.Get(),
                                       static_cast<UINT64>(offset), nullptr, 0);
+    if (graphicsPacket && confirmGraphicsCommandCapture(ctx, graphicsPacket) != 1) return mcdr::err("drawIndirect", "graphics command capture confirmation failed");
+    if (ctx->vanillaDepthSeedDraw && ctx->activeDepthTarget)
+        ctx->vanillaDepthSeedDraw(ctx->vanillaDepthSeedState, ctx, ctx->activeDepthTarget,
+            ctx->currentPipeline, static_cast<uint32_t>(mcdr::graphics_recording::CommandFamily::DrawIndirect),
+            ++ctx->vanillaDepthSeedOrdinal, graphicsPacket);
     return {};
 }
 
@@ -6350,6 +9202,29 @@ int setDlssEnabled(int enabled) {
     return want ? 1 : 0;
 }
 
+thread_local std::string gDlssLastFailure;
+
+bool dlssIsEnabled() {
+    return gCtx.dlssEnabled;
+}
+
+std::string dlssLastFailureText() {
+    return gDlssLastFailure;
+}
+
+void setDlssFailure(const char* stage, int32_t result) {
+    char note[512] = {};
+    mcdr_dlss_query(note, static_cast<int32_t>(sizeof(note)), nullptr, 0, nullptr, 0, nullptr);
+    gDlssLastFailure = std::string("DLSS ") + stage;
+    if (result != 0) {
+        gDlssLastFailure += " rc=" + std::to_string(result);
+    }
+    if (note[0] != '\0') {
+        gDlssLastFailure += ": ";
+        gDlssLastFailure += note;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // P108: DLSS（超分辨率）—— 数据面接线 + 真实 NVSDK_NGX 评价调用
 //
@@ -6437,6 +9312,7 @@ void destroyDlssTexture(CommandContext* ctx, void* object) {
     // 先把键从当前 ctx 的跟踪表里摘掉（键是它自己的裸资源指针），再走延迟删除。
     if (ctx != nullptr && obj->resource) {
         ctx->resourceState.erase(obj->resource.Get());
+        ctx->subresourceState.erase(obj->resource.Get());
     }
     dbgLogInfo("B4: module destroys a private DLSS texture: handle=%p resource=%p", object,
                obj->resource ? static_cast<void*>(obj->resource.Get()) : nullptr);
@@ -6444,19 +9320,21 @@ void destroyDlssTexture(CommandContext* ctx, void* object) {
 }
 }  // namespace
 
-bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
-    // P108（用户 m10920）：闸门是**独立的 DLSS 开关**，不再看 aaMode。DLSS 与抗锯齿互不
-    // 相干，两者都开时先 SMAA 再 DLSS 升采样（SMAA 的三趟在本函数之前跑，作用在同一张
-    // 低分辨率世界层上）。
-    if (!gCtx.dlssEnabled) {
-        return false;  // 开关关着：一个动作都没有
-    }
+int applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
+    gDlssLastFailure.clear();
+    auto reject = [](const char* reason, int32_t result = 0) {
+        setDlssFailure(reason, result);
+        return -1;
+    };
     if (!ctx || !ctx->listOpen || ctx->commandList == nullptr) {
-        return false;
+        return reject("rejected: command list is not open");
     }
     if (in.pInColor == nullptr || in.pInDepth == nullptr || in.pInMotionVectors == nullptr ||
         in.pInOutput == nullptr) {
-        return false;
+        return reject("rejected: missing input texture");
+    }
+    if (in.renderWidth <= 0 || in.renderHeight <= 0 || in.targetWidth <= 0 || in.targetHeight <= 0) {
+        return reject("rejected: non-positive render or target dimensions");
     }
     wireDlssImpl();
     // P108 根因修复（2026-10-16，hs_err_pid52140 / pid50060）：四个 `pIn*` 是 JVM 侧的
@@ -6467,6 +9345,17 @@ bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
     // `mv->GetDesc()` 就在 `EXCEPTION_ACCESS_VIOLATION reading 0x50`、`call 0` 上崩掉
     // （寄存器 RAX=0）。**解包必须在本模块里做**：这里知道 Dx12Object 的真实布局
     // （`ComPtr<ID3D12Resource> resource`），取出裸 `ID3D12Resource*` 后再往下传。
+    retainObjectForRecording(ctx, in.pInColor);
+    retainObjectForRecording(ctx, in.pInDepth);
+    retainObjectForRecording(ctx, in.pInMotionVectors);
+    retainObjectForRecording(ctx, in.pInOutput);
+    if (in.pInExposure) {
+        auto* exposure = reinterpret_cast<Dx12Object*>(in.pInExposure);
+        if (exposure->kind != Dx12Object::Kind::Texture || !exposure->resource ||
+            exposure->dxgiFormat != DXGI_FORMAT_R32_FLOAT || exposure->resource->GetDesc().Width != 1 ||
+            exposure->resource->GetDesc().Height != 1) return reject("rejected: incompatible exposure texture");
+        retainObjectForRecording(ctx, in.pInExposure);
+    }
     auto unwrapResource = [](mcdr_object* handle) -> void* {
         auto* obj = reinterpret_cast<Dx12Object*>(handle);
         return obj != nullptr ? reinterpret_cast<void*>(obj->resource.Get()) : nullptr;
@@ -6476,11 +9365,7 @@ bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
     resolved.pInDepth = reinterpret_cast<mcdr_object*>(unwrapResource(in.pInDepth));
     resolved.pInMotionVectors = reinterpret_cast<mcdr_object*>(unwrapResource(in.pInMotionVectors));
     resolved.pInOutput = reinterpret_cast<mcdr_object*>(unwrapResource(in.pInOutput));
-    dbgLogInfo("DLSS resource unwrap: color=%p depth=%p mv=%p out=%p (from Dx12Object "
-               "handles %p/%p/%p/%p)",
-               resolved.pInColor, resolved.pInDepth, resolved.pInMotionVectors, resolved.pInOutput,
-               static_cast<void*>(in.pInColor), static_cast<void*>(in.pInDepth),
-               static_cast<void*>(in.pInMotionVectors), static_cast<void*>(in.pInOutput));
+    resolved.pInExposure = reinterpret_cast<mcdr_object*>(unwrapResource(in.pInExposure));
     // 运动矢量缺失时 DLSS 无法工作：这里显式降级（打一次 INFO），而不是把一个空资源交给 NGX。
     if (resolved.pInColor == nullptr || resolved.pInDepth == nullptr || resolved.pInOutput == nullptr) {
         static bool s_loggedMissing = false;
@@ -6491,7 +9376,7 @@ bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
                        "a live texture",
                        resolved.pInColor, resolved.pInDepth, resolved.pInOutput);
         }
-        return false;
+        return reject("rejected: input texture did not unwrap to a resource");
     }
     if (resolved.pInMotionVectors == nullptr) {
         static bool s_loggedNoMv = false;
@@ -6501,12 +9386,12 @@ bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
                        "is off or did not record); DLSS needs per-pixel motion vectors, so it stays "
                        "off until one exists. Enable it with -Pdxrmc.temporal.velocity=true.");
         }
-        return false;
+        return reject("rejected: motion-vector texture did not unwrap to a resource");
     }
     // DLSS 的初始化与建特征都必须在**命令列表打开**的时候做（CreateFeature 会录制 NGX
     // 自己的命令），所以两者都走这里，而不是在 setAntiAliasing 里提前做。
     if (mcdr_dlss_can_run(reinterpret_cast<void*>(gCtx.device.Get())) != 1) {
-        return false;  // 失败已经一次性 WARN 过；保持既有路径
+        return reject("initialization unavailable");
     }
     // P108：资源状态过渡交给本模块（DLSS 实现单元看不到 ctx->resourceState）。它按
     // transitionTextureTo 的跟踪状态走 barrier，from==to 时自动跳过 —— 这修掉了旧代码手写
@@ -6521,39 +9406,24 @@ bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
     };
     // The tracked-state query is only needed by the depth snapshot path (snapshotDlssDepth);
     // the evaluate path never asks for a state, so no query callback is built here.
-    // P108 (user m11147): keep the implementation's tier in sync with the device state on every
-    // frame. `setDlssQuality` pushes changes immediately, but this is what makes the default (2 =
-    // Quality, which is what the old ratio-based choice picked at 640x360->854x480) actually take
-    // effect even when the JVM never calls the setter.
-    mcdr_dlss_request_quality(gCtx.dlssQualityTier);
-    // P108ac (user m08033): same re-assert for the DLSS model, and for the same reason — the
-    // implementation unit's state can be reset behind the device module's back, and a silently
-    // reverted preset would look exactly like "the button does nothing" in the user's report.
-    mcdr_dlss_request_preset(gCtx.dlssPreset);
-    // P108 (user m11147 follow-up): re-assert the JVM-supplied output texture EVERY frame, next to
-    // the tier above and for the same reason — the hand-off is one-shot on the JVM side
-    // (`handed … 1`, `dx12SetDlssOutput(0)` never called), while the implementation unit's state can
-    // be reset behind its back. Diagnosed from a joint run where `override accepted` (01:24:44.258)
-    // and the first evaluate (01:24:45.458) were on the SAME thread with no device recreate, yet
-    // the evaluate chose the private fallback: `s.externalOutput` had gone null with no
-    // `override cleared` line, and the only writer that can do that silently is
-    // `mcdr_dlss_shutdown`'s blanket `s = State{}`. Re-asserting here makes the hand-off idempotent
-    // and self-healing rather than depending on nothing in between touching that state.
-    // `mcdr_dlss_set_output_texture` early-returns when the pointer is unchanged.
-    {
+    const auto outputFlags = static_cast<ID3D12Resource*>(
+        reinterpret_cast<void*>(resolved.pInOutput))->GetDesc().Flags;
+    if ((outputFlags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
         void* overrideRaw = nullptr;
         if (gCtx.dlssOutputOverride != nullptr) {
             auto* oObj = reinterpret_cast<Dx12Object*>(gCtx.dlssOutputOverride);
             if (oObj->kind == Dx12Object::Kind::Texture && oObj->resource) {
+                retainObjectForRecording(ctx, oObj);
                 overrideRaw = reinterpret_cast<void*>(oObj->resource.Get());
             }
         }
-        mcdr_dlss_set_output_texture(overrideRaw);
+        const int32_t outputResult = mcdr_dlss_set_output_texture(overrideRaw);
+        if (outputResult < 0) return reject("output texture registration failed");
     }
     const int32_t created = mcdr_dlss_create(reinterpret_cast<void*>(ctx->commandList), &resolved,
                                              tl, ctx);
     if (created != 1) {
-        return false;
+        return reject("feature creation failed", created);
     }
     // NGX records a COMPUTE dispatch, and D3D12 forbids that while render targets are still
     // bound — the classic source of DXGI_ERROR_INVALID_CALL (0x887A0001). Ending a pass that is
@@ -6564,7 +9434,10 @@ bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
         dbgLogWarn("a render pass was still open at the DLSS evaluate (inRenderPass=1); ending it "
                 "so NGX's compute dispatch is legal. The caller is expected to begin its own pass "
                 "afterwards — nothing is restarted here.");
-        (void)endRenderPass(ctx);
+        if (auto ended = endRenderPass(ctx); !ended) {
+            gDlssLastFailure = std::string("DLSS endRenderPass failed: ") + ended.error().message;
+            return -1;
+        }
     }
     // NOTE: an explicit `OMSetRenderTargets(0, nullptr, ...)` is NOT used here — this TU's command
     // list handle is not a plain `ID3D12GraphicsCommandList*` for that call. Ending the tracked pass
@@ -6572,10 +9445,12 @@ bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
     // legal; if the device still reports INVALID_CALL we will look at descriptor heaps / list state
     // next, with the debug layer on.
     const int32_t evaluated = mcdr_dlss_evaluate(reinterpret_cast<void*>(ctx->commandList), &resolved, tl, ctx);
-    if (evaluated != 1) {
-        return false;
+    restoreDrawHeap(ctx);
+    if (evaluated <= 0) {
+        return reject("evaluate failed", evaluated);
     }
-    return true;
+    gDlssLastFailure.clear();
+    return evaluated;
 }
 
 // P108（用户 m11147 后续）：登记 JVM 送来的 UAV 输出纹理（(B) 方案）。
@@ -6586,10 +9461,23 @@ bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
 //
 // 只登记句柄、不持有引用；资源生命周期由 JVM 侧那个 Dx12Object 保证。
 // 返回 1=已接受 0=已清除 -1=句柄不是纹理资源（调用方应视为无效、保持原状）。
+int32_t invalidateReconstructionInputs(void* rawContext) {
+    auto* context = static_cast<CommandContext*>(rawContext);
+    if (!context) return 0;
+    if (!waitForRenderThreadSubmit()) {
+        invalidatePreparedReconstructionHistory();
+        return 0;
+    }
+    invalidatePreparedReconstructionHistory();
+    if (context->submissionFailed.load()) return 0;
+    return mcdr_dlss_invalidate_inputs();
+}
+
 int setDlssOutput(mcdr_object* tex) {
     if (tex == nullptr) {
+        if (mcdr_dlss_set_output_texture(nullptr) < 0) return -1;
         gCtx.dlssOutputOverride = nullptr;
-        mcdr_dlss_set_output_texture(nullptr);
+        gCtx.dlssOutputOverrideLease.reset();
         dbgLogInfo("DLSS output override cleared (back to the private fallback)");
         return 0;
     }
@@ -6600,8 +9488,11 @@ int setDlssOutput(mcdr_object* tex) {
                     static_cast<int>(obj->kind));
         return -1;
     }
-    gCtx.dlssOutputOverride = tex;
+    auto lease = retainObjectLease(obj);
     const int32_t r = mcdr_dlss_set_output_texture(reinterpret_cast<void*>(obj->resource.Get()));
+    if (r < 0) return -1;
+    gCtx.dlssOutputOverride = tex;
+    gCtx.dlssOutputOverrideLease = std::move(lease);
     dbgLogInfo("DLSS output override accepted (raw resource %p); the evaluate will write "
                "there instead of the private UAV texture",
                static_cast<void*>(obj->resource.Get()));
@@ -6705,15 +9596,6 @@ int queryDlss(char* out, int cap) {
         return fail("device not created");
     }
     wireDlssImpl();
-    // 探测缓存可能是在厂商 DLL 还没就位时建的（那时只报告"运行期不在"）。这里给一次
-    // 重探的机会：只有"上次没查成 + 现在运行期在"，才允许重探一次，避免每次查询都重新
-    // LoadLibrary。判据取自探测自己的 dlssQueried / ngxRuntime，不再另设状态。
-    if (!gCtx.rtx.dlssQueried && gCtx.rtx.ngxRuntime) {
-        mcdr::resetRtxSupportCache();
-        gCtx.rtx = mcdr::probeRtxSupport(gCtx.adapter.Get());
-        gDlssAvailabilityLogged = false;
-        notifyDlssDeviceReady();
-    }
     if (!gCtx.rtx.ngxRuntime) {
         return fail(gCtx.rtx.ngxNote.empty() ? "ngx runtime not found" : gCtx.rtx.ngxNote.c_str());
     }
@@ -6775,6 +9657,7 @@ HANDLE gEvtSubmitDone = nullptr;  // 渲染线程→主线程：命令已提交�
 // (waitResult=258=WAIT_TIMEOUT) / pendingPresents=0.0 → 主线程帧间隔 12195.6 ms，
 // 即用户报告的「加载世界弹出瞬间帧时间骤增 / 启动加载界面冻结」。
 std::atomic<bool> gRenderThreadBusy{false};
+std::atomic<int> gAsyncSubmissionResult{0};
 
 // P48（多帧飞行）：Present 完成护栏。
 // 主线程不再每帧等 Present 返回，因此它可能在上一帧 Present 尚未完成时就去
@@ -6786,6 +9669,7 @@ std::mutex gPresentMtx;
 std::condition_variable gPresentCv;
 UINT64 gSubmittedFrames = 0;  // 已完成 ExecuteCommandLists 的帧数
 UINT64 gPresentedFrames = 0;  // 已完成 Present 的帧数
+std::atomic<bool> gPresentRetirementFailed{false};
 
 // 渲染线程函数
 static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
@@ -6809,7 +9693,8 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         if (!gRenderRunning) return 0;
         if (!gAsyncRenderCtx) continue;
 
-        CommandContext* ctx = gAsyncRenderCtx;
+        CommandContext* ctx = gAsyncRenderCtx.load(std::memory_order_acquire);
+        if (!ctx) continue;
 
         // P98：本帧处理期间置 busy=1，所有退出路径（continue/break/return）由 RAII 清除，
         // 供主线程的 waitForRenderThreadSubmit 判断「有没有在飞的帧」。
@@ -6848,34 +9733,33 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         static double sProfWaitCmdMs = 0.0, sProfSubmitMs = 0.0, sProfPresentMs = 0.0;
         const double tProfWait0 = sProf ? nowMs() : 0.0;
         int commandsWaitLoops = 0;
+        bool commandsReady = false;
         for (;;) {
             if (!gRenderRunning) {
-                destroySurfaceNoWaitIdle(getActiveSurface());
                 return 0;
             }
             DWORD r = WaitForSingleObject(gEvtCommandsReady, 500);
             if (r == WAIT_OBJECT_0) {
+                if (!gRenderRunning) return 0;
                 dbgLogDebug("renderThread: commandsReady ctx=%p", reinterpret_cast<void*>(ctx));
+                commandsReady = true;
                 break;
             }
             if (r == WAIT_TIMEOUT && !gRenderRunning) {
-                destroySurfaceNoWaitIdle(getActiveSurface());
                 return 0;
             }
             // P41：超时保护——5s 内未收到 CommandsReady，说明主线程卡死，放弃本帧
             if (++commandsWaitLoops >= 10) {
                 dbgLogError("renderThread: commandsReady timeout after %ds, aborting frame ctx=%p",
                        commandsWaitLoops * 500 / 1000, reinterpret_cast<void*>(ctx));
-                if (ctx->listOpen) {
-                    // P44 fix：endCommandList 内部已统一递减 gOpenListCount，
-                    // 此处不再重复递减。
-                    (void)endCommandList(ctx);
-                }
-                gAsyncRenderCtx = nullptr;
+                fgAbortDisplayFrame(ctx);
+                failDisplayPresentSubmission(ctx);
+                gAsyncSubmissionResult.store(-1, std::memory_order_release);
                 SetEvent(gEvtSubmitDone);
                 break;
             }
         }
+        if (!commandsReady) continue;
 
         // 步骤 7：end + submit + present
         const double tProfWait1 = sProf ? nowMs() : 0.0;
@@ -6884,14 +9768,17 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         if (!submitRes) {
             dbgLogError("renderThread: submitCommandList FAILED: %s", errorMessage(submitRes.error()).c_str());
             // P41 fix：不清除 surface（submit 失败不代表 surface 无效）
-            if (gAsyncRenderCtx == ctx) gAsyncRenderCtx = nullptr;
+            failDisplayPresentSubmission(ctx);
+            gAsyncSubmissionResult.store(ctx->recordingFailed.load(std::memory_order_acquire) &&
+                !ctx->submissionFailed.load(std::memory_order_acquire) ? 2 : -1, std::memory_order_release);
             SetEvent(gEvtSubmitDone);
             continue;
         }
         [[maybe_unused]] const UINT64 value = *submitRes;
+        const auto frameGenerationTicket = fgDisplayFrameTicket(ctx);
 
         // 全局 queue fence（submitCommandList 已推进 gCtx.queueFenceValue）
-        ctx->lastSubmitQueueFence = gCtx.queueFenceValue;
+        const UINT64 submittedQueueFence = ctx->lastSubmitQueueFence;
 
         // per-backbuffer fence
         Dx12Surface* s = getActiveSurface();
@@ -6902,7 +9789,7 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
         if (s && bbIdx >= 0) {
             if (s->surfaceFences.size() < static_cast<size_t>(kSurfaceBufferCount))
                 s->surfaceFences.resize(kSurfaceBufferCount, 0);
-            s->surfaceFences[static_cast<size_t>(bbIdx)] = gCtx.queueFenceValue;
+            s->surfaceFences[static_cast<size_t>(bbIdx)] = submittedQueueFence;
         }
 
         DBG_LOG_DEBUG("renderThread: submit done v=%llu qf=%llu", (unsigned long long)value,
@@ -6924,12 +9811,13 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
             std::lock_guard<std::mutex> lk(gPresentMtx);
             ++gSubmittedFrames;
         }
+        gAsyncSubmissionResult.store(1, std::memory_order_release);
         SetEvent(gEvtSubmitDone);
 
         // present（presentSurface 返回 void）
         dbgLogDebug("renderThread: about to presentSurface qf=%llu bbIdx=%d",
                     static_cast<unsigned long long>(gCtx.queueFenceValue), bbIdx);
-        presentSurface(getActiveSurface());
+        const auto presentResult = presentSurface(getActiveSurface(), frameGenerationTicket);
         // P3-native 插桩：累加三段耗时，每 300 帧打印一次均值。
         if (sProf) {
             const double tProfPresent1 = nowMs();
@@ -6943,28 +9831,36 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
                 sProfWaitCmdMs = sProfSubmitMs = sProfPresentMs = 0.0;
             }
         }
-        // P48：Present 完成，放行主线程的 back buffer acquire。
+        UINT64 presentQueueFenceValue = 0;
+        uint32_t presentRetirementState = MCDR_PRESENT_RETIREMENT_NOT_REQUIRED;
+        if (s && bbIdx >= 0) {
+            std::lock_guard<std::mutex> queueLock(gQueueSubmissionMutex);
+            UINT64 pv = ++gCtx.queueFenceValue;
+            const HRESULT presentSignal = gCtx.queue->Signal(gCtx.queueFence.Get(), pv);
+            if (FAILED(presentSignal)) {
+                presentRetirementState = MCDR_PRESENT_RETIREMENT_UNKNOWN;
+                gPresentRetirementFailed.store(true, std::memory_order_release);
+                dbgLogError("renderThread: post-Present Signal failed hr=0x%08X", static_cast<unsigned>(presentSignal));
+            } else {
+                presentQueueFenceValue = pv;
+                presentRetirementState = MCDR_PRESENT_RETIREMENT_SIGNALLED;
+                if (s->surfacePresentFences.size() < static_cast<size_t>(kSurfaceBufferCount))
+                    s->surfacePresentFences.resize(kSurfaceBufferCount, 0);
+                s->surfacePresentFences[static_cast<size_t>(bbIdx)] = pv;
+            }
+        }
+
+        completeDisplayPresentReceipt(frameGenerationTicket, presentResult,
+            presentQueueFenceValue, presentRetirementState);
+        dbgLogDebug("renderThread: post-present qf=%llu openList=%d",
+                    static_cast<unsigned long long>(gCtx.queueFenceValue), gOpenListCount);
+        if (gOpenListCount == 0) flushPendingDeletes();
+
         {
             std::lock_guard<std::mutex> lk(gPresentMtx);
             ++gPresentedFrames;
         }
         gPresentCv.notify_all();
-
-        // P33 fix：signal per-surface present fence，确保 Display Controller 完成
-        // flip 后再销毁 surface。deviceWaitIdle 仅等命令队列，不等待 display controller。
-        if (s && bbIdx >= 0) {
-            UINT64 pv = ++gCtx.queueFenceValue;
-            gCtx.queue->Signal(gCtx.queueFence.Get(), pv);
-            if (s->surfacePresentFences.size() < static_cast<size_t>(kSurfaceBufferCount))
-                s->surfacePresentFences.resize(kSurfaceBufferCount, 0);
-            s->surfacePresentFences[static_cast<size_t>(bbIdx)] = pv;
-        }
-
-        // P33 fix：在 present fence signal 之后才 flush 延迟删除对象，确保所有
-        // GPU 工作（含 display controller flip）完成后才释放资源，避免 CORRUPTION。
-        dbgLogDebug("renderThread: post-present qf=%llu openList=%d",
-                    static_cast<unsigned long long>(gCtx.queueFenceValue), gOpenListCount);
-        if (gOpenListCount == 0) flushPendingDeletes();
 
         // 步骤 8：本帧结束。submitDone 已在本帧 present **之前**置位（P48 多帧飞行），
         // 以便主线程的下一帧录制与本帧 Present 重叠，这里不再重复置位。
@@ -6979,11 +9875,11 @@ static DWORD WINAPI renderThreadFunc(LPVOID /*param*/) {
 // P33 async renderer thread（外部可访问，供 destroySurface 调用）
 std::thread gRenderThread;
 // P33：渲染线程运行标志（外部可访问）
-bool gRenderRunning = false;
+std::atomic<bool> gRenderRunning{false};
 // P33：当前正在处理的 ctx（外部可访问，供诊断读回检测 ASYNC 管道活跃）
-CommandContext* gAsyncRenderCtx = nullptr;
+std::atomic<CommandContext*> gAsyncRenderCtx{nullptr};
 // P33：本帧 Present 已由渲染线程完成（Java 侧 present() 需跳过，避免重复 Present）
-bool gAsyncOwnsPresent = false;
+std::atomic<bool> gAsyncOwnsPresent{false};
 
 // P48（多帧飞行）：等待所有已提交帧完成 Present。
 // 主线程的 back buffer acquire 已推迟到 blit 之前（见 Dx12GpuSurface），
@@ -6996,31 +9892,28 @@ bool gAsyncOwnsPresent = false;
 // RemoveDevice 0x887A0005=DXGI_ERROR_ACCESS_DENIED，GLFW_NO_API 冷启动必崩）。
 // 现在返回 false，由 acquireSurface 放弃本帧（Java 侧跳过 blit，下一帧让 MC 重建 surface）。
 bool waitForPendingPresents(unsigned timeoutMs) {
-    if (!gRenderRunning) return true;
     std::unique_lock<std::mutex> lk(gPresentMtx);
-    if (gPresentedFrames >= gSubmittedFrames) return true;
+    if (gPresentedFrames >= gSubmittedFrames) return !gPresentRetirementFailed.load(std::memory_order_acquire);
     if (!gPresentCv.wait_for(lk, std::chrono::milliseconds(timeoutMs),
-                             [] { return gPresentedFrames >= gSubmittedFrames || !gRenderRunning; })) {
+                             [] { return gPresentedFrames >= gSubmittedFrames; })) {
         dbgLogError("waitForPendingPresents: TIMEOUT submitted=%llu presented=%llu (render thread stalled)",
                static_cast<unsigned long long>(gSubmittedFrames),
                static_cast<unsigned long long>(gPresentedFrames));
         return false;
     }
-    // 两种唤醒条件都是安全的：帧已呈现（index 已轮转完毕），或渲染线程已停止（index 不会再动）。
-    return true;
+    return !gPresentRetirementFailed.load(std::memory_order_acquire);
 }
 
 // 等待渲染线程完成当前帧：信号 beginFrame + 等 submitDone，不销毁线程本身。
 // 用于 destroySurface 场景：确保渲染线程不再并发操作 swapchain 后再调用 deviceWaitIdle。
-void waitForRenderThreadSubmit() {
-    if (!gRenderRunning || !gRenderThread.joinable()) return;
+bool waitForRenderThreadSubmit() {
+    if (!gRenderRunning || !gRenderThread.joinable()) return waitForPendingPresents();
     // P98 修复：没有在飞的帧时不再做 submitDone 握手。渲染线程空闲时只在
     // WaitForSingleObject(gEvtBeginFrame) 处空转，不碰 swapchain；旧实现仍无条件
     // SetEvent + 等满 10 s 超时（见 gRenderThreadBusy 的注释与实测数据）。
     // 仍在飞的帧由 waitForPendingPresents 兜底（Present 完成后才返回）。
     if (!gRenderThreadBusy.load(std::memory_order_acquire)) {
-        waitForPendingPresents();
-        return;
+        return waitForPendingPresents();
     }
     // P98 诊断：量出实际等待时长（世界入场瞬间曾在日志里留下 10.5 s 空档，
     // 用户报告为「帧时间骤增 / 启动加载界面冻结」）。
@@ -7032,32 +9925,271 @@ void waitForRenderThreadSubmit() {
     DWORD r = WaitForSingleObject(gEvtSubmitDone, 10000);
     const double p98submitDoneMs = nowMs() - p98t0;
     if (r != WAIT_OBJECT_0) {
-        // Shutdown path only (destroySurface): the run still tears down cleanly, so
-        // this is a warning, not an error — otherwise every good session ends with a
-        // scary line even at the default log level.
         dbgLogWarn("waitForRenderThreadSubmit: timeout (render thread may be stuck)");
+        return false;
     }
     // P48：submitDone 现在在 Present **之前**置位，这里再等 Present 真正完成，
     // 保证后续 destroySurface 的 swapchain 操作（ResizeBuffers/Release）不与
     // 并发的 Present 竞争。
     const double p98t1 = nowMs();
-    waitForPendingPresents();
+    const bool presentsComplete = waitForPendingPresents();
     const double p98presentsMs = nowMs() - p98t1;
     if (p98submitDoneMs > 30.0 || p98presentsMs > 30.0) {
         dbgLogInfo("waitForRenderThreadSubmit: submitDone=%.1f ms (waitResult=%lu) pendingPresents=%.1f ms",
                p98submitDoneMs, static_cast<unsigned long>(r), p98presentsMs);
     }
+    return presentsComplete;
+}
+
+mcdr::Result<void> beginDisplayPresentReceipt(const FgPresentTicket& ticket) {
+    auto* context = static_cast<CommandContext*>(ticket.context);
+    if (!context) return {};
+    std::lock_guard lock(gPresentMtx);
+    auto& result = context->displayPresentResult;
+    if (result.phase == DisplayPresentPhase::Awaiting || result.phase == DisplayPresentPhase::Terminal)
+        return mcdr::err("display.receipt", "Previous display result has not been consumed");
+    result = {};
+    result.phase = DisplayPresentPhase::Awaiting;
+    result.receipt.schemaVersion = MCDR_PRESENT_RECEIPT_SCHEMA_VERSION;
+    result.receipt.structSize = sizeof(mcdr_present_receipt_v1);
+    result.receipt.serial = ticket.serial;
+    result.receipt.providerGeneration = ticket.providerGeneration;
+    return {};
+}
+
+void attachDisplayPresentIdentity(void* opaqueContext, const mcdr_frame_identity& identity,
+    uint64_t historyGeneration) {
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    if (!context) return;
+    std::lock_guard lock(gPresentMtx);
+    auto& result = context->displayPresentResult;
+    if (result.phase != DisplayPresentPhase::Awaiting) return;
+    result.receipt.identity = identity;
+    result.receipt.historyGeneration = historyGeneration;
+}
+
+void queueDisplayPresentReceipt(const FgPresentTicket& ticket, uint32_t submissionState) {
+    auto* context = static_cast<CommandContext*>(ticket.context);
+    if (!context) return;
+    std::lock_guard lock(gPresentMtx);
+    auto& result = context->displayPresentResult;
+    if (result.phase != DisplayPresentPhase::Awaiting || result.receipt.serial != ticket.serial) return;
+    result.receipt.submissionState = submissionState;
+    if (submissionState == MCDR_SUBMISSION_SUBMITTED) {
+        result.receipt.commandFenceValue = ticket.fenceValue;
+        result.receipt.submitQueueFenceValue = context->lastSubmitQueueFence;
+    }
+}
+
+void failDisplayPresentSubmission(void* opaqueContext) {
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    if (!context) return;
+    {
+        std::lock_guard lock(gPresentMtx);
+        auto& result = context->displayPresentResult;
+        if (result.phase != DisplayPresentPhase::Awaiting) return;
+        const bool rejected = context->recordingFailed.load(std::memory_order_acquire) &&
+            !context->submissionFailed.load(std::memory_order_acquire);
+        result.receipt.submissionState = rejected ? MCDR_SUBMISSION_FAILED : MCDR_SUBMISSION_UNKNOWN;
+        result.receipt.presentOutcome = rejected ? MCDR_PRESENT_CANCELLED : MCDR_PRESENT_UNKNOWN;
+        result.receipt.retirementState = rejected ? MCDR_PRESENT_RETIREMENT_NOT_REQUIRED : MCDR_PRESENT_RETIREMENT_UNKNOWN;
+        result.phase = DisplayPresentPhase::Terminal;
+    }
+    gPresentCv.notify_all();
+}
+
+void cancelDisplayPresentReceipt(void* opaqueContext) {
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    if (!context) return;
+    {
+        std::lock_guard lock(gPresentMtx);
+        auto& result = context->displayPresentResult;
+        if (result.phase != DisplayPresentPhase::Awaiting) return;
+        result.receipt.presentOutcome = MCDR_PRESENT_CANCELLED;
+        result.receipt.retirementState = MCDR_PRESENT_RETIREMENT_NOT_REQUIRED;
+        result.phase = DisplayPresentPhase::Terminal;
+    }
+    gPresentCv.notify_all();
+}
+
+void completeDisplayPresentReceipt(const FgPresentTicket& ticket, SurfacePresentResult present,
+    uint64_t presentQueueFenceValue, uint32_t retirementState) {
+    auto* context = static_cast<CommandContext*>(ticket.context);
+    if (!context) return;
+    {
+        std::lock_guard lock(gPresentMtx);
+        auto& result = context->displayPresentResult;
+        if (result.phase != DisplayPresentPhase::Awaiting || result.receipt.serial != ticket.serial) return;
+        result.receipt.presentOutcome = present.outcome;
+        result.receipt.dxgiStatus = present.dxgiStatus;
+        result.receipt.flags = present.flags;
+        result.receipt.outputFrameCount = present.outputFrameCount;
+        result.receipt.presentQueueFenceValue = presentQueueFenceValue;
+        result.receipt.retirementState = retirementState;
+        result.phase = DisplayPresentPhase::Terminal;
+    }
+    gPresentCv.notify_all();
+}
+
+mcdr::Result<int32_t> settleDisplayFrame(void* opaqueContext, uint64_t timeoutMs,
+    void* opaqueReceipt, uint32_t byteCount) {
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    auto* output = static_cast<mcdr_present_receipt_v1*>(opaqueReceipt);
+    if (!context || !output || byteCount != sizeof(*output))
+        return mcdr::err("display.receipt", "Invalid display settlement context or receipt");
+    *output = {};
+    output->schemaVersion = MCDR_PRESENT_RECEIPT_SCHEMA_VERSION;
+    output->structSize = sizeof(*output);
+    std::unique_lock lock(gPresentMtx);
+    auto& result = context->displayPresentResult;
+    if (result.phase == DisplayPresentPhase::Empty || result.phase == DisplayPresentPhase::Consumed)
+        return MCDR_DISPLAY_SETTLE_EMPTY;
+    const auto timeout = std::chrono::milliseconds(std::min<uint64_t>(timeoutMs, 0xFFFFFFF0ULL));
+    if (!gPresentCv.wait_for(lock, timeout, [&] { return result.phase == DisplayPresentPhase::Terminal; })) {
+        *output = result.receipt;
+        return MCDR_DISPLAY_SETTLE_TIMEOUT;
+    }
+    *output = result.receipt;
+    if (output->submissionState == MCDR_SUBMISSION_UNKNOWN ||
+        output->retirementState == MCDR_PRESENT_RETIREMENT_UNKNOWN)
+        return MCDR_DISPLAY_SETTLE_SUBMISSION_UNKNOWN;
+    result.phase = DisplayPresentPhase::Consumed;
+    return MCDR_DISPLAY_SETTLE_COMPLETE;
+}
+
+mcdr::Result<void> abortDisplayFrame(void* opaqueContext) {
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    if (context == nullptr) return mcdr::err("abortDisplayFrame", "Null command context");
+    std::lock_guard<std::mutex> submissionLock(gAsyncSubmissionMutex);
+    const auto initialTicket = fgDisplayFrameTicket(context);
+    if (gAsyncRenderCtx.load(std::memory_order_acquire) == context) {
+        if (!gRenderRunning || !gEvtSubmitDone)
+            return mcdr::err("abortDisplayFrame", "Asynchronous renderer still owns the context but is not running");
+        if (WaitForSingleObject(gEvtSubmitDone, 10'000) != WAIT_OBJECT_0)
+            return mcdr::err("abortDisplayFrame", "Asynchronous command submission did not finish within 10 seconds");
+        const int result = gAsyncSubmissionResult.load(std::memory_order_acquire);
+        if ((result != 1 && result != 2) || context->submissionFailed.load())
+            return mcdr::err("abortDisplayFrame", "Asynchronous command submission failed; context ownership retained");
+        gAsyncRenderCtx = nullptr;
+    }
+    if (!waitForPendingPresents(2'000))
+        return mcdr::err("abortDisplayFrame", "Pending Present did not finish or its retirement signal failed");
+    auto* surface = getActiveSurface();
+    std::unique_lock<std::mutex> presentLock;
+    if (surface) presentLock = std::unique_lock<std::mutex>(surface->presentMutex);
+    std::lock_guard<std::mutex> queueLock(gQueueSubmissionMutex);
+    if (context->submissionFailed.load())
+        return mcdr::err("abortDisplayFrame", "Command submission failed; resources retained");
+    if (context->inRenderPass)
+        return mcdr::err("abortDisplayFrame", "Command context still has an open render pass");
+    const bool rejected = context->recordingFailed.load(std::memory_order_acquire);
+    if (context->listOpen && !rejected) {
+        const auto submitted = submitRecordedCommandList(context);
+        if (!submitted) return mcdr::err("abortDisplayFrame", errorMessage(submitted.error()));
+    }
+    if (context->fenceValue != 0) {
+        const auto waited = waitForFenceValue(context, context->fenceValue, 5'000'000'000ULL);
+        if (!waited) {
+            context->submissionFailed = true;
+            return mcdr::err("abortDisplayFrame", errorMessage(waited.error()));
+        }
+    }
+    if (rejected) {
+        ComPtr<ID3D12CommandAllocator> allocator;
+        ComPtr<ID3D12GraphicsCommandList> list;
+        HRESULT result = gCtx.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator));
+        if (SUCCEEDED(result)) result = gCtx.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            allocator.Get(), nullptr, IID_PPV_ARGS(&list));
+        if (SUCCEEDED(result)) result = list->Close();
+        if (FAILED(result))
+            return mcdr::err("abortDisplayFrame", "Could not replace rejected recording: " + formatBackendResult(result));
+        {
+            std::lock_guard recordingLock(gRecordingContextsMutex);
+            gRecordingContexts.erase(context->commandList);
+            context->commandList = nullptr;
+            context->commandLists[context->currentListSlot].Reset();
+            context->allocators[context->currentListSlot] = std::move(allocator);
+            context->commandLists[context->currentListSlot] = std::move(list);
+            context->commandList = context->commandLists[context->currentListSlot].Get();
+            gRecordingContexts.emplace(context->commandList, context);
+        }
+        if (context->listOpen && gOpenListCount > 0) --gOpenListCount;
+        context->listOpen = 0;
+        context->recordingLeases[context->currentListSlot].clear();
+        context->retainedGraphicsPipelines.clear();
+        context->retainedRecordingObjects.clear();
+        if (context->recordingDiscarded) context->recordingDiscarded->store(true, std::memory_order_release);
+        context->recordingDiscarded.reset();
+        context->recordingIdentity.reset();
+        context->controlIdentity.reset();
+        context->resourceState.clear();
+        context->subresourceState.clear();
+        context->activeColorTargets.clear();
+        context->activeColorTargetsTouched.clear();
+        context->activeDepthTarget = nullptr;
+        context->activeAttachmentRanges.clear();
+        context->activePassRtvs.clear();
+        context->activePassDsv = {};
+        context->activeMotionRtv = {};
+        context->activeMotionTarget = nullptr;
+        context->additionalColorRtv = {};
+        context->additionalColorTarget = nullptr;
+        context->activePassBoundColorCount = UINT_MAX;
+        context->rasterMotionWorldColor = nullptr;
+        context->rasterMotionWorldDepth = nullptr;
+        context->rasterMotionTarget = nullptr;
+        context->rasterMotionLeases.clear();
+        context->rasterMotionSelected = false;
+        context->vanillaDepthSeedState = nullptr;
+        context->vanillaDepthSeedBind = nullptr;
+        context->vanillaDepthSeedClear = nullptr;
+        context->vanillaDepthSeedDraw = nullptr;
+        context->vanillaDepthSeedOrdinal = 0;
+        context->colorTargetsWritten = false;
+        context->currentPipeline = nullptr;
+        invalidateGraphicsInputBindings(context, true);
+        context->graphicsInputRanges.clear();
+        context->graphicsCapture = {};
+        context->captureShadingRate = {};
+        context->shadingRateImageBound = nullptr;
+        context->lastSrvViews.clear();
+        context->rtvCache.clear();
+        context->dsvCache.clear();
+        context->vanillaFrameState.reset();
+        context->oitFrameState.reset();
+        invalidatePreparedReconstructionHistory();
+    }
+    const auto currentTicket = fgDisplayFrameTicket(context);
+    if (currentTicket.serial != 0 && currentTicket.serial != initialTicket.serial)
+        return mcdr::err("abortDisplayFrame", "Display frame changed while waiting for cancellation");
+    if (currentTicket.serial != 0) fgAbortDisplayFrame(currentTicket);
+    if (surface && initialTicket.serial != 0 &&
+        ((surface->frameGenerationTicket.serial == 0 && currentTicket.serial == initialTicket.serial) ||
+         (surface->frameGenerationTicket.context == context &&
+          surface->frameGenerationTicket.serial == initialTicket.serial))) {
+        surface->frameGenerationTicket = {};
+        surface->blittedThisFrame.store(false, std::memory_order_release);
+    }
+    if (currentTicket.serial != 0 && mcdr_dlss_inputs_ready_for_present() != 1)
+        return mcdr::err("abortDisplayFrame", "Frame generation input invalidation failed; resources retained");
+    cancelDisplayPresentReceipt(context);
+    if (rejected) context->recordingFailed.store(false, std::memory_order_release);
+    return {};
 }
 
 // 形参 unnamed：workerCount 是 ABI 已经发布出去的参数（mcdr_dx12InitAsyncRenderer 的第一个
 // 入参，名字保留在 mcdr_device.cppm 的声明上），但当前渲染线程只有一条，实现里用不到它。
 // 不写名字即可避免 /W4 的 C4100 未引用形参，同时不改动 C ABI。
 bool initAsyncRenderer(UINT) {
+    std::lock_guard<std::mutex> submissionLock(gAsyncSubmissionMutex);
     if (auto devRes = ensureDevice(); !devRes) {
         dbgLogError("initAsyncRenderer: ensureDevice failed: %s", errorMessage(devRes.error()).c_str());
         return false;
     }
     if (gRenderRunning) return true;
+    if (gRenderThread.joinable() || gEvtBeginFrame || gEvtRecordingReady || gEvtCommandsReady || gEvtSubmitDone) {
+        return false;
+    }
 
     // P33 fix：gEvtBeginFrame 必须是 **auto-reset**（每帧一次的触发信号）。
     // 若用 manual-reset 且无人 Reset，渲染线程完成一帧后回到等待点会立刻再次通过
@@ -7076,6 +10208,10 @@ bool initAsyncRenderer(UINT) {
         if (gEvtRecordingReady) CloseHandle(gEvtRecordingReady);
         if (gEvtCommandsReady) CloseHandle(gEvtCommandsReady);
         if (gEvtSubmitDone) CloseHandle(gEvtSubmitDone);
+        gEvtBeginFrame = nullptr;
+        gEvtRecordingReady = nullptr;
+        gEvtCommandsReady = nullptr;
+        gEvtSubmitDone = nullptr;
         return false;
     }
 
@@ -7085,6 +10221,7 @@ bool initAsyncRenderer(UINT) {
         std::lock_guard<std::mutex> lk(gPresentMtx);
         gSubmittedFrames = 0;
         gPresentedFrames = 0;
+        gPresentRetirementFailed.store(false, std::memory_order_release);
     }
     gRenderRunning = true;
     gRenderThread = std::thread([]() {
@@ -7096,20 +10233,37 @@ bool initAsyncRenderer(UINT) {
     return true;
 }
 
-void destroyAsyncRenderer() {
-    if (!gRenderRunning) return;
+bool destroyAsyncRenderer() {
+    std::lock_guard<std::mutex> submissionLock(gAsyncSubmissionMutex);
+    if (gAsyncRenderCtx.load(std::memory_order_acquire) &&
+        gAsyncSubmissionResult.load(std::memory_order_acquire) == 0 && gRenderRunning) {
+        if (WaitForSingleObject(gEvtSubmitDone, 10000) != WAIT_OBJECT_0) {
+            dbgLogError("destroyAsyncRenderer: submission remains pending; retaining renderer");
+            return false;
+        }
+    }
+
+    gRenderRunning = false;
 
     if (gRenderThread.joinable()) {
         // 先发信号让渲染线程从任何等待点苏醒（manual-reset events 持久有效）
         SetEvent(gEvtBeginFrame);
         SetEvent(gEvtRecordingReady);
         SetEvent(gEvtCommandsReady);
-        SetEvent(gEvtSubmitDone);
-        // 再设标志，线程在下一次循环检查时看到 false 并退出
-        gRenderRunning = false;
+        if (WaitForSingleObject(gRenderThread.native_handle(), 10000) != WAIT_OBJECT_0) {
+            dbgLogError("destroyAsyncRenderer: worker termination timed out; retaining renderer");
+            return false;
+        }
         gRenderThread.join();
     } else {
         gRenderRunning = false;
+    }
+
+    if (gCtx.device) {
+        if (auto idle = deviceWaitIdle(); !idle) {
+            dbgLogError("destroyAsyncRenderer: GPU remains active; retaining renderer: %s", errorMessage(idle.error()).c_str());
+            return false;
+        }
     }
 
     if (gEvtBeginFrame) {
@@ -7130,9 +10284,14 @@ void destroyAsyncRenderer() {
     }
     gAsyncRenderCtx = nullptr;
     dbgLogInfo("destroyAsyncRenderer: done");
+    return true;
 }
 
 mcdr::Result<void> asyncRenderBeginFrame(CommandContext* ctx) {
+    std::lock_guard<std::mutex> submissionLock(gAsyncSubmissionMutex);
+    if (!ctx || ctx->submissionFailed || ctx->recordingFailed.load(std::memory_order_acquire)) {
+        return mcdr::err("asyncRenderBeginFrame", "asyncRenderBeginFrame: invalid or failed context");
+    }
     if (!gRenderRunning) {
         // 渲染线程未运行 → 本帧必然走 SYNC 路径，Java 侧 present() 必须真正
         // 执行 Present，因此清除上一帧遗留的所有权标记。
@@ -7149,6 +10308,8 @@ mcdr::Result<void> asyncRenderBeginFrame(CommandContext* ctx) {
         return mcdr::err("asyncRenderBeginFrame", "asyncRenderBeginFrame: previous frame not complete");
     }
     gAsyncRenderCtx = ctx;
+    queueDisplayPresentReceipt(fgDisplayFrameTicket(ctx), MCDR_SUBMISSION_QUEUED);
+    gAsyncSubmissionResult.store(0, std::memory_order_release);
     // P33 fix：新一帧开始，撤销上一帧的 Present 所有权标记。本帧稍后由渲染线程
     // present 后重新置 true；若本帧走 SYNC fallback（不经过本函数），标记保持
     // false，Java 侧 present() 会正常执行真正的 Present。
@@ -7164,27 +10325,55 @@ mcdr::Result<void> asyncRenderBeginFrame(CommandContext* ctx) {
     return {};
 }
 
+int settleCommandSubmissionV1(CommandContext* ctx, uint64_t timeoutMs, uint64_t* submittedFence) {
+    if (!submittedFence) return MCDR_COMMAND_OUTCOME_INVALID;
+    *submittedFence = 0;
+    std::lock_guard submissionLock(gAsyncSubmissionMutex);
+    if (!ctx || gAsyncRenderCtx.load(std::memory_order_acquire) != ctx)
+        return MCDR_COMMAND_OUTCOME_INVALID;
+    if (!gRenderRunning || !gEvtSubmitDone) return MCDR_COMMAND_OUTCOME_SUBMISSION_UNKNOWN;
+    const DWORD waitMs = timeoutMs > 0xFFFFFFF0ULL ? 0xFFFFFFF0UL : static_cast<DWORD>(timeoutMs);
+    const DWORD waited = WaitForSingleObject(gEvtSubmitDone, waitMs);
+    if (waited == WAIT_TIMEOUT) return MCDR_COMMAND_OUTCOME_OWNERSHIP_PENDING;
+    if (waited != WAIT_OBJECT_0 || ctx->submissionFailed.load(std::memory_order_acquire))
+        return MCDR_COMMAND_OUTCOME_SUBMISSION_UNKNOWN;
+    const int result = gAsyncSubmissionResult.load(std::memory_order_acquire);
+    if (result == 2 && ctx->recordingFailed.load(std::memory_order_acquire)) {
+        gAsyncRenderCtx = nullptr;
+        return MCDR_COMMAND_OUTCOME_RECORDING_REJECTED;
+    }
+    if (result != 1) return MCDR_COMMAND_OUTCOME_SUBMISSION_UNKNOWN;
+    *submittedFence = ctx->fenceValue;
+    gAsyncRenderCtx = nullptr;
+    return MCDR_COMMAND_OUTCOME_SUBMITTED;
+}
+
 mcdr::Result<void> asyncRenderWaitComplete(CommandContext* ctx, UINT64 timeoutMs) {
-    (void)ctx;
+    std::lock_guard<std::mutex> submissionLock(gAsyncSubmissionMutex);
+    if (!ctx || gAsyncRenderCtx.load(std::memory_order_acquire) != ctx) {
+        return mcdr::err("asyncRenderWaitComplete", "asyncRenderWaitComplete: context does not own submission");
+    }
     if (!gRenderRunning) {
         return mcdr::err("asyncRenderWaitComplete", "asyncRenderWaitComplete: renderer not running");
     }
     // 等待 SUBMIT_DONE
-    DWORD r = WaitForSingleObject(gEvtSubmitDone, static_cast<DWORD>(timeoutMs));
+    DWORD waitMs = timeoutMs > 0xFFFFFFF0ULL ? 0xFFFFFFF0UL : static_cast<DWORD>(timeoutMs);
+    DWORD r = WaitForSingleObject(gEvtSubmitDone, waitMs);
     if (r == WAIT_OBJECT_0) {
+        if (gAsyncSubmissionResult.load(std::memory_order_acquire) != 1 || ctx->submissionFailed) {
+            return mcdr::err("asyncRenderWaitComplete", "asyncRenderWaitComplete: submission failed; ownership retained");
+        }
         gAsyncRenderCtx = nullptr;
         // 每帧成功路径：级别降到 debug（INFO 下曾占 16k 行/45s，见 P78 的日志分级原则）。
         dbgLogDebug("asyncRenderWaitComplete: OK timeout=%llu", static_cast<unsigned long long>(timeoutMs));
         return {};
     }
-    // The caller falls back to a synchronous path, so a timeout degrades rather than
-    // breaks: warning, not error (and the JVM side logs its fallback at WARN too).
     dbgLogWarn("asyncRenderWaitComplete: TIMEOUT timeout=%llu", static_cast<unsigned long long>(timeoutMs));
     return mcdr::err("asyncRenderWaitComplete", "asyncRenderWaitComplete: timeout");
 }
 
 bool asyncRenderIsRecordingReady(CommandContext* ctx) {
-    (void)ctx;
+    if (!ctx || gAsyncRenderCtx.load(std::memory_order_acquire) != ctx) return false;
     if (!gRenderRunning) return false;
     // 检查 RECORDING_READY 是否已设置
     // 用 0 timeout 查询（非阻塞）
@@ -7193,12 +10382,13 @@ bool asyncRenderIsRecordingReady(CommandContext* ctx) {
 }
 
 bool asyncRenderWaitRecordingReady(CommandContext* ctx, UINT64 timeoutMs) {
-    (void)ctx;
+    if (!ctx || gAsyncRenderCtx.load(std::memory_order_acquire) != ctx) return false;
     if (!gRenderRunning) return false;
     // 阻塞等待渲染线程发出 RECORDING_READY（每帧一开始就置位，正常为微秒级）。
     // 直接用 WaitForSingleObject 取代 Java 的 sleep(1) 轮询：休眠 1ms 会带来
     // 调度器/timer 粒度级别的固定开销，而本等待在主线程的帧关键路径上。
-    DWORD r = WaitForSingleObject(gEvtRecordingReady, static_cast<DWORD>(timeoutMs));
+    DWORD waitMs = timeoutMs > 0xFFFFFFF0ULL ? 0xFFFFFFF0UL : static_cast<DWORD>(timeoutMs);
+    DWORD r = WaitForSingleObject(gEvtRecordingReady, waitMs);
     return r == WAIT_OBJECT_0;
 }
 
@@ -7210,13 +10400,16 @@ UINT currentDrawFrameSlot(CommandContext* ctx) {
 }
 
 void asyncSendCommandsReady(CommandContext* ctx) {
-    (void)ctx;
+    if (!ctx || gAsyncRenderCtx.load(std::memory_order_acquire) != ctx) return;
     if (!gRenderRunning) return;
     SetEvent(gEvtCommandsReady);
 }
 
-void clearAsyncRenderCtx() { gAsyncRenderCtx = nullptr; }
+void clearAsyncRenderCtx() {
+    std::lock_guard<std::mutex> submissionLock(gAsyncSubmissionMutex);
+    if (gAsyncRenderCtx.load(std::memory_order_acquire)) {
+        dbgLogWarn("clearAsyncRenderCtx: refusing to discard pending ownership");
+    }
+}
 
 }  // namespace d3d12_mc
-
-

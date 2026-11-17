@@ -99,6 +99,11 @@ int32_t mcdr_dlss_available(void);
 // P213：帧生成（DLSS-G）的开关。0 = off，1 = on（固定倍率），2 = dynamic。
 // 只写状态；slDLSSGSetOptions 由渲染线程在 evaluate 里下发（那里才有 frame token/viewport）。
 void mcdr_dlss_set_fg_mode(int32_t mode, int32_t numFrames);
+// 返回 MCDR_FG_PREPARE_*；只有先前 Present 的输入仍被 GPU 使用时返回 NOT_READY。
+int32_t mcdr_dlss_prepare_fg(int32_t mode, int32_t numFrames, uint32_t displayWidth,
+    uint32_t displayHeight, uint32_t guideWidth, uint32_t guideHeight,
+    uint32_t* maxGeneratedFrames);
+int32_t mcdr_dlss_fg_after_present(void);
 
 // P213c：上一次 Present 真正提交的帧数（1 = 没插帧），F3 的 output 用。
 int32_t mcdr_dlss_fg_presented(void);
@@ -121,6 +126,7 @@ void mcdr_reflex_set_frame_limit(uint32_t micros);
 // P112：缓存每帧相机常量（Streamline 的 sl::Constants 所需；结构见 mcdr_abi.h 的
 // mcdr_dlss_constants）。JVM 每帧在 evaluate 之前调用。返回 1=已缓存，0=参数为空。
 int32_t mcdr_dlss_set_constants(const mcdr_dlss_constants* constants);
+void mcdr_dlss_clear_camera_constants(void);
 
 // ---------------------------------------------------------------------------
 // P108：**跟踪型状态过渡**。
@@ -137,6 +143,11 @@ int32_t mcdr_dlss_set_constants(const mcdr_dlss_constants* constants);
 // 指针，本单元只负责原样回传。
 using DlssTransitionFn = void (*)(void* ctx, void* resource, int32_t toState);
 using DlssQueryStateFn = int32_t (*)(void* ctx, void* resource);
+int32_t mcdr_dlss_submit_display_frame(void* commandList, const mcdr_dlss_input* input,
+    const mcdr_dlss_constants* camera, int32_t colorState, int32_t depthState,
+    int32_t motionState, void* ui, int32_t uiState, uint64_t realFrameId, uint32_t guidesDilated,
+    float frameTimeDeltaMs,
+    DlssTransitionFn transitionFn, void* transitionContext);
 // ---------------------------------------------------------------------------
 // B4：私有纹理由**模块**创建（实现单元不再自建任何 D3D12 纹理）。
 //
@@ -171,11 +182,20 @@ using DlssCreateTextureFn = int32_t (*)(void* ctx, const DlssTextureDesc* desc, 
 using DlssDestroyTextureFn = void (*)(void* ctx, void* object);
 // 注入创建/销毁入口。模块在 wireDlssImpl() 里调一次；返回 1 = 两个入口都装上了。
 int32_t mcdr_dlss_install_texture_ops(void* createFn, void* destroyFn);
+int32_t mcdr_dlss_install_recording_pin(void* pinFn);
+int32_t mcdr_dlss_install_streamline_shutdown(void* shutdownFn);
+int32_t mcdr_dlss_invalidate_inputs(void);
+int32_t mcdr_dlss_inputs_ready_for_present(void);
 
 // 在**已打开**的命令列表上创建/重建 DLSS 特征（尺寸变化时自动重建）。
 // `tl`/`tlCtx` 非空时所有资源过渡都通过它请求（见上），为空则不做过过渡。
 int32_t mcdr_dlss_create(void* commandList, const mcdr_dlss_input* in, DlssTransitionFn tl,
                          void* tlCtx);
+int32_t mcdr_dlss_prepare_sr(void* commandList, const mcdr_dlss_input* seed,
+    const mcdr_raster_camera* camera, int32_t tier, int32_t preset,
+    const int32_t resourceStates[5], void** retainedCandidateToken);
+void mcdr_dlss_commit_sr(void* candidateToken, void** retiredToken);
+int32_t mcdr_dlss_abort_sr(void* candidateToken);
 // 每帧一次的真实 NGX 评价。commandList 是 ID3D12GraphicsCommandList*。
 // 返回 1=真的跑了 0=跳过（没特征/参数为空）-1=失败或已关闭。
 int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTransitionFn tl,
@@ -201,6 +221,7 @@ int32_t mcdr_dlss_set_enabled(int32_t enabled);
 
 // 释放特征与自建资源并 Shutdown NGX。必须在**设备还活着**时调用（destroyDevice 里）。
 void mcdr_dlss_shutdown(void);
+int32_t mcdr_dlss_shutdown_checked(void);
 
 // P249：把原生 DXGI 工厂原地升级成 Streamline 的代理工厂，返回 1=已换成代理。
 //

@@ -58,11 +58,6 @@ constexpr UINT kBundleSlotCount = kBundleFrameSlots * kBundleBatchesPerFrame;
 // MC PrimitiveTopology ordinal -> 命令列表级拓扑（bundle 内使用）。
 D3D12_PRIMITIVE_TOPOLOGY bundlePrimitiveTopology(int ordinal);
 
-// 前向声明：录制时记录所属管线，用于与同步路径同样规则校正顶点步长
-// （Dx12Pipeline::vertexStrides 由 inputElements 实际格式推算，覆盖 Java 侧
-// getVertexSize() 的错误值）。
-struct Dx12Pipeline;
-
 class BundleRecorder {
 public:
     BundleRecorder() = default;
@@ -98,11 +93,13 @@ public:
     void setPipelineState(ID3D12PipelineState* pso);
     // 记录所属管线的 per-slot 修正 stride（与同步路径 setVertexBuffer 一致）。
     // 说明：这里只保存 (slot → stride) 映射，而不保存 Dx12Pipeline*。异步 bundle 模块
-    // 不能 import 设备模块（设备模块的实现单元反向 import 本模块，会成环），所以
-    // Dx12Pipeline 在本模块里只有前向声明；保存指针会让 correctedStride 需要完整类型。
+    // 不能 import 设备模块（设备模块的实现单元反向 import 本模块，会成环）。
     void setCorrectedStride(int slot, UINT stride);
     // 该 slot 的修正 stride；无记录时返回 0（调用方回退传入值）。
-    UINT correctedStride(int slot) const;
+    UINT correctedStride(int slot) const {
+        const auto stride = m_correctedStrides.find(slot);
+        return stride == m_correctedStrides.end() ? 0u : stride->second;
+    }
     void setDescriptorTable(UINT slot, D3D12_GPU_DESCRIPTOR_HANDLE handle);
     // B：CBV 的 root descriptor（地址烘焙进命令列表，不经过描述符堆）。
     void setRootConstantBufferView(UINT rootIndex, D3D12_GPU_VIRTUAL_ADDRESS address);

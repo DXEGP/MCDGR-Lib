@@ -102,8 +102,10 @@ bool PartitionedDescriptorAllocator::writeCBV(UINT slot, ID3D12Resource* buffer,
     // 所以能违反它的只有调用方给的 offset —— 宁可写不出描述符（调用方拿 0 去报错），
     // 也不要交出一张会让 shader 读错位的视图。
     if (cbv.BufferLocation % 256ULL != 0) return false;
+    if (size > UINT64_MAX - 255ULL) return false;
     UINT64 aligned = (size + 255) & ~255ULL;
     if (aligned == 0) aligned = 256;
+    if (aligned > UINT_MAX) return false;
     cbv.SizeInBytes = static_cast<UINT>(std::min<UINT64>(aligned, 0xFFFFFFFFULL));
     m_device->CreateConstantBufferView(&cbv, cpuHandle(slot));
     return true;

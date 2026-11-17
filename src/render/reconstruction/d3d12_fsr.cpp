@@ -22,8 +22,6 @@
 //     **不置** `DEPTH_INFINITE`。
 //   * MV：渲染分辨率的**像素**位移（D3D12Velocity 已乘过 ScreenSize）→ `motionVectorScale = 1`，
 //     不置 `FFX_UPSCALE_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS`。
-//   * MV 由 jittered 投影算出 → 置 `MOTION_VECTORS_JITTER_CANCELLATION`，让 FSR 把 jitter 差
-//     当相机抖动扣掉而不是当物体运动（与 DLSS 路径的 motionVectorJitterCancellation 对称）。
 //     这一条要真机验，记在 known_bugs.md 的 P277 里。
 //
 // 失败策略（照抄 DLSS 的）：每条失败路径最多打一行日志并钉住状态，不每帧重试；
@@ -78,6 +76,7 @@ struct FsrHeapBroker {
     ComPtr<ID3D12Heap> shared;      // 复用的 DEFAULT 堆（一次给足，不再增长）
     uint64_t cursor = 0;            // bump 分配游标
     uint64_t capacity = 0;
+    uint64_t sharedAllocations = 0;
     std::vector<ID3D12Heap*> loose; // 放不进 shared 的临时堆，由 deallocator 回收
     uint32_t sharedHits = 0;
     uint32_t fallbacks = 0;
@@ -134,6 +133,7 @@ ffxReturnCode_t fsrHeapAlloc(uint32_t /*effectId*/, const D3D12_HEAP_DESC* desc,
     *out = b.shared.Get();   // FFX 只借用，不加引用；销毁时走 deallocator，我们认得这个指针
     *offset = b.cursor;
     b.cursor += need;
+    ++b.sharedAllocations;
     ++b.sharedHits;
     if (!b.logged) {
         b.logged = true;
@@ -150,7 +150,12 @@ ffxReturnCode_t fsrHeapFree(uint32_t /*effectId*/, ID3D12Heap* heap, uint64_t /*
     if (heap == nullptr) { return FFX_API_RETURN_OK; }
     auto& b = broker();
     std::lock_guard<std::mutex> guard(b.lock);
-    if (heap == b.shared.Get()) { return FFX_API_RETURN_OK; }   // 共享堆由 broker 持有，不在这里放
+    if (heap == b.shared.Get()) {
+        if (b.sharedAllocations == 0) { return FFX_API_RETURN_ERROR; }
+        --b.sharedAllocations;
+        if (b.sharedAllocations == 0) { b.cursor = 0; }
+        return FFX_API_RETURN_OK;
+    }
     for (auto it = b.loose.begin(); it != b.loose.end(); ++it) {
         if (*it == heap) {
             (*it)->Release();
@@ -288,11 +293,9 @@ Dx12Object* asObject(void* handle) {
 // 上下文创建标志。**每帧不变**，所以只在建/重建上下文时算一次。
 uint32_t contextFlagsFor(const mcdr_sr_dispatch& seed) {
     uint32_t flags = FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
-    flags |= FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
     if (seed.hdrInput != 0) { flags |= FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE; }
     // 不置 DISPLAY_RESOLUTION_MOTION_VECTORS：MV 是渲染分辨率的像素位移。
     // 不置 DEPTH_INFINITE：26.3 的远平面有限。
-    // 不置 AUTO_EXPOSURE：曝光由 JVM 侧给 preExposure（P289 才接纹理）。
     return flags;
 }
 
@@ -308,9 +311,9 @@ void fillCapsFields(mcdr_sr_caps& out, bool available, const std::string& note) 
     out.backend = static_cast<int32_t>(SrBackendId::Fsr);
     out.available = available ? 1 : 0;
     out.coupledDenoise = 0;  // FSR 不带降噪器（SHARC/NRD 由我们自己的分支处理）
-    out.needsExposure = 0;   // preExposure 标量就够
+    out.needsExposure = 0;
     // 收 reactive mask（有人给就用）；responsive mask 是 XeSS 的概念，这里不声明。
-    out.takesMasks = MCDR_SR_MASK_REACTIVE;
+    out.takesMasks = MCDR_SR_MASK_REACTIVE | MCDR_SR_MASK_TRANSPARENCY_AND_COMPOSITION;
     out.externalHeap = 0;    // v1 用 FFX 自己的分配器；外部堆要等 P279 的 allocator 回调
     out.jitterPhaseCount = 8;
     out.minRenderWidth = 320;
@@ -330,6 +333,8 @@ void fillCapsFields(mcdr_sr_caps& out, bool available, const std::string& note) 
 class FsrSrProvider final : public IUpscaleProvider {
 public:
     SrBackendId backend() const override { return SrBackendId::Fsr; }
+
+    std::string failureText() const override { return problem_; }
 
     void fillCaps(mcdr_sr_caps& out) const override {
         std::string why;
@@ -374,10 +379,16 @@ public:
         Dx12Object* depth = asObject(dispatch.pDepth);
         Dx12Object* motion = asObject(dispatch.pMotionVectors);
         Dx12Object* output = asObject(dispatch.pColorOutput);
+        Dx12Object* exposure = asObject(dispatch.pExposure);
         if (color == nullptr) { problem_ = "missing color input"; return false; }
         if (depth == nullptr) { problem_ = "missing depth"; return false; }
         if (motion == nullptr) { problem_ = "missing motion vectors"; return false; }
         if (output == nullptr) { problem_ = "missing color output"; return false; }
+        if (exposure != nullptr && (!exposure->resource || exposure->dxgiFormat != DXGI_FORMAT_R32_FLOAT ||
+            exposure->resource->GetDesc().Width != 1 || exposure->resource->GetDesc().Height != 1)) {
+            problem_ = "incompatible exposure texture";
+            return false;
+        }
         if (color->resource == nullptr || depth->resource == nullptr ||
             motion->resource == nullptr || output->resource == nullptr) {
             problem_ = "resource handle without d3d12 resource";
@@ -395,7 +406,11 @@ public:
             problem_ = "render size below the 320x180 minimum";
             return false;
         }
-        if (flags_ == 0) { flags_ = contextFlagsFor(dispatch); }
+        const uint32_t requestedFlags = contextFlagsFor(dispatch);
+        if (flags_ != requestedFlags) {
+            flags_ = requestedFlags;
+            needsRecreate_ = true;
+        }
         adoptSizes(dispatch.renderWidth, dispatch.renderHeight, dispatch.displayWidth,
                    dispatch.displayHeight);
         if (!ensureContext(ctx)) { return false; }
@@ -405,6 +420,7 @@ public:
         transitionTextureTo(ctx, color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         transitionTextureTo(ctx, depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         transitionTextureTo(ctx, motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (exposure) transitionTextureTo(ctx, exposure, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         // P276：reactive mask 是可选的第五个输入。句柄在但资源为空（JVM 侧还没建好）时
         // 当作没有 —— 把半个对象交给 FFX 会让它自己发屏障发到空指针上。
         Dx12Object* reactive = asObject(dispatch.pReactiveMask);
@@ -412,6 +428,12 @@ public:
             transitionTextureTo(ctx, reactive, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         } else {
             reactive = nullptr;
+        }
+        Dx12Object* transparencyAndComposition = asObject(dispatch.pTransparencyAndComposition);
+        if (transparencyAndComposition != nullptr && transparencyAndComposition->resource != nullptr) {
+            transitionTextureTo(ctx, transparencyAndComposition, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        } else {
+            transparencyAndComposition = nullptr;
         }
         transitionTextureTo(ctx, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
@@ -431,13 +453,17 @@ public:
         desc.color = ffxApiGetResourceDX12(color->resource.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
         desc.depth = ffxApiGetResourceDX12(depth->resource.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
         desc.motionVectors = ffxApiGetResourceDX12(motion->resource.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
-        desc.exposure = ffxApiGetResourceDX12(nullptr);                  // v1 不接曝光纹理（P289）
+        desc.exposure = exposure
+            ? ffxApiGetResourceDX12(exposure->resource.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ)
+            : ffxApiGetResourceDX12(nullptr);
         // FFX 把 state 当作进入 dispatch 时该资源所处的状态，也就是它自己那道 barrier 的 Before，
         // 所以必须与上面 transitionTextureTo 的结果一致（NON_PIXEL_SHADER_RESOURCE => COMPUTE_READ）。
         desc.reactive = reactive != nullptr
             ? ffxApiGetResourceDX12(reactive->resource.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ)
             : ffxApiGetResourceDX12(nullptr);
-        desc.transparencyAndComposition = ffxApiGetResourceDX12(nullptr); // 同上
+        desc.transparencyAndComposition = transparencyAndComposition != nullptr
+            ? ffxApiGetResourceDX12(transparencyAndComposition->resource.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ)
+            : ffxApiGetResourceDX12(nullptr);
         desc.output = ffxApiGetResourceDX12(output->resource.Get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
         desc.jitterOffset.x = dispatch.jitterOffsetX;
         desc.jitterOffset.y = dispatch.jitterOffsetY;
@@ -510,7 +536,7 @@ private:
             problem_ = "size beyond 8k";
             return false;
         }
-        if (context_ != nullptr && renderW_ <= maxRenderW_ && renderH_ <= maxRenderH_ &&
+        if (context_ != nullptr && !needsRecreate_ && renderW_ <= maxRenderW_ && renderH_ <= maxRenderH_ &&
             displayW_ <= maxDisplayW_ && displayH_ <= maxDisplayH_) {
             return true;
         }
@@ -518,7 +544,10 @@ private:
             // 旧上下文的内部资源可能还在飞：先等 GPU 追平最后一次提交再销毁。
             // 只在首次建 / 尺寸变大时发生，代价是一帧停顿，可以接受。
             if (ctx != nullptr && ctx->fenceValue > 0) {
-                (void)waitForFenceValue(ctx, ctx->fenceValue, 2000000000ull);
+                if (!waitForFenceValue(ctx, ctx->fenceValue, 2000000000ull)) {
+                    problem_ = "context resize fence timed out";
+                    return false;
+                }
             }
             destroyContext();
         }
@@ -562,7 +591,7 @@ private:
         const ffxReturnCode_t rc =
             runtime().api.createContext(&context_, &upscaleDesc.header, &callbacks);
         if (rc != FFX_API_RETURN_OK || context_ == nullptr) {
-            context_ = nullptr;
+            destroyContext();
             problem_ = "ffxCreateContext failed rc=";
             problem_ += std::to_string(static_cast<int>(rc));
             if (!logged_) {
@@ -572,6 +601,7 @@ private:
             }
             return false;
         }
+        needsRecreate_ = false;
         problem_.clear();
         return true;
     }
@@ -583,13 +613,6 @@ private:
         callbacks.alloc = &ffxAllocCb;
         callbacks.dealloc = &ffxDeallocCb;
         (void)runtime().api.destroyContext(&context_, &callbacks);
-        // 上下文没了，FFX 已经把它借出去的堆段全部还回来（走 fsrHeapFree），游标可以归零，
-        // 但 shared 那块堆本身留着 —— 这才是 P279 想在切后端/改窗口时省掉的那一次分配。
-        {
-            auto& b = broker();
-            std::lock_guard<std::mutex> guard(b.lock);
-            b.cursor = 0;
-        }
         context_ = nullptr;
         maxRenderW_ = 0;
         maxRenderH_ = 0;
@@ -600,6 +623,7 @@ private:
     ID3D12Device* device_ = nullptr;
     ffxContext context_ = nullptr;
     uint32_t flags_ = 0;
+    bool needsRecreate_ = false;
     int32_t renderW_ = 0;
     int32_t renderH_ = 0;
     int32_t displayW_ = 0;

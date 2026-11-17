@@ -70,10 +70,7 @@ int32_t MCDR_CALL mcdr_dx12CreateDevice(char* buf, int32_t cap) {
     result += d3d12_mc::featureLevelName(ctx.featureLevel);
     result += "; ";
     result += d3d12_mc::capabilitiesText(ctx.caps);
-    result += "); ";
-    // P1 probe + P2 resource-layer self-test; the detail string is what the Java
-    // side logs when the four-round createDevice() self-test reports.
-    result += d3d12_mc::runResourceSelfTest();
+    result += ")";
     return writeString(result, buf, cap);
 }
 
@@ -130,6 +127,15 @@ mcdr_object* MCDR_CALL mcdr_dx12CreateComputePipeline(const void* dxil, int32_t 
     const auto r = d3d12_mc::createComputePipeline(dxil, dxilSize);
     if (!r) {
         return mcdr::abi::failWithPtr<d3d12_mc::Dx12Object>("mcdr_dx12CreateComputePipeline",
+                                                            r.error().message);
+    }
+    return static_cast<d3d12_mc::Dx12Object*>(*r);
+}
+
+mcdr_object* MCDR_CALL mcdr_dx12CreateTerrainTileBinningPipeline(const void* dxil, int32_t dxilSize) {
+    const auto r = d3d12_mc::createTerrainTileBinningPipeline(dxil, dxilSize);
+    if (!r) {
+        return mcdr::abi::failWithPtr<d3d12_mc::Dx12Object>("mcdr_dx12CreateTerrainTileBinningPipeline",
                                                             r.error().message);
     }
     return static_cast<d3d12_mc::Dx12Object*>(*r);
@@ -211,6 +217,11 @@ uint64_t MCDR_CALL mcdr_dx12GetDeviceHandle(void) {
 }
 
 void MCDR_CALL mcdr_dx12DestroyDevice(void) { d3d12_mc::destroyDevice(); }
+int32_t MCDR_CALL mcdr_dx12DestroyDeviceChecked(void) {
+    auto result = d3d12_mc::destroyDeviceChecked();
+    if (!result) return mcdr::abi::failWith("mcdr_dx12DestroyDeviceChecked", result.error().message);
+    return 1;
+}
 
 uint64_t MCDR_CALL mcdr_dx12CreateHiddenWindow(int32_t width, int32_t height) {
     return static_cast<uint64_t>(d3d12_mc::createHiddenWindow(width, height));

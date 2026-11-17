@@ -59,16 +59,28 @@ int32_t MCDR_CALL mcdr_dx12SrCreate(mcdr_command_ctx* ctx, int32_t backend, int3
 // 记录型；返回 0 只表示"没有生效的后端"，不是错误。
 int32_t MCDR_CALL mcdr_dx12SrResize(mcdr_command_ctx* ctx, int32_t renderWidth, int32_t renderHeight,
                                     int32_t displayWidth, int32_t displayHeight) {
-    static_cast<void>(ctx);
-    return srResizeProvider(renderWidth, renderHeight, displayWidth, displayHeight);
+    return srResizeProvider(ctx, renderWidth, renderHeight, displayWidth, displayHeight);
 }
 
-// P271：逐帧提交。`desc->backend` 为 0 时用 SrPick 记下的那个。
-int32_t MCDR_CALL mcdr_dx12SrEvaluate(mcdr_command_ctx* ctx, const mcdr_sr_dispatch* desc) {
-    if (ctx == nullptr || desc == nullptr) {
-        return -1;
+int32_t MCDR_CALL mcdr_dx12SrPrepare(mcdr_command_ctx* ctx,
+                                     const mcdr_sr_dispatch* description,
+                                     int32_t dlssQuality, int32_t dlssPreset, uint64_t* token) {
+    if (token != nullptr) *token = 0;
+    if (description == nullptr || token == nullptr) {
+        mcdr::abi::setLastError("mcdr_dx12SrPrepare", "Null description or token output");
+        return MCDR_SR_PREPARE_INVALID_ARGUMENT;
     }
-    return srEvaluateFrame(ctx, *desc);
+    const int32_t result = srPrepareProvider(ctx, *description, dlssQuality, dlssPreset, token);
+    if (result < 0) mcdr::abi::setLastError("mcdr_dx12SrPrepare", srLastFailureText());
+    return result;
+}
+
+int32_t MCDR_CALL mcdr_dx12SrCommit(uint64_t token) {
+    return srCommitPreparedProvider(token);
+}
+
+int32_t MCDR_CALL mcdr_dx12SrAbort(uint64_t token) {
+    return srAbortPreparedProvider(token);
 }
 
 // P271：jitter 相位。返回 0 = 该后端没有自己的相位表，调用方沿用 D3D12Temporal 的
@@ -94,8 +106,7 @@ int32_t MCDR_CALL mcdr_dx12SrJitterPhaseCount(int32_t backend, int32_t renderWid
 // P271：释放。只允许在没有打开命令列表时调用；重复调用安全。期望后端也一起清掉，
 // 否则"销毁后再 Pick 都没做过就 Evaluate"会用一个已经不存在的后端。
 void MCDR_CALL mcdr_dx12SrDestroy(void) {
-    srReleaseProvider();
-    (void)srPickBackend(MCDR_SR_BACKEND_NONE);
+    (void)srReleaseProvider();
 }
 
 // P271：一行可用性文本。与 mcdr_dx12QueryDlss 同样走 writeString（NUL 结尾 + 返回长度）。

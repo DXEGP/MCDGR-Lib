@@ -218,6 +218,14 @@
          plain C header on purpose: language-linkage (extern "C") entities cannot be
          exported from a C++ module, and the Kotlin side must keep including it. -->
     <ClInclude Include="include\mcdr_abi.h" />
+    <ClInclude Include="include\mcdr_oit_shader.h" />
+    <ClInclude Include="include\mcdr_oit_resolve_shader.h" />
+    <ClInclude Include="include\mcdr_graphics_capture.h" />
+    <ClInclude Include="include\mcdr_graphics_recording.h" />
+    <ClInclude Include="include\mcdr_terrain_tile.h" />
+    <ClInclude Include="include\mcdr_oit_budget.h" />
+    <ClInclude Include="include\mcdr_oit_execution.h" />
+    <ClInclude Include="include\mcdr_oit_normalization.h" />
     <ClInclude Include="include\mcdr_dlss_impl.h" />
     <ClInclude Include="include\mcdr_hdr_state.h" />
     <ClInclude Include="include\mcdr_rtx_support.h" />
@@ -226,6 +234,7 @@
     <ClInclude Include="include\mcdr_surface_opts_state.h" />
     <ClInclude Include="include\mcdr_window_host.h" />
     <ClInclude Include="include\_d3d12_module_prelude.h" />
+    <ClInclude Include="src\render\vanilla\vanilla_pass_scheduler.h" />
     <!-- Shared prelude for the module interface units below. Every .cppm #includes
          this in its global module fragment (NOMINMAX + windows/d3d12/dxgi/dcomp +
          STL + the DBG_LOG_DEBUG macro). -->
@@ -270,15 +279,45 @@
     <!-- DLL 入口点：普通 TU（不属于任何命名模块），见文件内注释 -->
     <ClCompile Include="src\platform\dllmain.cpp" />
     <ClCompile Include="src\backend\memory\d3d12_descriptor_allocator.cpp" />
-    <ClCompile Include="src\diagnostics\d3d12_diagnostics.cpp"></ClCompile>
-    <ClCompile Include="src\diagnostics\d3d12_pix.cpp"></ClCompile>
-    <ClCompile Include="src\backend\shader\d3d12_shader.cpp"></ClCompile>
-    <ClCompile Include="src\render\antialiasing\d3d12_postprocess.cpp"></ClCompile>
+    <ClCompile Include="src\diagnostics\d3d12_diagnostics.cpp">
+    </ClCompile>
+    <ClCompile Include="src\diagnostics\d3d12_pix.cpp">
+    </ClCompile>
+    <ClCompile Include="src\backend\shader\d3d12_shader.cpp">
+    </ClCompile>
+    <ClCompile Include="src\module\backend\workgraph\d3d12_workgraph.cppm">
+      <CompileAs>CompileAsCppModule</CompileAs>
+    </ClCompile>
+    <ClCompile Include="src\backend\workgraph\d3d12_workgraph.cpp" />
+    <ClCompile Include="src\module\render\vanilla\d3d12_vanilla_frame.cppm">
+      <CompileAs>CompileAsCppModule</CompileAs>
+    </ClCompile>
+    <ClCompile Include="src\render\vanilla\d3d12_vanilla_frame.cpp" />
+    <ClCompile Include="src\render\vanilla\d3d12_vanilla_programs.cpp" />
+    <ClCompile Include="src\module\render\oit\d3d12_oit.cppm">
+      <CompileAs>CompileAsCppModule</CompileAs>
+    </ClCompile>
+    <ClCompile Include="src\render\reconstruction\d3d12_oit_records.cpp" />
+    <ClCompile Include="src\render\reconstruction\d3d12_oit_normalization.cpp" />
+    <ClCompile Include="src\c_abi\abi_oit.cpp" />
+    <ClCompile Include="src\module\render\frameprep\d3d12_frameprep.cppm">
+      <CompileAs>CompileAsCppModule</CompileAs>
+    </ClCompile>
+    <ClCompile Include="src\render\frameprep\d3d12_frameprep.cpp" />
+    <ClCompile Include="src\module\render\presentation\d3d12_display_frame.cppm">
+      <CompileAs>CompileAsCppModule</CompileAs>
+    </ClCompile>
+    <ClCompile Include="src\render\presentation\d3d12_display_frame.cpp" />
+    <ClCompile Include="src\c_abi\abi_display.cpp" />
+    <ClCompile Include="src\c_abi\abi_frameprep.cpp" />
+    <ClCompile Include="src\render\antialiasing\d3d12_postprocess.cpp">
+    </ClCompile>
     <ClCompile Include="src\backend\device\d3d12_device.cpp" />
     <ClCompile Include="src\render\presentation\d3d12_surface.cpp" />
     <!-- P272：超分 Provider 接口层（能力表 + DLSS provider + 注册表）。与 d3d12_device.cpp
          同属模块 mcdr.d3d12.device 的实现单元，所以不需要额外设置。 -->
     <ClCompile Include="src\render\reconstruction\d3d12_sr.cpp" />
+    <ClCompile Include="src\render\reconstruction\d3d12_prepared_reconstruction.cpp" />
     <ClCompile Include="src\render\presentation\d3d12_framegen.cpp" />
     <ClCompile Include="src\render\reconstruction\d3d12_fsr.cpp" />
     <ClCompile Include="src\render\reconstruction\d3d12_xess.cpp" />
@@ -299,6 +338,7 @@
          nvsdk_ngx*.h，设备模块永远不碰 NGX 类型，许可面因此收在一个文件里。 -->
     <ClCompile Include="src\render\reconstruction\d3d12_dlss.cpp" />
     <ClCompile Include="src\render\terrain\d3d12_mesh_base.cpp" />
+    <ClCompile Include="src\render\terrain\d3d12_terrain_workgraph.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include=".clang-format" />
@@ -308,10 +348,18 @@
     <None Include=".gitmodules" />
     <None Include="AGENTS.MD" />
     <None Include="cpp.hint" />
+    <None Include="docs\oit-4k-layout-proposal.md" />
+    <None Include="docs\oit-record-budget-native-status.md" />
+    <None Include="docs\oit-records.md" />
+    <None Include="docs\organization.md" />
+    <None Include="docs\overview.md" />
+    <None Include="docs\README_ZH.MD" />
+    <None Include="docs\rendering.md" />
+    <None Include="docs\shader-bindings.md" />
+    <None Include="docs\terrain-mesh.md" />
     <None Include="LICENSE" />
     <None Include="MCDR.slnx" />
     <None Include="README.md" />
-    <None Include="README_ZH.MD" />
     <None Include="vcpkg-configuration.json" />
     <None Include="vcpkg.json" />
   </ItemGroup>

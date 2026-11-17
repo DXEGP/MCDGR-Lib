@@ -3,6 +3,7 @@ module;
 #include "_d3d12_module_prelude.h"
 #include "mcdr_smaa_luts.h"
 #include <cwchar>
+#include <initializer_list>
 
 module mcdr.d3d12.device;
 
@@ -525,31 +526,48 @@ mcdr::Result<void> initSharpenPipeline() {
 
 const SharpenPipeline* getSharpenPipeline() { return deviceContext().sharpenPipeline.get(); }
 
+namespace {
+
+struct PostprocessTextureInput {
+    ID3D12Resource* resource;
+    DXGI_FORMAT format;
+    UINT rootParameter;
+};
+
+mcdr::Result<void> bindPostprocessTextures(CommandContext* context, ID3D12GraphicsCommandList* commandList,
+    std::initializer_list<PostprocessTextureInput> inputs) {
+    for (const auto& input : inputs) {
+        if (!input.resource) return mcdr::err("bindPostprocessTextures", "Postprocess texture is unavailable");
+    }
+    auto allocated = allocateDrawDescriptors(context, static_cast<UINT>(inputs.size()));
+    if (!allocated) return std::unexpected(allocated.error());
+    restoreDrawHeap(context);
+    auto cpu = allocated->cpu;
+    auto gpu = allocated->gpu;
+    for (const auto& input : inputs) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC description{};
+        description.Format = input.format;
+        description.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        description.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        description.Texture2D.MipLevels = 1;
+        deviceContext().device->CreateShaderResourceView(input.resource, &description, cpu);
+        commandList->SetGraphicsRootDescriptorTable(input.rootParameter, gpu);
+        cpu.ptr += deviceContext().drawInc;
+        gpu.ptr += deviceContext().drawInc;
+    }
+    return {};
+}
+
+}
+
 mcdr::Result<void> blitBindSourceTexture(CommandContext* ctx, Dx12Object* srcTex,
                                          ID3D12GraphicsCommandList* cmd) {
     if (!srcTex || !srcTex->resource) {
         return mcdr::err("blitBindSourceTexture", "blitBindSourceTexture: null or invalid srcTex");
     }
-    // 源纹理过渡到 PIXEL_SHADER_RESOURCE（采样必需）。
     transitionTextureTo(ctx, srcTex,
                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                             | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-
-    // P24 fix（黑屏根因之一）：SRV 必须写入命令列表当前设置的堆。
-    // 此前在 srvHeap 分配 SRV 并直接 SetGraphicsRootDescriptorTable，但
-    // beginCommandList 只 SetDescriptorHeaps({drawHeap}) → 每帧验证错误
-    // "descriptor heap containing handle is different from currently set
-    // descriptor heap"（dx12-native.log 658 行），根表绑定无效。
-    // 改为复用 pushDescriptors 的机制：把 SRV 写到本帧 drawHeap 瞬态槽位，
-    // root table 绑定该槽位的 GPU 句柄（与命令列表当前堆一致）。
-    if (ctx->nextDrawSlot + 1 > syncDrawDescriptorCapacity()) {
-        return mcdr::err("blitBindSourceTexture",
-                         "blitBindSourceTexture: draw descriptor heap exhausted for this frame");
-    }
-    SIZE_T base = static_cast<SIZE_T>(ctx->drawHeapSlotBase + ctx->nextDrawSlot) * deviceContext().drawInc;
-    D3D12_CPU_DESCRIPTOR_HANDLE srvCpu = deviceContext().drawHeap->GetCPUDescriptorHandleForHeapStart();
-    srvCpu.ptr += base;
-    ctx->nextDrawSlot += 1;
 
     DXGI_FORMAT viewFmt = srcTex->resource->GetDesc().Format;
     switch (viewFmt) {
@@ -557,22 +575,7 @@ mcdr::Result<void> blitBindSourceTexture(CommandContext* ctx, Dx12Object* srcTex
         case DXGI_FORMAT_D16_UNORM: viewFmt = DXGI_FORMAT_R16_UNORM; break;
         default: break;
     }
-    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-    srvDesc.Format = viewFmt;
-    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srvDesc.Texture2D.MipLevels = 1;
-    srvDesc.Texture2D.MostDetailedMip = 0;
-    deviceContext().device->CreateShaderResourceView(srcTex->resource.Get(), &srvDesc, srvCpu);
-
-    // 绑定根描述符表（表 0 = blit 的 SRV；drawHeap 已是命令列表当前设置的堆）。
-    D3D12_GPU_DESCRIPTOR_HANDLE srvGpu = deviceContext().drawHeap->GetGPUDescriptorHandleForHeapStart();
-    srvGpu.ptr += base;
-    cmd->SetGraphicsRootDescriptorTable(0, srvGpu);
-    // 逐帧诊断（每帧 1 次 stderr+文件 flush）→ DEBUG，需 DX12_LOG_VERBOSE=1 才输出。
-    dbgLogDebug("blitBindSourceTexture: drawHeapSlotBase=%u nextDrawSlot=%u srvGpu=%llx",
-                ctx->drawHeapSlotBase, ctx->nextDrawSlot, static_cast<unsigned long long>(srvGpu.ptr));
-    return {};
+    return bindPostprocessTextures(ctx, cmd, {{srcTex->resource.Get(), viewFmt, 0}});
 }
 
 // ---------------------------------------------------------------------------
@@ -1130,8 +1133,6 @@ mcdr::Result<void> smaaCreateLutTexture(const unsigned char* data, UINT width, U
     return {};
 }
 
-// 懒初始化两张 LUT + 它们的持久 SRV。成功后 deviceContext().smaaLutsReady=true，
-// 权力趟用官方算法的 kSmaaWeightLutPS；失败则保持 false（调用方回退解析式权重并 WARN）。
 mcdr::Result<void> smaaEnsureLuts() {
     if (deviceContext().smaaLutsReady) return {};
     if (!deviceContext().device || !deviceContext().queue) {
@@ -1151,32 +1152,6 @@ mcdr::Result<void> smaaEnsureLuts() {
         !r) {
         return mcdr::err("smaaEnsureLuts", "SearchTex: " + errorMessage(r.error()));
     }
-    if (!deviceContext().smaaLutSrvHeap) {
-        D3D12_DESCRIPTOR_HEAP_DESC hd{};
-        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        hd.NumDescriptors = 2;  // 0 = AreaTex，1 = SearchTex
-        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        HRESULT hr = deviceContext().device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&deviceContext().smaaLutSrvHeap));
-        if (FAILED(hr)) {
-            return mcdr::err("smaaEnsureLuts", "CreateDescriptorHeap(SRV 2) hr=0x" + formatBackendResult(hr));
-        }
-        deviceContext().smaaLutSrvGpu = deviceContext().smaaLutSrvHeap->GetGPUDescriptorHandleForHeapStart();
-        deviceContext().smaaLutSrvGpuInc = deviceContext().device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    }
-    const D3D12_CPU_DESCRIPTOR_HANDLE cpuBase = deviceContext().smaaLutSrvHeap->GetCPUDescriptorHandleForHeapStart();
-    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srvDesc.Texture2D.MipLevels = 1;
-    srvDesc.Texture2D.MostDetailedMip = 0;
-    srvDesc.Format = DXGI_FORMAT_R8G8_UNORM;
-    D3D12_CPU_DESCRIPTOR_HANDLE cpuArea = cpuBase;
-    deviceContext().device->CreateShaderResourceView(areaTex.Get(), &srvDesc, cpuArea);
-    srvDesc.Format = DXGI_FORMAT_R8_UNORM;
-    D3D12_CPU_DESCRIPTOR_HANDLE cpuSearch = cpuBase;
-    cpuSearch.ptr += deviceContext().smaaLutSrvGpuInc;
-    deviceContext().device->CreateShaderResourceView(searchTex.Get(), &srvDesc, cpuSearch);
-
     deviceContext().smaaAreaTex = areaTex;
     deviceContext().smaaSearchTex = searchTex;
     deviceContext().smaaLutsReady = true;
@@ -1471,50 +1446,6 @@ mcdr::Result<void> smaaEnsurePipelines(DXGI_FORMAT rtFormat) {
     return {};
 }
 
-// 把一张纹理的 SRV 写进本帧 drawHeap 的瞬态槽位并绑到根参数 rootParam 上
-// （与 blitBindSourceTexture 同一机制：SRV 必须落在命令列表当前设置的堆里）。
-mcdr::Result<void> smaaBindSrv(CommandContext* ctx, ID3D12GraphicsCommandList* cmd, ID3D12Resource* res,
-                               DXGI_FORMAT viewFmt, UINT rootParam) {
-    if (!res) {
-        return mcdr::err("smaaBindSrv", "smaaBindSrv: null resource");
-    }
-    if (ctx->nextDrawSlot + 1 > syncDrawDescriptorCapacity()) {
-        return mcdr::err("smaaBindSrv", "smaaBindSrv: draw descriptor heap exhausted for this frame");
-    }
-    SIZE_T base = static_cast<SIZE_T>(ctx->drawHeapSlotBase + ctx->nextDrawSlot) * deviceContext().drawInc;
-    D3D12_CPU_DESCRIPTOR_HANDLE srvCpu = deviceContext().drawHeap->GetCPUDescriptorHandleForHeapStart();
-    srvCpu.ptr += base;
-    ctx->nextDrawSlot += 1;
-
-    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-    srvDesc.Format = viewFmt;
-    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srvDesc.Texture2D.MipLevels = 1;
-    srvDesc.Texture2D.MostDetailedMip = 0;
-    deviceContext().device->CreateShaderResourceView(res, &srvDesc, srvCpu);
-
-    D3D12_GPU_DESCRIPTOR_HANDLE srvGpu = deviceContext().drawHeap->GetGPUDescriptorHandleForHeapStart();
-    srvGpu.ptr += base;
-    cmd->SetGraphicsRootDescriptorTable(rootParam, srvGpu);
-    return {};
-}
-
-// P104：把两张官方 LUT 的 **持久** SRV 绑到权重趟的根参数 1（t1 = AreaTex）与 2（t2 = SearchTex）。
-// 与 smaaBindSrv 的区别：这两张 SRV 早在 smaaEnsureLuts 里就写进 deviceContext().smaaLutSrvHeap 了，
-// 每帧只需要把「堆里已有的表」挂到根参数上 —— 不占每帧的 drawHeap 槽位，也不重新建视图。
-mcdr::Result<void> smaaBindLuts(ID3D12GraphicsCommandList* cmd) {
-    if (!deviceContext().smaaLutSrvHeap || !deviceContext().smaaLutSrvGpu.ptr || deviceContext().smaaLutSrvGpuInc == 0) {
-        return mcdr::err("smaaBindLuts", "LUT SRV heap is not ready");
-    }
-    D3D12_GPU_DESCRIPTOR_HANDLE areaGpu = deviceContext().smaaLutSrvGpu;
-    D3D12_GPU_DESCRIPTOR_HANDLE searchGpu = deviceContext().smaaLutSrvGpu;
-    searchGpu.ptr += deviceContext().smaaLutSrvGpuInc;
-    cmd->SetGraphicsRootDescriptorTable(1, areaGpu);
-    cmd->SetGraphicsRootDescriptorTable(2, searchGpu);
-    return {};
-}
-
 }  // namespace
 
 const char* antiAliasingName(int mode) {
@@ -1525,6 +1456,16 @@ const char* antiAliasingName(int mode) {
         case 3: return "DLAA";
         default: return "UNKNOWN";
     }
+}
+
+thread_local std::string gAntiAliasingLastFailure;
+
+std::string antiAliasingLastFailureText() {
+    return gAntiAliasingLastFailure;
+}
+
+int antiAliasingMode() {
+    return deviceContext().aaMode;
 }
 
 int setAntiAliasing(int mode) {
@@ -1541,6 +1482,7 @@ int setAntiAliasing(int mode) {
     deviceContext().aaMode = mode;
     // 换模式时把两条路径的"一次性失败"闸门都复位：用户可以靠改设置再试一次。
     if (mode != prev) {
+        gAntiAliasingLastFailure.clear();
         deviceContext().smaaDisabled = false;
         deviceContext().smaaUnavailableLogged = false;
         deviceContext().smaaAppliedFrames = 0;
@@ -1563,34 +1505,41 @@ int setAntiAliasing(int mode) {
 }
 
 
-bool applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
+int applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
     // P104：只有 1(SMAA) 才走三趟；0/2/3 一律跳过（语义与 P104 时一致）。
     // P108（用户 m10920）：DLSS 已从抗锯齿枚举里拆出去，**不再**在这里判 DLSS —— SMAA 与
     // DLSS 现在是独立开关，两者都开时这一趟先跑（在低分辨率世界层上），再由
     // applyDlssToTexture 把它升采样到窗口尺寸。
-    if (deviceContext().aaMode != 1 || deviceContext().smaaDisabled) {
-        return false;
+    if (deviceContext().aaMode != 1) {
+        return 0;
+    }
+    auto reject = [](const char* reason) {
+        gAntiAliasingLastFailure = std::string("SMAA: ") + reason;
+        dbgLogError("SMAA rejected: %s", gAntiAliasingLastFailure.c_str());
+        return -1;
+    };
+    if (deviceContext().smaaDisabled) {
+        return reject("disabled after a previous failure");
     }
     if (!ctx || !ctx->listOpen || !tex || !tex->resource) {
-        return false;
+        return reject("missing command context or texture");
     }
     ID3D12GraphicsCommandList* cmd = ctx->commandList;
     if (cmd == nullptr) {
-        return false;
+        return reject("missing command list");
     }
     const D3D12_RESOURCE_DESC srcDesc = tex->resource->GetDesc();
     const UINT64 srcW64 = srcDesc.Width;
     const UINT64 srcH64 = srcDesc.Height;
     if (srcW64 == 0 || srcH64 == 0) {
-        return false;
+        return reject("texture has zero dimensions");
     }
     if (srcDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || srcDesc.SampleDesc.Count != 1) {
-        // 非 2D / MSAA 目标既不能当 SRV 采样也不能 CopyResource：静默不适用（不是错误）。
         if (!deviceContext().smaaUnavailableLogged) {
             deviceContext().smaaUnavailableLogged = true;
             dbgLogWarn("target is not a single-sampled 2D texture; skipping the in-place SMAA path");
         }
-        return false;
+        return reject("target is not a single-sampled 2D texture");
     }
     DXGI_FORMAT srcFormat = srcDesc.Format;
     if (srcFormat == DXGI_FORMAT_UNKNOWN) {
@@ -1601,9 +1550,9 @@ bool applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
     // 把中间纹理留在与预期不符的状态上继续用。
     auto fail = [](const char* where, const std::string& what) {
         deviceContext().smaaDisabled = true;
-        deviceContext().aaMode = 0;
-        dbgLogError("SMAA failed in %s; SMAA disabled: %s", where, firstLine(what).c_str());
-        return false;
+        gAntiAliasingLastFailure = std::string("SMAA failed in ") + where + ": " + firstLine(what);
+        dbgLogError("%s; SMAA disabled", gAntiAliasingLastFailure.c_str());
+        return -1;
     };
     if (auto r = smaaEnsurePipelines(srcFormat); !r) {
         deviceContext().smaaUnavailableLogged = true;
@@ -1668,7 +1617,7 @@ bool applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
     cmd->RSSetViewports(1, &srcVp);
     cmd->RSSetScissorRects(1, &srcSc);
     cmd->SetPipelineState(deviceContext().smaaEdgePso.Get());
-    if (auto r = smaaBindSrv(ctx, cmd, tex->resource.Get(), srcFormat, 0); !r) {
+    if (auto r = bindPostprocessTextures(ctx, cmd, {{tex->resource.Get(), srcFormat, 0}}); !r) {
         return fail("pass1.bind", r.error().message);
     }
     cmd->DrawIndexedInstanced(6, 1, 0, 0, 0);
@@ -1681,15 +1630,13 @@ bool applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
     cmd->RSSetViewports(1, &srcVp);
     cmd->RSSetScissorRects(1, &srcSc);
     cmd->SetPipelineState(useLutWeights ? deviceContext().smaaWeightLutPso.Get() : deviceContext().smaaWeightPso.Get());
-    if (auto r = smaaBindSrv(ctx, cmd, deviceContext().smaaEdges.Get(), DXGI_FORMAT_R8G8_UNORM, 0); !r) {
-        return fail("pass2.bind", r.error().message);
-    }
-    if (useLutWeights) {
-        // 官方 LUT 路径额外需要 t1 = AreaTex、t2 = SearchTex（SRV 常驻，见 smaaBindLuts）。
-        if (auto r = smaaBindLuts(cmd); !r) {
-            return fail("pass2.bind.luts", r.error().message);
-        }
-    }
+    auto weightBindings = useLutWeights
+        ? bindPostprocessTextures(ctx, cmd, {
+            {deviceContext().smaaEdges.Get(), DXGI_FORMAT_R8G8_UNORM, 0},
+            {deviceContext().smaaAreaTex.Get(), DXGI_FORMAT_R8G8_UNORM, 1},
+            {deviceContext().smaaSearchTex.Get(), DXGI_FORMAT_R8_UNORM, 2}})
+        : bindPostprocessTextures(ctx, cmd, {{deviceContext().smaaEdges.Get(), DXGI_FORMAT_R8G8_UNORM, 0}});
+    if (!weightBindings) return fail("pass2.bind", weightBindings.error().message);
     cmd->DrawIndexedInstanced(6, 1, 0, 0, 0);
 
     // ③ 邻域混合：source + weights → scratch（**源纹理本身正在被采样，不能同时当 RTV**）
@@ -1702,11 +1649,10 @@ bool applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
     cmd->RSSetViewports(1, &srcVp);
     cmd->RSSetScissorRects(1, &srcSc);
     cmd->SetPipelineState(deviceContext().smaaBlendPso.Get());
-    if (auto r = smaaBindSrv(ctx, cmd, tex->resource.Get(), srcFormat, 0); !r) {
-        return fail("pass3.bind.t0", r.error().message);
-    }
-    if (auto r = smaaBindSrv(ctx, cmd, deviceContext().smaaWeights.Get(), DXGI_FORMAT_R8G8_UNORM, 1); !r) {
-        return fail("pass3.bind.t1", r.error().message);
+    if (auto r = bindPostprocessTextures(ctx, cmd, {
+            {tex->resource.Get(), srcFormat, 0},
+            {deviceContext().smaaWeights.Get(), DXGI_FORMAT_R8G8_UNORM, 1}}); !r) {
+        return fail("pass3.bind", r.error().message);
     }
     cmd->DrawIndexedInstanced(6, 1, 0, 0, 0);
 
@@ -1715,6 +1661,10 @@ bool applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
     // （它的稳定态就是 COMMON，与 transitionTo 的初始锚点一致）。
     transitionTo(ctx, deviceContext().smaaWorldResult.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                  D3D12_RESOURCE_STATE_COPY_SOURCE);
+    const auto targetDescription = tex->resource->GetDesc();
+    if (prepareSampledTextureWrite(ctx, tex, 0,
+            uint32_t(targetDescription.MipLevels) * targetDescription.DepthOrArraySize) != SampledTextureContentStatus::Ready)
+        return fail("copyBack", "Sampled texture contents could not be preserved before writing");
     transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_COPY_DEST);
     cmd->CopyResource(tex->resource.Get(), deviceContext().smaaWorldResult.Get());
     transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -1727,7 +1677,8 @@ bool applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
                    static_cast<unsigned long long>(srcW64), static_cast<unsigned long long>(srcH64),
                    static_cast<int>(srcFormat));
     }
-    return true;
+    gAntiAliasingLastFailure.clear();
+    return 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1859,7 +1810,7 @@ static const char kTaaPS[] =
 
 // 建 TAA 的根签名 + resolve PSO（懒初始化，幂等）。
 // 根参数：0 = b0 的 12 个 32-bit 常量；1..3 = t1/t2/t3 各一张 SRV 表。三张表分开建，
-// 而不是塞进一张 NumDescriptors=3 的表 —— smaaBindSrv 一次只写一个槽位并把该槽位挂成表，
+// 而不是塞进一张 NumDescriptors=3 的表，
 // 连续三张分开的表正好与它兼容（也就不需要再写一套堆槽位计算）。
 mcdr::Result<void> taaEnsurePipelines() {
     if (deviceContext().taaRootSig && deviceContext().taaPso) {
@@ -2004,11 +1955,16 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
                       float jitterY, float prevJitterX, float prevJitterY, float blend, int reset,
                       float sharpenAmount) {
 
-    if (deviceContext().aaMode != 2 || deviceContext().taaDisabled) {
-        return 0;
+    auto reject = [](const char* reason) {
+        gAntiAliasingLastFailure = std::string("TAA: ") + reason;
+        dbgLogError("TAA rejected: %s", gAntiAliasingLastFailure.c_str());
+        return -1;
+    };
+    if (deviceContext().taaDisabled) {
+        return reject("disabled after a previous failure");
     }
     if (!ctx || !ctx->listOpen || ctx->commandList == nullptr || !scene || !scene->resource || !motion) {
-        return 0;
+        return reject("missing command context, scene, or motion texture");
     }
 
     // 运动矢量按 TextureView 传进来（D3D12Velocity 的 view）：解包到底层纹理。
@@ -2017,11 +1973,11 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
     Dx12Object* motionTex = motion;
     if (motion->kind == Dx12Object::Kind::TextureView) {
         if (motion->sourceTexture == nullptr || !motion->sourceTexture->resource) {
-            return 0;
+            return reject("motion view has no source texture");
         }
         motionTex = motion->sourceTexture;
     } else if (!motion->resource) {
-        return 0;
+        return reject("motion texture has no resource");
     }
 
     ID3D12GraphicsCommandList* cmd = ctx->commandList;
@@ -2033,7 +1989,7 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
             deviceContext().taaUnavailableLogged = true;
             dbgLogWarn("TAA needs single-sampled 2D scene and motion textures; skipping TAA");
         }
-        return 0;
+            return reject("scene and motion must be single-sampled 2D textures");
     }
     const UINT64 w = sceneDesc.Width;
     const UINT64 h = sceneDesc.Height;
@@ -2045,7 +2001,7 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
                        static_cast<unsigned long long>(motionDesc.Width),
                        static_cast<unsigned long long>(motionDesc.Height));
         }
-        return 0;
+        return reject("scene and motion dimensions do not match");
     }
     // 回填走 blit / sharpen 两条现成管线，它们的 RTVFormats[0] 都写死 R8G8B8A8_UNORM ⇒ 场景
     // 不是这个格式就没有可用的目标管线。UNKNOWN 按 SMAA 的既有约定视为 RGBA8。
@@ -2059,13 +2015,14 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
             dbgLogWarn("TAA needs an RGBA8 scene target (fmt=%d); skipping TAA",
                        static_cast<int>(sceneFormat));
         }
-        return 0;
+        return reject("scene target is not RGBA8");
     }
 
     // 任何一步失败都彻底关掉 TAA：避免每帧重试刷日志，也避免把历史留在与预期不符的状态上。
     auto fail = [](const char* where, const std::string& what) {
         deviceContext().taaDisabled = true;
-        dbgLogError("TAA failed in %s; TAA disabled: %s", where, firstLine(what).c_str());
+        gAntiAliasingLastFailure = std::string("TAA failed in ") + where + ": " + firstLine(what);
+        dbgLogError("%s; TAA disabled", gAntiAliasingLastFailure.c_str());
         return -1;
     };
     if (auto r = taaEnsurePipelines(); !r) {
@@ -2129,14 +2086,11 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
                                                0.0f};
     cmd->SetGraphicsRoot32BitConstants(0, kTaaParam32BitCount, params, 0);
 
-    if (auto r = smaaBindSrv(ctx, cmd, scene->resource.Get(), sceneFormat, 1); !r) {
-        return fail("pass1.bind.scene", r.error().message);
-    }
-    if (auto r = smaaBindSrv(ctx, cmd, deviceContext().taaHistory[readIndex].Get(), kTaaHistoryFormat, 2); !r) {
-        return fail("pass1.bind.history", r.error().message);
-    }
-    if (auto r = smaaBindSrv(ctx, cmd, motionTex->resource.Get(), motionTex->dxgiFormat, 3); !r) {
-        return fail("pass1.bind.motion", r.error().message);
+    if (auto r = bindPostprocessTextures(ctx, cmd, {
+            {scene->resource.Get(), sceneFormat, 1},
+            {deviceContext().taaHistory[readIndex].Get(), kTaaHistoryFormat, 2},
+            {motionTex->resource.Get(), motionTex->dxgiFormat, 3}}); !r) {
+        return fail("pass1.bind", r.error().message);
     }
     cmd->DrawIndexedInstanced(6, 1, 0, 0, 0);
 
@@ -2152,10 +2106,8 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
         auto sr = sharpenTextureToTexture(ctx, &historyObj, scene, sharpenAmount);
         if (sr) {
             filled = true;
-        } else if (!deviceContext().taaSharpenFallbackWarned) {
-            deviceContext().taaSharpenFallbackWarned = true;
-            dbgLogWarn("TAA sharpen pass failed; falling back to a plain blit: %s",
-                       firstLine(sr.error().message).c_str());
+        } else {
+            return fail("pass2.sharpen", sr.error().message);
         }
     }
     if (!filled) {
@@ -2181,6 +2133,7 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
                    static_cast<unsigned long long>(w), static_cast<unsigned long long>(h),
                    static_cast<double>(blend));
     }
+    gAntiAliasingLastFailure.clear();
     return 1;
 }
 // ---------------------------------------------------------------------------

@@ -19,6 +19,18 @@ RAW 用于转换后的 R8_SINT 字节 texel buffer：HLSL 是 ByteAddressBuffer�
 `createBuffer` 按 256 字节对齐分配物理资源，逻辑 size 仍为调用方长度；RAW 尾部填充不改变逻辑可读字节数。
 地形 mesh 专用 t14/t15/t16 的 RAW 描述符由独立 mesh 录制路径维护，其资源契约保持不变。
 
+## Mesh 派发契约
+
+`drawMeshlets` 的 `meshletCount` 参数表示本次 `DispatchMesh` 的组数：MS-only 为 meshlet 数，
+AS/MS 为 `ceil(meshlet 数 / 32)`。有效范围为 `[1, 4194304]`（`2^22`）；超限返回错误。
+
+不超过 65535 组时使用一维派发；更大时使用 `256 × ceil(count / 256)`，满足每轴与总组数限制。
+JVM 生成的 AS 与 MS-only 必须同步使用 `gid.x + gid.y * 256` 还原线性组号，
+尾部填充组不能读取超出 `gMeshletCount` 的描述符。MS 在统一控制流中仅调用一次 `SetMeshOutputCounts`。
+
+`b8` 的 `MeshletGlobals` 固定为 32 B：meshlet 数在 offset 0，剔除开关在 offset 4，
+offset 8/12 为填充，距离带 VRS 的 `float4` 从 offset 16 开始。CBV 分配尺寸按 256 B 对齐。
+
 ## 文件
 
 | 文件 | 职责 |

@@ -17,6 +17,8 @@
 module;
 
 #include "_d3d12_module_prelude.h"
+#include "mcdr_terrain_tile.h"
+#include "mcdr_terrain_tile_adapter.h"
 
 export module mcdr.d3d12.mesh;
 
@@ -31,6 +33,9 @@ export namespace d3d12_mc {
 using Microsoft::WRL::ComPtr;
 // Java 侧 dx12CreateMeshPipeline 的 desc 解析产物。
 struct MeshPipelineDesc {
+    uint32_t pushConstantBytes = 0;
+    uint64_t captureHash = 0;
+    uint64_t captureGeneration = 0;
     // DXC 编出的 DXIL 字节码（不是 HLSL 源码）。asDxil 可空（不用 amplification），
     // msDxil 必填；psDxil 可空（无 PS 时不写颜色目标）。
     std::vector<uint8_t> asDxil;
@@ -40,6 +45,7 @@ struct MeshPipelineDesc {
     int colorCount = 0;
     std::vector<PipelineDesc::ColorTarget> colorTargets;
     bool hasDepth = false;
+    bool rasterMotion = false;
     int depthFormat = 0;  // GpuFormat ordinal（与图形管线同义；DSV 固定 D32_FLOAT，同图形管线）
     bool depthWrite = false;
     int depthCompareOp = 0;
@@ -48,6 +54,44 @@ struct MeshPipelineDesc {
     // 与图形管线同构：0=CBV（root descriptor），1=SRV+static sampler，2=SRV（texel buffer）。
     // 顺序即 register 顺序，保证 mcdr_dx12PushDescriptors 无需改动即可复用。
     std::vector<PipelineDesc::Binding> bindings;
+};
+
+struct TerrainTileGeometryV2 {
+    uint64_t segmentAddress = 0;
+    uint64_t vertexAddress = 0;
+    uint64_t visibleAddress = 0;
+    uint64_t atlasAddress = 0;
+    uint64_t batchConstantsAddress = 0;
+};
+
+struct TerrainTileReplayBindingV2 {
+    uint8_t type = 0;
+    void* buffer = nullptr;
+    int64_t offset = 0;
+    int64_t length = 0;
+    int32_t texelFormat = 0;
+    void* view = nullptr;
+};
+
+struct TerrainTileReplayReadV2 {
+    void* resource = nullptr;
+    uint32_t firstSubresource = 0;
+    uint32_t subresourceCount = 0;
+    uint32_t state = 0;
+    uint32_t initialState = 0;
+};
+
+struct TerrainTileReplayInputsV2 {
+    std::vector<TerrainTileReplayBindingV2> bindings;
+    std::vector<TerrainTileReplayReadV2> reads;
+    std::array<uint8_t, 128> pushConstants{};
+    uint32_t pushConstantBytes = 0;
+    bool pushConstantsValid = false;
+};
+
+enum class TerrainTileAttachmentMode : uint32_t {
+    Load = 0,
+    Clear = 1,
 };
 
 // 创建 mesh 管线（失败返回 mcdr::Error，成功返回句柄）。root signature 用 1.1 版本且
@@ -76,9 +120,24 @@ mcdr::Result<void*> createMeshPipeline(const MeshPipelineDesc& desc, uint64_t ex
 //   [N+1] descriptor table，含 t14（顶点 ByteAddressBuffer）、t15（段表）、t16（meshlet 表）
 // 这样地形 PSO 与 mesh PSO 能共用同一套 draw 绑定，只是 mesh 变体多两个槽位。
 mcdr::Result<uint64_t> createMeshRootSignature(const std::vector<PipelineDesc::Binding>& bindings,
-                                               bool meshExtras);
+                                               bool meshExtras, bool visibleWork = false, uint32_t pushConstantBytes = 0,
+                                               uint64_t captureHash = 0, bool tileExtras = false);
 // 释放 createMeshRootSignature 交出的签名（传 0 安全）。
 void releaseMeshRootSignature(uint64_t rootSignature);
+
+// Tile route owns a root-compatible DispatchMesh command signature. It is
+// deliberately opaque across the module boundary and may be attached to the
+// original capture pipeline without changing the vanilla draw path.
+mcdr::Result<void*> createTerrainTileRoute(uint64_t rootSignature,
+                                           uint64_t captureHash,
+                                           uint64_t captureGeneration);
+void destroyTerrainTileRoute(void* route);
+mcdr::Result<void> bindTerrainTileRoute(void* capturePipeline, void* route);
+mcdr::Result<void> bindTerrainTilePipeline(void* route, void* tilePipeline);
+mcdr::Result<void> bindTerrainTileStageV2(void* source, void* route,
+    const mcdr_terrain_tile_stage_v2& contract);
+mcdr::terrain_tile::StageAdapterDescription describeTerrainTileStageAdapter(
+    const std::shared_ptr<const void>& routeLease, uint64_t sourceIdentity, uint64_t sourceGeneration);
 
 // 本机是否具备 mesh 管线的最小条件（12_2 + mesh shader tier ≥ 1 + DXC 能编 ms_6_x
 // + 能拿到 ID3D12Device2）。why 收到不满足的原因（可为 nullptr）。
@@ -87,6 +146,36 @@ bool meshPipelineSupported(std::string* why);
 // DispatchMesh：x/y/z = 线程组数量（ctx 为 mcdr_command_ctx 句柄）。要求当前已
 // setPipeline 一个 mesh 管线。
 mcdr::Result<void> dispatchMesh(void* ctx, int x, int y, int z);
+
+struct TerrainProgramDescription {
+    const void* nodes;
+    size_t nodesBytes;
+    const void* initialize;
+    size_t initializeBytes;
+    const void* finalize;
+    size_t finalizeBytes;
+    const uint32_t* uniformRegisters;
+    uint32_t uniformCount;
+    uint64_t budget;
+};
+
+mcdr::Result<void*> createTerrainWorkGraph(const TerrainProgramDescription& description);
+void destroyTerrainWorkGraph(void* program);
+mcdr::Result<void*> prepareTerrainWorkGraph(void* context, void* program,
+    void* const* buffers, const uint64_t* offsets, const uint64_t* lengths,
+    uint32_t bindingCount, uint32_t sectionCount, uint32_t meshletCapacity);
+mcdr::Result<void> drawTerrainWorkGraph(void* context, void* batch,
+    void* vertexBuffer, uint64_t vertexOffset);
+mcdr::terrain_tile::Result prepareTerrainTilePacket(void* context,
+    const std::shared_ptr<const void>& packet, const mcdr::terrain_tile::Batch& batch);
+mcdr::terrain_tile::Result prepareTerrainTilePacketV2(void* context,
+    const std::shared_ptr<const void>& packet, const mcdr::terrain_tile::BatchV2& batch);
+mcdr::Result<void> recordTerrainTileReplay(void* context, void* route,
+    const mcdr::terrain_tile::BatchV2& batch, const TerrainTileGeometryV2& geometry,
+    const TerrainTileReplayInputsV2& inputs, uint32_t stageIndex, TerrainTileAttachmentMode attachmentMode);
+mcdr::Result<void> validateTerrainTileReplay(void* route,
+    const mcdr::terrain_tile::BatchV2& batch);
+void destroyTerrainBatch(void* batch);
 
 }  // export namespace d3d12_mc —— 导出接口到此为止
 

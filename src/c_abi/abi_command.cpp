@@ -6,10 +6,9 @@
 module;
 
 #include "_d3d12_module_prelude.h"
+#include "mcdr_abi.h"
 
 module mcdr.abi.common;
-
-#include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
 
 import mcdr.d3d12.device;
 import mcdr.d3d12.mesh;
@@ -17,10 +16,180 @@ import mcdr.d3d12.async_bundle;
 import mcdr.d3d12.async_descriptor;
 import mcdr.d3d12.async_executor;
 import mcdr.d3d12.async_fence;
+import mcdr.render.vanilla;
+import mcdr.render.display;
+import mcdr.render.oit;
 // mcdr.error 是叶子模块，不 import 就取不到 mcdr::Error（import 不传递）。
 import mcdr.error;
 
 using namespace d3d12_mc;
+
+namespace {
+
+int vanillaSmaaAdapter(void* context, void* payload) {
+    return d3d12_mc::applySmaaToTexture(static_cast<CommandContext*>(context),
+                                        static_cast<Dx12Object*>(payload));
+}
+
+int reportVanillaPostResult(const char* operation, int result) {
+    if (result < 0) {
+        std::string detail = d3d12_mc::vanilla::lastFailureText();
+        if (std::strcmp(operation, "mcdr_dx12ApplySmaaToTexture") == 0) {
+            const std::string provider = d3d12_mc::antiAliasingLastFailureText();
+            if (!provider.empty()) detail = provider;
+        }
+        mcdr::abi::setLastError(operation,
+            detail.empty() ? std::string("selected post adapter failed") : detail);
+    }
+    return result;
+}
+
+}  // namespace
+
+extern "C" int32_t MCDR_CALL mcdr_dx12PrepareFramePrograms(mcdr_command_ctx* context,
+    uint64_t generation, uint32_t flags, void** candidate) {
+    if (candidate) *candidate = nullptr;
+    try {
+        const auto result = vanilla::prepareFramePrograms(context, generation, flags, candidate);
+        if (result != MCDR_FRAME_PROGRAMS_SUCCESS)
+            mcdr::abi::setLastError("mcdr_dx12PrepareFramePrograms", vanilla::frameProgramsFailureText());
+        return result;
+    } catch (const std::exception& failure) {
+        mcdr::abi::setLastError("mcdr_dx12PrepareFramePrograms", failure.what());
+        return MCDR_FRAME_PROGRAMS_COMPILATION_FAILED;
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12PrepareFramePrograms", "Frame program preparation failed");
+        return MCDR_FRAME_PROGRAMS_COMPILATION_FAILED;
+    }
+}
+
+extern "C" int32_t MCDR_CALL mcdr_dx12CommitFramePrograms(mcdr_command_ctx* context, void* candidate) {
+    try {
+        const auto result = vanilla::commitFramePrograms(context, candidate);
+        if (result != MCDR_FRAME_PROGRAMS_SUCCESS)
+            mcdr::abi::setLastError("mcdr_dx12CommitFramePrograms", vanilla::frameProgramsFailureText());
+        return result;
+    } catch (const std::exception& failure) {
+        mcdr::abi::setLastError("mcdr_dx12CommitFramePrograms", failure.what());
+        return MCDR_FRAME_PROGRAMS_INVALID_REQUEST;
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12CommitFramePrograms", "Frame program validation failed");
+        return MCDR_FRAME_PROGRAMS_INVALID_REQUEST;
+    }
+}
+
+extern "C" void MCDR_CALL mcdr_dx12AbortFramePrograms(void* candidate) {
+    vanilla::abortFramePrograms(candidate);
+}
+
+extern "C" int32_t MCDR_CALL mcdr_dx12VanillaBeginFrame(mcdr_command_ctx* context,
+                                                          const mcdr_vanilla_frame_input* input) {
+    return reportVanillaPostResult("mcdr_dx12VanillaBeginFrame",
+        vanilla::beginFrame(context, input, sizeof(*input)));
+}
+
+extern "C" int32_t MCDR_CALL mcdr_dx12VanillaWorldReady(mcdr_command_ctx* context,
+                                                          const mcdr_frame_identity* input) {
+    return reportVanillaPostResult("mcdr_dx12VanillaWorldReady",
+        vanilla::markWorldReady(context, input, sizeof(*input)));
+}
+
+extern "C" int32_t MCDR_CALL mcdr_dx12VanillaGuiReady(mcdr_command_ctx* context,
+                                                        const mcdr_frame_identity* input) {
+    return reportVanillaPostResult("mcdr_dx12VanillaGuiReady",
+        vanilla::markGuiReady(context, input, sizeof(*input)));
+}
+
+extern "C" int32_t MCDR_CALL mcdr_dx12VanillaPublishPreparedFrame(mcdr_command_ctx* context,
+                                                                    const mcdr_prepared_frame* input) {
+    return reportVanillaPostResult("mcdr_dx12VanillaPublishPreparedFrame",
+        vanilla::publishPreparedFrame(context, input, sizeof(*input)));
+}
+
+extern "C" int32_t MCDR_CALL mcdr_dx12VanillaEvaluateReconstruction(
+    mcdr_command_ctx* context, const mcdr_reconstruction_request* input) {
+    return reportVanillaPostResult("mcdr_dx12VanillaEvaluateReconstruction",
+        vanilla::executePreparedReconstruction(context, input, sizeof(*input),
+            d3d12_mc::evaluatePreparedReconstruction));
+}
+
+extern "C" int32_t MCDR_CALL mcdr_dx12SettleDisplayFrameV1(
+    mcdr_command_ctx* context, uint64_t timeoutMs, mcdr_present_receipt_v1* receipt) {
+    if (!receipt || receipt->schemaVersion != MCDR_PRESENT_RECEIPT_SCHEMA_VERSION ||
+        receipt->structSize != sizeof(mcdr_present_receipt_v1)) {
+        mcdr::abi::setLastError("mcdr_dx12SettleDisplayFrameV1", "Invalid display receipt schema or size");
+        return MCDR_DISPLAY_SETTLE_INVALID_REQUEST;
+    }
+    const auto result = settleDisplayFrame(context, timeoutMs, receipt, sizeof(*receipt));
+    if (!result) {
+        mcdr::abi::setLastError("mcdr_dx12SettleDisplayFrameV1", result.error().message);
+        return MCDR_DISPLAY_SETTLE_INVALID_REQUEST;
+    }
+    return *result;
+}
+
+extern "C" int32_t MCDR_CALL mcdr_dx12VanillaResetFrame(mcdr_command_ctx* context) {
+    if (context == nullptr) return -1;
+    if (display::retire(context) != 1) {
+        mcdr::abi::setLastError("mcdr_dx12VanillaResetFrame", display::lastFailureText());
+        return -1;
+    }
+    oit::reset(context);
+    vanilla::reset(context);
+    return 1;
+}
+
+extern "C" int32_t MCDR_CALL mcdr_dx12VanillaPrepareWorldOutput(
+    mcdr_command_ctx* context, const mcdr_world_output_input* input) {
+    return reportVanillaPostResult("mcdr_dx12VanillaPrepareWorldOutput",
+        vanilla::prepareWorldOutput(context, input, sizeof(*input)));
+}
+
+extern "C" int32_t MCDR_CALL mcdr_dx12VanillaBeginRasterPass(
+    mcdr_command_ctx* context, void** token) {
+    if (token != nullptr) *token = nullptr;
+    if (context == nullptr || token == nullptr) {
+        mcdr::abi::setLastError("mcdr_dx12VanillaBeginRasterPass", "Null context or token output");
+        return -1;
+    }
+    const auto result = vanilla::beginRasterAttachmentPass(context, token);
+    if (result != 1) mcdr::abi::setLastError("mcdr_dx12VanillaBeginRasterPass", vanilla::lastFailureText());
+    return result;
+}
+
+extern "C" int32_t MCDR_CALL mcdr_dx12VanillaBeginDeclaredPass(
+    mcdr_command_ctx* context, uint32_t pass, const mcdr_vanilla_resource_use* uses,
+    uint32_t useCount, uint32_t graphicsEffects, void** token) {
+    if (context == nullptr || uses == nullptr || token == nullptr || useCount == 0) return -1;
+    std::vector<d3d12_mc::vanilla::PassResourceUse> declarations;
+    declarations.reserve(useCount);
+    for (uint32_t index = 0; index < useCount; ++index) {
+        const auto& use = uses[index];
+        declarations.push_back({use.object, use.version, use.firstSubresource, use.subresourceCount,
+            static_cast<d3d12_mc::vanilla::ResourceAccess>(use.access), use.requiredState,
+            use.finalState, static_cast<d3d12_mc::vanilla::ExternalResourceState>(use.externalState)});
+    }
+    d3d12_mc::vanilla::DeclaredPassToken* opaque = nullptr;
+    const auto result = d3d12_mc::vanilla::beginDeclaredPass(context, pass, declarations.data(),
+        useCount, graphicsEffects, &opaque);
+    *token = opaque;
+    if (result != 1) mcdr::abi::setLastError("mcdr_dx12VanillaBeginDeclaredPass", vanilla::lastFailureText());
+    return result;
+}
+
+extern "C" int32_t MCDR_CALL mcdr_dx12VanillaFinishDeclaredPass(
+    mcdr_command_ctx* context, void* token) {
+    const auto result = d3d12_mc::vanilla::finishDeclaredPass(context,
+        static_cast<d3d12_mc::vanilla::DeclaredPassToken*>(token));
+    if (result != 1) mcdr::abi::setLastError("mcdr_dx12VanillaFinishDeclaredPass", vanilla::lastFailureText());
+    return result;
+}
+
+extern "C" int32_t MCDR_CALL mcdr_dx12InvalidateReconstructionInputs(mcdr_command_ctx* context) {
+    const auto result = d3d12_mc::invalidateReconstructionInputs(context);
+    if (result != 1) return mcdr::abi::failWith("mcdr_dx12InvalidateReconstructionInputs", "Input invalidation rejected");
+    return 1;
+}
 
 // ===========================================================================
 // 本文件是合并后的 C ABI 适配单元，按**功能**命名（不再按移植阶段 pX）。
@@ -71,6 +240,10 @@ mcdr_command_ctx* MCDR_CALL MCDR_D3D12_create_command_encoder(void) {
 
 void MCDR_CALL mcdr_dx12DestroyCommandEncoder(mcdr_command_ctx* ctx) { d3d12_mc::destroyCommandEncoder(ctx); }
 
+int32_t MCDR_CALL mcdr_dx12DestroyCommandEncoderCheckedV1(mcdr_command_ctx* ctx) {
+    return d3d12_mc::destroyCommandEncoderChecked(ctx);
+}
+
 void MCDR_CALL mcdr_dx12BeginCommandList(mcdr_command_ctx* ctx) {
     if (const auto r = d3d12_mc::beginCommandList(ctx); !r) {
         mcdr::abi::failVoid("mcdr_dx12BeginCommandList", r.error().message);
@@ -114,6 +287,19 @@ int32_t MCDR_CALL mcdr_dx12WaitForFence(mcdr_command_ctx* ctx, uint64_t value, i
     return r ? 1 : 0;
 }
 
+int32_t MCDR_CALL mcdr_dx12CommandRecordingStatusV1(mcdr_command_ctx* ctx) {
+    return d3d12_mc::commandRecordingStatus(ctx);
+}
+
+int32_t MCDR_CALL mcdr_dx12SubmitV1(mcdr_command_ctx* ctx, uint64_t* submittedFence) {
+    return d3d12_mc::submitCommandListV1(ctx, submittedFence);
+}
+
+int32_t MCDR_CALL mcdr_dx12SettleCommandSubmissionV1(mcdr_command_ctx* ctx,
+    uint64_t timeoutMs, uint64_t* submittedFence) {
+    return d3d12_mc::settleCommandSubmissionV1(ctx, timeoutMs, submittedFence);
+}
+
 uint64_t MCDR_CALL mcdr_dx12GetFenceValue(mcdr_command_ctx* ctx) {
     // createFence() 捕获的是本 ctx 的当前 per-command-list 序号，target = 该值 + 1；
     // 等待对象是同一个 ctx 的 fence（BUG-03）。
@@ -139,6 +325,16 @@ void MCDR_CALL mcdr_dx12CopyBuffer(mcdr_command_ctx* ctx, mcdr_object* src, int6
     }
 }
 
+int32_t MCDR_CALL mcdr_dx12CopyBufferChecked(mcdr_command_ctx* ctx, mcdr_object* src,
+    int64_t srcOffset, mcdr_object* dst, int64_t dstOffset, int64_t size) {
+    const auto result = d3d12_mc::copyBufferToBuffer(ctx, src, srcOffset, dst, dstOffset, size);
+    if (!result) {
+        mcdr::abi::failVoid("mcdr_dx12CopyBufferChecked", result.error().message);
+        return 0;
+    }
+    return 1;
+}
+
 void MCDR_CALL mcdr_dx12WriteToTexture(mcdr_command_ctx* ctx, mcdr_object* stagingBuffer,
                                        int64_t stagingOffset, int32_t width, int32_t height,
                                        mcdr_object* dstTexture, int32_t mip, int32_t layer, int32_t dstX,
@@ -148,6 +344,16 @@ void MCDR_CALL mcdr_dx12WriteToTexture(mcdr_command_ctx* ctx, mcdr_object* stagi
         !r) {
         mcdr::abi::failVoid("mcdr_dx12WriteToTexture", r.error().message);
     }
+}
+
+int32_t MCDR_CALL mcdr_dx12WriteToTextureChecked(mcdr_command_ctx* ctx, mcdr_object* stagingBuffer,
+                                               int64_t stagingOffset, int32_t width, int32_t height,
+                                               mcdr_object* dstTexture, int32_t mip, int32_t layer,
+                                               int32_t dstX, int32_t dstY) {
+    const auto result = d3d12_mc::copyBufferToTexture(ctx, stagingBuffer, stagingOffset, width, height,
+                                                    dstTexture, mip, layer, dstX, dstY, width, height);
+    if (!result) return mcdr::abi::failWith("mcdr_dx12WriteToTextureChecked", result.error().message);
+    return 1;
 }
 
 void MCDR_CALL mcdr_dx12CopyBufferToTexture(mcdr_command_ctx* ctx, mcdr_object* srcBuffer, int64_t srcOffset,
@@ -160,6 +366,16 @@ void MCDR_CALL mcdr_dx12CopyBufferToTexture(mcdr_command_ctx* ctx, mcdr_object* 
         !r) {
         mcdr::abi::failVoid("mcdr_dx12CopyBufferToTexture", r.error().message);
     }
+}
+
+int32_t MCDR_CALL mcdr_dx12CopyBufferToTextureChecked(mcdr_command_ctx* ctx, mcdr_object* srcBuffer,
+                                                    int64_t srcOffset, int32_t srcWidth, int32_t srcHeight,
+                                                    mcdr_object* dstTexture, int32_t mip, int32_t layer,
+                                                    int32_t dstX, int32_t dstY, int32_t width, int32_t height) {
+    const auto result = d3d12_mc::copyBufferToTexture(ctx, srcBuffer, srcOffset, srcWidth, srcHeight,
+                                                    dstTexture, mip, layer, dstX, dstY, width, height);
+    if (!result) return mcdr::abi::failWith("mcdr_dx12CopyBufferToTextureChecked", result.error().message);
+    return 1;
 }
 
 void MCDR_CALL mcdr_dx12CopyTextureToBuffer(mcdr_command_ctx* ctx, mcdr_object* srcTexture, int32_t mip,
@@ -183,11 +399,25 @@ void MCDR_CALL mcdr_dx12CopyTextureToTexture(mcdr_command_ctx* ctx, mcdr_object*
     }
 }
 
+int32_t MCDR_CALL mcdr_dx12CopyTextureToTextureChecked(mcdr_command_ctx* ctx, mcdr_object* srcTexture,
+                                                     mcdr_object* dstTexture, int32_t mip, int32_t layer,
+                                                     int32_t srcX, int32_t srcY, int32_t dstX, int32_t dstY,
+                                                     int32_t width, int32_t height) {
+    const auto result = d3d12_mc::copyTextureToTexture(ctx, srcTexture, dstTexture, mip, layer,
+                                                     srcX, srcY, dstX, dstY, width, height);
+    if (!result) return mcdr::abi::failWith("mcdr_dx12CopyTextureToTextureChecked", result.error().message);
+    return 1;
+}
+
 // P104b: in-place SMAA on a texture (the world layer). The Java side calls this from a
 // GameRenderer mixin, right after the world has rendered and before the GUI is drawn, so
 // the anti-aliasing never touches UI. Silence here is normal: mode != SMAA is a no-op.
 int32_t MCDR_CALL mcdr_dx12ApplySmaaToTexture(mcdr_command_ctx* ctx, mcdr_object* texture) {
-    return d3d12_mc::applySmaaToTexture(ctx, texture) ? 1 : 0;
+    if (d3d12_mc::deviceContext().aaMode != 1) {
+        return 0;
+    }
+    return reportVanillaPostResult("mcdr_dx12ApplySmaaToTexture",
+        vanilla::executeSmaaWorldPost(ctx, vanillaSmaaAdapter, texture));
 }
 
 // P106: GUI target split. The Java side calls this once per frame to hand the finished world
@@ -212,40 +442,6 @@ int32_t MCDR_CALL mcdr_dx12SharpenTextureToTexture(mcdr_command_ctx* ctx, mcdr_o
         return 0;
     }
     return 1;
-}
-
-// P152: TAA resolve, native side. Same call point as SMAA (world drawn, GUI not yet), but the
-// history textures, the resolve pipeline and the jitter bookkeeping live in the device context,
-// so the JVM only pushes the per-frame values. Returns 1 = applied, 0 = skipped (mode is not
-// TAA / unsuitable target / already disabled), -1 = failed (one ERROR log, TAA disabled).
-int32_t MCDR_CALL mcdr_dx12ApplyTaaToTexture(mcdr_command_ctx* ctx, mcdr_object* scene,
-                                             mcdr_object* motion, float jitterX, float jitterY,
-                                             float prevJitterX, float prevJitterY, float blend,
-                                             int32_t reset, float sharpenAmount) {
-    return d3d12_mc::applyTaaToTexture(ctx, scene, motion, jitterX, jitterY, prevJitterX, prevJitterY,
-                                       blend, reset, sharpenAmount);
-}
-
-// P108: DLSS. Same call point as mcdr_dx12ApplySmaaToTexture (world done, GUI not yet):
-// the world layer is upscaled from the render size into the window-sized target, which is
-// what the linear blit used to do. Silenced by the independent DLSS switch being off
-// (mcdr_dx12SetDlssEnabled — P108 / user m10920 decoupled it from the AA mode), and by any
-// earlier failure (which has already been logged exactly once).
-int32_t MCDR_CALL mcdr_dx12CreateDlssFeature(mcdr_command_ctx* ctx, const mcdr_dlss_input* in) {
-    if (ctx == nullptr || in == nullptr) {
-        return -1;
-    }
-    // Create and Evaluate are one entry point on purpose: NGX may only create the feature
-    // while a command list is open, and the Java side has exactly that one window per
-    // frame (after the world, before the GUI).
-    return d3d12_mc::applyDlssToTexture(ctx, *in) ? 1 : 0;
-}
-
-int32_t MCDR_CALL mcdr_dx12EvaluateDlss(mcdr_command_ctx* ctx, const mcdr_dlss_input* in) {
-    if (ctx == nullptr || in == nullptr) {
-        return -1;
-    }
-    return d3d12_mc::applyDlssToTexture(ctx, *in) ? 1 : 0;
 }
 
 // P108: one-line DLSS availability/state query for the UI and the log.
@@ -374,7 +570,7 @@ void MCDR_CALL mcdr_dx12InitAsyncRenderer(int32_t workerCount) {
     }
 }
 
-void MCDR_CALL mcdr_dx12DestroyAsyncRenderer(void) { d3d12_mc::destroyAsyncRenderer(); }
+int32_t MCDR_CALL mcdr_dx12DestroyAsyncRenderer(void) { return d3d12_mc::destroyAsyncRenderer() ? 1 : 0; }
 
 int32_t MCDR_CALL mcdr_dx12AsyncRenderBeginFrame(mcdr_command_ctx* ctx) {
     const auto r = d3d12_mc::asyncRenderBeginFrame(ctx);

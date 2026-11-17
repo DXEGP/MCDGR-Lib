@@ -22,9 +22,11 @@ module;
 // 与 d3d12_device.cpp 同理，**.cppm 全局模块片段里的声明不会传给实现单元**，各实现
 // 单元要自己再 include 一次（include guard 保证幂等）。
 #include "mcdr_abi.h"
+#include "mcdr_dlss_impl.h"
 
 // P284：`swprintf_s` / `wcslen`（PIX 区间名）。放在全局模块片段，理由同上。
 #include <cstdio>
+#include <cmath>
 #include <cwchar>
 #include <string_view>
 
@@ -32,7 +34,7 @@ module mcdr.d3d12.device;
 
 namespace d3d12_mc {
 // P280：销毁 provider 前等 GPU 追平（定义在文件末尾，`ensureProvider` 在匿名 namespace 里先声明）。
-void releaseProviderWithWait(CommandContext* ctx);
+bool releaseProviderWithWait(CommandContext* ctx);
 
 namespace {
 
@@ -92,7 +94,7 @@ void fillDlssCaps(mcdr_sr_caps& out) {
     out.available = up ? 1 : 0;
     out.coupledDenoise = 0;    // DLSS-SR 不含降噪；DLSS-D 是另一个后端（v1 不做）
     out.needsExposure = 0;
-    out.takesMasks = MCDR_SR_MASK_REACTIVE;
+    out.takesMasks = 0;
     out.externalHeap = 1;      // Streamline 可通过 slAllocateResources 用外部堆
     out.jitterPhaseCount = 8;  // Streamline 的 8 相位（与 D3D12Temporal 的 Halton(2,3) 对齐）
     out.minRenderWidth = 320;
@@ -120,9 +122,8 @@ mcdr_dlss_input toDlssInput(const mcdr_sr_dispatch& d) {
     in.mvScaleX = d.motionVectorScaleX != 0.0f ? d.motionVectorScaleX : 1.0f;
     in.mvScaleY = d.motionVectorScaleY != 0.0f ? d.motionVectorScaleY : 1.0f;
     in.preExposure = d.preExposure != 0.0f ? d.preExposure : 1.0f;
-    // mcdr_sr_dispatch v1 不带曝光纹理：显式声明 NONE，等 P289 再接。
     in.exposureScale = 1.0f;
-    in.exposureMode = MCDR_DLSS_EXPOSURE_NONE;
+    in.exposureMode = d.pExposure ? MCDR_DLSS_EXPOSURE_AUTO : MCDR_DLSS_EXPOSURE_NONE;
     // 世界层颜色不含 UI alpha（GUI 有自己的目标），所以不做 alpha 升采样。
     in.alphaUpscaling = 0;
     in.nearZ = d.cameraNear;
@@ -136,6 +137,7 @@ mcdr_dlss_input toDlssInput(const mcdr_sr_dispatch& d) {
     in.pInDepth = static_cast<mcdr_object*>(d.pDepth);
     in.pInMotionVectors = static_cast<mcdr_object*>(d.pMotionVectors);
     in.pInOutput = static_cast<mcdr_object*>(d.pColorOutput);
+    in.pInExposure = static_cast<mcdr_object*>(d.pExposure);
     return in;
 }
 
@@ -144,6 +146,34 @@ int32_t gSrPicked = MCDR_SR_BACKEND_NONE;
 int32_t gSrActive = MCDR_SR_BACKEND_NONE;
 std::string gSrNote;  // 最近一次失败 / 降级原因，给 SrQuery 用
 std::unique_ptr<IUpscaleProvider> gSrProvider;
+
+struct SrCreationSignature {
+    int32_t backend = MCDR_SR_BACKEND_NONE;
+    int32_t renderWidth = 0;
+    int32_t renderHeight = 0;
+    int32_t displayWidth = 0;
+    int32_t displayHeight = 0;
+};
+
+SrCreationSignature gSrCreationSignature;
+
+struct PreparedSrProvider {
+    uint64_t token = 0;
+    int32_t backend = MCDR_SR_BACKEND_NONE;
+    mcdr_sr_dispatch description{};
+    mcdr_raster_camera camera{};
+    std::unique_ptr<IUpscaleProvider> provider;
+    uint64_t completedQueueSubmission = 0;
+    CommandContext* creationContext = nullptr;
+    uint64_t creationFence = 0;
+    void* dlssCandidate = nullptr;
+    bool abandoned = false;
+    std::vector<std::shared_ptr<void>> inputLeases;
+};
+
+std::unique_ptr<PreparedSrProvider> gPreparedSrProvider;
+uint64_t gSrNextPreparationToken = 1;
+std::vector<void*> gRetiredDlssPreparations;
 
 // P284：诊断计数。只给 `mcdr_dx12SrQuery` 的文本用 —— 升采样"到底跑没跑"最容易看错的
 // 信号是"日志里有一条 provider ready"，而它只在初始化成功时打一次；这里记的是逐帧结果。
@@ -166,6 +196,8 @@ int32_t gSrLastDisplayHeight = 0;
 class DlssSrProvider final : public IUpscaleProvider {
 public:
     SrBackendId backend() const override { return SrBackendId::Dlss; }
+
+    std::string failureText() const override { return dlssLastFailureText(); }
 
     void fillCaps(mcdr_sr_caps& out) const override { fillDlssCaps(out); }
 
@@ -197,10 +229,7 @@ public:
     }
 
     bool evaluate(CommandContext* ctx, const mcdr_sr_dispatch& desc) override {
-        if (ctx == nullptr || desc.pColorInput == nullptr || desc.pColorOutput == nullptr) {
-            return false;
-        }
-        return applyDlssToTexture(ctx, toDlssInput(desc));
+        return applyDlssToTexture(ctx, toDlssInput(desc)) > 0;
     }
 
     void shutdown() override {
@@ -235,28 +264,80 @@ std::unique_ptr<IUpscaleProvider> makeProvider(SrBackendId id) {
 
 // 懒建 / 换后端。调用点：srCreateProvider（JVM 显式建）与 srEvaluateFrame（JVM 只
 // Pick + Evaluate 时也要能工作，P271 的验证探针就是这种用法）。
+bool replaceProvider(CommandContext* ctx, int32_t backendId, const mcdr_sr_dispatch& seed);
+
 bool ensureProvider(CommandContext* ctx, int32_t backendId, const mcdr_sr_dispatch& seed) {
     if (gSrProvider != nullptr && gSrActive == backendId) {
         return true;
     }
-    if (gSrProvider != nullptr) {
-        const int32_t previous = gSrActive;
-        releaseProviderWithWait(ctx);
+    const int32_t previous = gSrActive;
+    if (!replaceProvider(ctx, backendId, seed)) return false;
+    if (previous != MCDR_SR_BACKEND_NONE)
         dbgLogInfo("SR provider switch %s -> %s", nameOf(previous), nameOf(backendId));
-    }
-    std::unique_ptr<IUpscaleProvider> provider = makeProvider(toId(backendId));
-    if (provider == nullptr) {
+    return true;
+}
+
+bool replaceProvider(CommandContext* ctx, int32_t backendId, const mcdr_sr_dispatch& seed) {
+    std::unique_ptr<IUpscaleProvider> candidate = makeProvider(toId(backendId));
+    if (candidate == nullptr) {
         gSrNote = "backend not implemented";
         return false;
     }
-    if (!provider->initialize(ctx, seed)) {
-        return false;  // initialize 已经写过 gSrNote
+    if (!candidate->initialize(ctx, seed)) {
+        const std::string problem = candidate->failureText();
+        candidate->shutdown();
+        gSrNote = std::string(nameOf(backendId)) + " initialize failed";
+        if (!problem.empty()) gSrNote += ": " + problem;
+        return false;
+    }
+    if (gSrProvider != nullptr) {
+        if (!releaseProviderWithWait(ctx)) {
+            candidate->shutdown();
+            return false;
+        }
     }
     gSrActive = backendId;
-    gSrProvider = std::move(provider);
+    gSrProvider = std::move(candidate);
+    gSrCreationSignature = {
+        backendId,
+        seed.renderWidth,
+        seed.renderHeight,
+        seed.displayWidth,
+        seed.displayHeight,
+    };
     dbgLogInfo("SR provider ready: %s (render %dx%d display %dx%d)", nameOf(backendId),
                seed.renderWidth, seed.renderHeight, seed.displayWidth, seed.displayHeight);
     return true;
+}
+
+bool retirePreparedSrProvider(PreparedSrProvider& prepared) {
+    if (prepared.creationContext != nullptr) {
+        if (prepared.creationContext->submissionFailed.load() ||
+            (prepared.creationFence > 0 &&
+                !waitForFenceValue(prepared.creationContext, prepared.creationFence,
+                    5'000'000'000ULL).has_value())) return false;
+        destroyCommandEncoder(prepared.creationContext);
+        prepared.creationContext = nullptr;
+    }
+    if (prepared.dlssCandidate != nullptr) {
+        if (mcdr_dlss_abort_sr(prepared.dlssCandidate) != 1) return false;
+        prepared.dlssCandidate = nullptr;
+    }
+    if (prepared.provider != nullptr) {
+        prepared.provider->shutdown();
+        prepared.provider.reset();
+    }
+    return true;
+}
+
+int32_t abandonPreparedSrProvider(std::unique_ptr<PreparedSrProvider> prepared,
+    int32_t result, uint64_t* token) {
+    prepared->abandoned = true;
+    if (!retirePreparedSrProvider(*prepared)) {
+        *token = prepared->token;
+        gPreparedSrProvider = std::move(prepared);
+    }
+    return result;
 }
 
 // 从 create 的参数造一个"种子载荷"：只填尺寸，资源指针留空。DLSS 的 initialize 只读
@@ -274,6 +355,10 @@ mcdr_sr_dispatch seedFromSizes(int32_t renderWidth, int32_t renderHeight, int32_
 }  // namespace
 
 int32_t srPickBackend(int32_t backendId) {
+    if (gPreparedSrProvider != nullptr) {
+        gSrNote = "SR backend selection is blocked by a pending preparation";
+        return 0;
+    }
     if (!validBackend(backendId)) {
         gSrNote = "unknown backend id";
         return 0;
@@ -327,26 +412,39 @@ void srFillCaps(int32_t backendId, mcdr_sr_caps& out) {
 
 int32_t srCreateProvider(CommandContext* ctx, int32_t backendId, int32_t maxRenderWidth,
                          int32_t maxRenderHeight, int32_t displayWidth, int32_t displayHeight) {
+    if (gPreparedSrProvider != nullptr) {
+        gSrNote = "SR creation is blocked by a pending preparation";
+        return 0;
+    }
     if (ctx == nullptr || !validBackend(backendId) || maxRenderWidth <= 0 || maxRenderHeight <= 0 ||
         displayWidth <= 0 || displayHeight <= 0) {
+        gSrNote = "srCreateProvider: invalid context, backend or dimensions";
         return -1;
     }
     if (backendId == MCDR_SR_BACKEND_NONE) {
-        srReleaseProvider();
-        gSrActive = MCDR_SR_BACKEND_NONE;
-        return 1;
+        return releaseProviderWithWait(ctx) ? 1 : 0;
     }
     const mcdr_sr_dispatch seed =
         seedFromSizes(maxRenderWidth, maxRenderHeight, displayWidth, displayHeight);
-    // 幂等：同一个后端重复 create 只更新尺寸，不重建（P280 的热切换会靠这个语义）。
-    if (gSrProvider != nullptr && gSrActive == backendId) {
-        gSrProvider->onResize(maxRenderWidth, maxRenderHeight, displayWidth, displayHeight);
+    if (gSrProvider != nullptr &&
+        gSrCreationSignature.backend == backendId &&
+        gSrCreationSignature.renderWidth == maxRenderWidth &&
+        gSrCreationSignature.renderHeight == maxRenderHeight &&
+        gSrCreationSignature.displayWidth == displayWidth &&
+        gSrCreationSignature.displayHeight == displayHeight) {
         return 1;
     }
-    return ensureProvider(ctx, backendId, seed) ? 1 : 0;
+    if (gSrProvider != nullptr && gSrActive == backendId) {
+        return replaceProvider(ctx, backendId, seed) ? 1 : 0;
+    }
+    if (!ensureProvider(ctx, backendId, seed)) {
+        if (gSrNote.empty()) gSrNote = std::string(nameOf(backendId)) + " initialize failed";
+        return -1;
+    }
+    return 1;
 }
 
-int32_t srResizeProvider(int32_t renderWidth, int32_t renderHeight, int32_t displayWidth,
+int32_t srResizeProvider(CommandContext* ctx, int32_t renderWidth, int32_t renderHeight, int32_t displayWidth,
                          int32_t displayHeight) {
     if (renderWidth <= 0 || renderHeight <= 0 || displayWidth <= 0 || displayHeight <= 0) {
         return -1;
@@ -354,12 +452,179 @@ int32_t srResizeProvider(int32_t renderWidth, int32_t renderHeight, int32_t disp
     if (gSrProvider == nullptr) {
         return 0;  // 没有生效的后端：不是错误，只是没东西可通知
     }
-    gSrProvider->onResize(renderWidth, renderHeight, displayWidth, displayHeight);
+    return srCreateProvider(ctx, gSrActive, renderWidth, renderHeight, displayWidth, displayHeight);
+}
+
+int32_t srPrepareProvider(CommandContext* ctx, const mcdr_sr_dispatch& description,
+    int32_t dlssQuality, int32_t dlssPreset, uint64_t* token) {
+    if (token == nullptr) return MCDR_SR_PREPARE_INVALID_ARGUMENT;
+    *token = 0;
+    for (auto retired = gRetiredDlssPreparations.begin(); retired != gRetiredDlssPreparations.end();) {
+        if (mcdr_dlss_abort_sr(*retired) == 1) retired = gRetiredDlssPreparations.erase(retired);
+        else ++retired;
+    }
+    if (ctx == nullptr || ctx->listOpen || !validBackend(description.backend) ||
+        description.renderWidth <= 0 || description.renderHeight <= 0 ||
+        description.displayWidth <= 0 || description.displayHeight <= 0) {
+        gSrNote = "SR preparation requires a valid description and a closed command context";
+        return MCDR_SR_PREPARE_INVALID_ARGUMENT;
+    }
+    if (gPreparedSrProvider != nullptr) {
+        gSrNote = "SR preparation is waiting for the previous candidate to retire";
+        return MCDR_SR_PREPARE_NOT_READY;
+    }
+    if (description.backend != MCDR_SR_BACKEND_NONE &&
+        (description.renderWidth < 320 || description.renderHeight < 180)) {
+        gSrNote = "SR preparation render size is below the 320x180 minimum";
+        return MCDR_SR_PREPARE_INVALID_ARGUMENT;
+    }
+    const uint64_t previousSubmission = currentQueueFenceValue();
+    if (previousSubmission > 0 &&
+        !waitForQueueFenceValue(previousSubmission, 5'000'000'000ULL).has_value()) {
+        gSrNote = "SR preparation queue fence timed out";
+        return MCDR_SR_PREPARE_NOT_READY;
+    }
+    auto candidate = std::make_unique<PreparedSrProvider>();
+    candidate->token = gSrNextPreparationToken++;
+    if (candidate->token == 0) candidate->token = gSrNextPreparationToken++;
+    candidate->backend = description.backend;
+    candidate->description = description;
+    if (description.pCamera != nullptr) {
+        candidate->camera = *description.pCamera;
+        candidate->description.pCamera = &candidate->camera;
+    }
+    candidate->completedQueueSubmission = previousSubmission;
+    if (description.backend == MCDR_SR_BACKEND_DLSS) {
+        const auto encoder = createCommandEncoder();
+        if (!encoder) {
+            gSrNote = "DLSS preparation command context creation failed";
+            return MCDR_SR_PREPARE_REJECTED;
+        }
+        candidate->creationContext = static_cast<CommandContext*>(*encoder);
+        if (!beginCommandList(candidate->creationContext)) {
+            destroyCommandEncoder(candidate->creationContext);
+            gSrNote = "DLSS preparation command list creation failed";
+            return MCDR_SR_PREPARE_REJECTED;
+        }
+        mcdr_dlss_input input = toDlssInput(description);
+        int32_t resourceStates[5]{};
+        uint32_t resourceIndex = 0;
+        bool validResources = true;
+        for (mcdr_object** field : {&input.pInColor, &input.pInDepth,
+            &input.pInMotionVectors, &input.pInOutput, &input.pInExposure}) {
+            auto* object = static_cast<Dx12Object*>(*field);
+            if (object == nullptr && field == &input.pInExposure) continue;
+            if (object == nullptr || object->resource == nullptr) {
+                validResources = false;
+                break;
+            }
+            auto lease = retainObjectLease(object);
+            if (!lease) {
+                validResources = false;
+                break;
+            }
+            candidate->inputLeases.push_back(std::move(lease));
+            retainObjectForRecording(candidate->creationContext, object);
+            resourceStates[resourceIndex] = static_cast<int32_t>(resourceSubresourceState(
+                ctx, object->resource.Get(), 0, D3D12_RESOURCE_STATE_COMMON));
+            *field = reinterpret_cast<mcdr_object*>(object->resource.Get());
+            ++resourceIndex;
+        }
+        const int32_t created = validResources ? mcdr_dlss_prepare_sr(
+            candidate->creationContext->commandList, &input, description.pCamera, dlssQuality, dlssPreset,
+            resourceStates, &candidate->dlssCandidate) : MCDR_SR_PREPARE_INVALID_ARGUMENT;
+        const auto ended = endCommandList(candidate->creationContext);
+        if (!ended) {
+            gSrNote = "DLSS preparation command list close failed";
+            return abandonPreparedSrProvider(std::move(candidate), MCDR_SR_PREPARE_REJECTED, token);
+        }
+        const auto submitted = submitCommandList(candidate->creationContext);
+        if (submitted) candidate->creationFence = *submitted;
+        if (!submitted || candidate->creationContext->submissionFailed.load() ||
+            (candidate->creationFence > 0 && !waitForFenceValue(candidate->creationContext,
+                candidate->creationFence, 5'000'000'000ULL).has_value())) {
+            candidate->abandoned = true;
+            *token = candidate->token;
+            gPreparedSrProvider = std::move(candidate);
+            gSrNote = "DLSS preparation command completion is unknown; resources remain retained";
+            return MCDR_SR_PREPARE_COMPLETION_UNKNOWN;
+        }
+        destroyCommandEncoder(candidate->creationContext);
+        candidate->creationContext = nullptr;
+        candidate->completedQueueSubmission = currentQueueFenceValue();
+        if (created != MCDR_SR_PREPARE_READY) {
+            gSrNote = created == MCDR_SR_PREPARE_NOT_READY
+                ? "DLSS preparation is waiting for real frame inputs or a free viewport"
+                : "DLSS SDK rejected feature preparation; applied feature remains retained";
+            return abandonPreparedSrProvider(std::move(candidate), created, token);
+        }
+    }
+    if (description.backend != MCDR_SR_BACKEND_NONE) {
+        candidate->provider = makeProvider(toId(description.backend));
+        if (candidate->provider == nullptr) {
+            gSrNote = "SR preparation backend is unavailable";
+            return abandonPreparedSrProvider(std::move(candidate), MCDR_SR_PREPARE_REJECTED, token);
+        }
+        if (!candidate->provider->initialize(ctx, description)) {
+            gSrNote = candidate->provider->failureText();
+            return abandonPreparedSrProvider(std::move(candidate), MCDR_SR_PREPARE_REJECTED, token);
+        }
+    }
+    *token = candidate->token;
+    gPreparedSrProvider = std::move(candidate);
+    return MCDR_SR_PREPARE_READY;
+}
+
+int32_t srCommitPreparedProvider(uint64_t token) {
+    if (gPreparedSrProvider == nullptr || gPreparedSrProvider->token != token) return -1;
+    if (currentQueueFenceValue() != gPreparedSrProvider->completedQueueSubmission) {
+        gSrNote = "SR preparation became stale after a queue submission";
+        return 0;
+    }
+    auto prepared = std::move(gPreparedSrProvider);
+    if (prepared->dlssCandidate != nullptr) {
+        void* retiredDlss = nullptr;
+        mcdr_dlss_commit_sr(prepared->dlssCandidate, &retiredDlss);
+        prepared->dlssCandidate = nullptr;
+        if (retiredDlss != nullptr && mcdr_dlss_abort_sr(retiredDlss) != 1)
+            gRetiredDlssPreparations.push_back(retiredDlss);
+    }
+    auto retired = std::move(gSrProvider);
+    gSrProvider = std::move(prepared->provider);
+    gSrActive = prepared->backend;
+    gSrPicked = prepared->backend;
+    gSrCreationSignature = {
+        prepared->backend,
+        prepared->description.renderWidth,
+        prepared->description.renderHeight,
+        prepared->description.displayWidth,
+        prepared->description.displayHeight,
+    };
+    if (retired != nullptr) retired->shutdown();
+    gSrNote.clear();
+    return 1;
+}
+
+int32_t srAbortPreparedProvider(uint64_t token) {
+    if (gPreparedSrProvider == nullptr || gPreparedSrProvider->token != token) return -1;
+    gPreparedSrProvider->abandoned = true;
+    if (!retirePreparedSrProvider(*gPreparedSrProvider)) return 0;
+    gPreparedSrProvider.reset();
     return 1;
 }
 
 int32_t srEvaluateFrame(CommandContext* ctx, const mcdr_sr_dispatch& desc) {
-    if (ctx == nullptr) {
+    if (gPreparedSrProvider != nullptr && !gPreparedSrProvider->abandoned) {
+        gSrNote = "SR evaluation is blocked by a pending preparation";
+        return -1;
+    }
+    if (!std::isfinite(desc.preExposure) || desc.preExposure < 0.0f ||
+        (desc.preExposure > 0.0f && !std::isfinite(1.0f / desc.preExposure))) {
+        gSrNote = "srEvaluateFrame: invalid preExposure";
+        return -1;
+    }
+    if (ctx == nullptr || !ctx->listOpen || ctx->commandList == nullptr) {
+        gSrNote = "srEvaluateFrame: command list is not open";
         return -1;
     }
     int32_t backendId = static_cast<int32_t>(desc.backend);
@@ -367,13 +632,17 @@ int32_t srEvaluateFrame(CommandContext* ctx, const mcdr_sr_dispatch& desc) {
         backendId = gSrPicked;
     }
     if (!validBackend(backendId)) {
+        gSrNote = "srEvaluateFrame: invalid backend " + std::to_string(backendId);
         return -1;
     }
     if (backendId == MCDR_SR_BACKEND_NONE) {
         return 0;  // 明确关掉：安静跳过
     }
     if (!ensureProvider(ctx, backendId, desc)) {
-        return 0;  // 不可用 / 未实现：由 SrQuery / SrQueryCaps 报原因
+        if (gSrNote.empty()) gSrNote = std::string(nameOf(backendId)) + " initialize failed";
+        dbgLogError("srEvaluateFrame: selected backend=%s initialization failed: %s",
+                    nameOf(backendId), gSrNote.c_str());
+        return -1;
     }
     // P284：给 PIX / RenderDoc 一个可读的区间名 —— 抓帧时能直接看到"这一帧的升采样是
     // 哪家后端、从多大升到多大"，不用去翻日志对时间戳。`BeginEvent` / `EndEvent` 只在
@@ -382,6 +651,7 @@ int32_t srEvaluateFrame(CommandContext* ctx, const mcdr_sr_dispatch& desc) {
     swprintf_s(eventName, L"SR:%hs %dx%d->%dx%d", nameOf(backendId), desc.renderWidth,
                desc.renderHeight, desc.displayWidth, desc.displayHeight);
     ctx->commandList->BeginEvent(0, eventName, static_cast<UINT>(wcslen(eventName)));
+    if (desc.pExposure) retainObjectForRecording(ctx, desc.pExposure);
     const bool ok = gSrProvider->evaluate(ctx, desc);
     ctx->commandList->EndEvent();
     gSrLastRenderWidth = desc.renderWidth;
@@ -396,6 +666,11 @@ int32_t srEvaluateFrame(CommandContext* ctx, const mcdr_sr_dispatch& desc) {
     } else {
         ++gSrEvalFail;
         gSrNote.assign(nameOf(backendId)).append(" evaluate failed");
+        const std::string problem = gSrProvider->failureText();
+        if (!problem.empty()) gSrNote.append(": ").append(problem);
+        dbgLogError("srEvaluateFrame: selected backend=%s evaluate failed render=%dx%d display=%dx%d: %s",
+                    nameOf(backendId), desc.renderWidth, desc.renderHeight,
+                    desc.displayWidth, desc.displayHeight, gSrNote.c_str());
     }
     // P273：无论成败都把主描述符堆绑回来。三个厂商 SDK 的 Evaluate 内部都可能
     // SetDescriptorHeaps（Streamline 的 evaluate 就是典型），而堆绑定是命令列表级状态、
@@ -403,15 +678,14 @@ int32_t srEvaluateFrame(CommandContext* ctx, const mcdr_sr_dispatch& desc) {
     // "descriptor heap containing handle is different from currently set descriptor heap"。
     restoreDrawHeap(ctx);
     if (!ok) {
-        return 0;
+        return -1;
     }
     gSrActive = backendId;
-    // P305b：包装型帧后端的输入 tag 必须落在**这一帧的命令列表**上（XeSS 的
-    // `TagFrameResource(cmdList, presentId, …)`、FSR 的 `InterpolationCommandListDX12` 都是
-    // 这个时机），而不是 Present 前后。DLSS-G 不覆写这个钩子 —— 它在 `d3d12_dlss.cpp` 里
-    // 自己用同一次 `slSetTagForFrame` 交 tag，所以这里对它是一次空调用。
-    fgTagFrameInputs(fgMakeFrameInputs(ctx, desc));
     return 1;
+}
+
+std::string srLastFailureText() {
+    return gSrNote;
 }
 
 // P274：相位长度由后端回答，而不是让上层写死一个常数。
@@ -446,7 +720,14 @@ int32_t srJitterPhaseCount(int32_t backendId, int32_t renderWidth, int32_t displ
     return 0;
 }
 
-void srReleaseProvider(void) {
+bool srReleaseProvider(void) {
+    if (gPreparedSrProvider != nullptr) {
+        if (srAbortPreparedProvider(gPreparedSrProvider->token) != 1) return false;
+    }
+    for (auto retired = gRetiredDlssPreparations.begin(); retired != gRetiredDlssPreparations.end();) {
+        if (mcdr_dlss_abort_sr(*retired) == 1) retired = gRetiredDlssPreparations.erase(retired);
+        else return false;
+    }
     if (gSrProvider != nullptr) {
         // 这条路径没有命令上下文可等（ABI 的 `mcdr_dx12SrDestroy` 就是这么调的），所以改用
         // 队列级栅栏：等"此刻已经提交的全部工作"退役。它覆盖的正是"上一帧提交的命令列表还
@@ -455,13 +736,17 @@ void srReleaseProvider(void) {
         if (queueValue > 0) {
             const auto waited = waitForQueueFenceValue(queueValue, 5'000'000'000ULL);
             if (!waited.has_value()) {
-                dbgLogWarn("the queue did not retire in time, releasing the SR provider anyway");
+                dbgLogWarn("SR release: queue fence timed out");
+                return false;
             }
         }
         gSrProvider->shutdown();
         gSrProvider.reset();
+        gSrCreationSignature = {};
     }
     gSrActive = MCDR_SR_BACKEND_NONE;
+    gSrPicked = MCDR_SR_BACKEND_NONE;
+    return true;
 }
 
 // P280：要销毁 provider 时先等上一帧的提交落地。
@@ -473,19 +758,22 @@ void srReleaseProvider(void) {
 //
 // 只等 `ctx->fenceValue`、不等 `+1`：切换发生在帧内（命令列表可能已经打开），本帧的提交
 // 还没发生，等 `+1` 等于等一个永远不会被 Signal 的值（走满超时才返回）。
-void releaseProviderWithWait(CommandContext* ctx) {
+bool releaseProviderWithWait(CommandContext* ctx) {
     if (gSrProvider == nullptr) {
-        return;
+        return true;
     }
     if (ctx != nullptr && ctx->fenceValue > 0) {
         const auto waited = waitForFenceValue(ctx, ctx->fenceValue, 5'000'000'000ULL);
         if (!waited.has_value()) {
-            dbgLogWarn("the previous frame did not retire in time, releasing the SR provider anyway");
+            dbgLogWarn("SR release: command fence timed out");
+            return false;
         }
     }
     gSrProvider->shutdown();
     gSrProvider.reset();
     gSrActive = MCDR_SR_BACKEND_NONE;
+    gSrCreationSignature = {};
+    return true;
 }
 
 // P284：一行诊断文本。这一行的读者是"怀疑升采样没在跑"的人，所以四件事都要能读到：

@@ -20,6 +20,7 @@
 module;
 
 #include "_d3d12_module_prelude.h"
+#include <algorithm>
 
 // mcdr_fg_caps / mcdr_fg_dispatch / MCDR_FG_* 与 MCDR_FG_LATENCY_* 都在这里。必须放在全局
 // 模块片段：模块 purview 内文本包含头文件会触发 C5244，本项目 /WX 直接失败。
@@ -117,9 +118,8 @@ void* xellContext(ID3D12Device* device)
 }
 constexpr bool kWrapWired = true;
 // P305s：告诉 SDK 我们的真实输入语义 —— 深度是 reverse-Z（GREATER_THAN_OR_EQUAL、清 0 = 远），
-// MV 含 jitter（与 DLSS 侧同时置 MVJittered + motionVectorJitterCancellation 一致）。
 // 头文件要求 `BuildPipelines` 的 initFlags "must be identical" 到初始化用的值，所以只留一个常量。
-constexpr uint32_t kInitFlags = XEFG_SWAPCHAIN_INIT_FLAG_INVERTED_DEPTH | XEFG_SWAPCHAIN_INIT_FLAG_JITTERED_MV;
+constexpr uint32_t kInitFlags = XEFG_SWAPCHAIN_INIT_FLAG_INVERTED_DEPTH;
 
 // P305ae：逐帧 tag 已接通（presentId / 五资源 / 帧常量 / UI 合成 / enabled+插帧数），
 // 加上链所有权（计数=1）修好，这一位可以翻 true —— 包装失败的原因会由 caps 的 note 说清。
@@ -308,6 +308,13 @@ int32_t loadLocked(XessFgRuntime& rt) {
         rt.problem = "libxess_fg.dll missing entry points";
         return 0;
     }
+    xefg_swapchain_version_t version{};
+    if (!api.getVersion || api.getVersion(&version) != XEFG_SWAPCHAIN_RESULT_SUCCESS) {
+        rt.problem = "XeSS-FG runtime version unavailable";
+        return 0;
+    }
+    dbgLogInfo("xess-fg: runtime=%u.%u.%u display guides; HIGH_RES_MV is deprecated",
+        version.major, version.minor, version.patch);
     return 1;
 }
 
@@ -335,6 +342,7 @@ public:
     }
 
     void frameStart() override {
+        taggedThisFrame_ = false;
         // P305ah：XeLL 的帧首序列。语义与官方 sample 的 `OnSleep()` 同一位置（一帧开始、
         // 还没采输入/记命令之前）。`xell_developer_guide_english.md:296-300` 是硬顺序：
         //   "`xellSleep` must be the first XeLL API function called with a newly assigned
@@ -345,7 +353,7 @@ public:
         // 我们把模拟段压成零长：这个钩子挂在 `acquireSurface`（tick 已经跑完、渲染还没开始），
         // 真正的模拟段在 JVM 侧，native 拿不到它的起止。零长只是让 XeLL 的模拟耗时估计偏低，
         // 不影响协议正确性 —— 四个阶段 marker 每个帧都齐。
-        if (handle_ == nullptr || xell_ == nullptr || mode_ == 0) {
+        if (handle_ == nullptr || xell_ == nullptr || desiredMode_ == 0) {
             return;
         }
         if (markerOpen_) {
@@ -362,14 +370,24 @@ public:
         noteMarker(XELL_RENDERSUBMIT_START, frameId_, "RENDERSUBMIT_START");
     }
 
+    void discardFrameInputs() override {
+        taggedThisFrame_ = false;
+        historyAccepted_ = false;
+        hasConstants_ = false;
+        if (handle_ && api_.setEnabled && appliedMode_ != 0 &&
+            api_.setEnabled(handle_, 0u) == XEFG_SWAPCHAIN_RESULT_SUCCESS) appliedMode_ = 0;
+    }
+
     void beforePresent() override {
         // 期望值 → 生效值。`desc.numFrames` 在 ABI 里是**额外帧数**（`FrameGeneration.kt` 的
         // `nativeFrames()`：1 = 多插 1 张 = 2x），跟 XeSS 的"插几帧"是同一个口径，不用换算。
         // 每次 Present 前重算（设置线程随时可能改），真正的 SDK 下发在 tagFrameInputs ——
         // 那里才知道链还在、命令列表可用。
-        if (desiredMode_ <= 0) {
+        if (desiredMode_ <= 0 || !taggedThisFrame_) {
             mode_ = 0;
             frames_ = 0;
+            if (handle_ && api_.setEnabled && appliedMode_ != 0 &&
+                api_.setEnabled(handle_, 0u) == XEFG_SWAPCHAIN_RESULT_SUCCESS) appliedMode_ = 0;
             return;
         }
         mode_ = 1;
@@ -394,6 +412,8 @@ public:
     }
 
     void afterPresent() override {
+        historyAccepted_ = false;
+        taggedThisFrame_ = false;
         // P305ah：PRESENT_END 先发 —— 它在语义上属于上一次 Present，与下面的状态读取无关，
         // 不能因为读状态失败就把它漏掉（guide :255 的调用点在 Present 之后紧邻）。
         if (xell_ != nullptr && markerOpen_) {
@@ -417,6 +437,8 @@ public:
             return;
         }
         presented_ = status.framesPresented > 0 ? static_cast<int32_t>(status.framesPresented) : 1;
+        historyAccepted_ = mode_ != 0 && status.isFrameGenEnabled != 0 &&
+            status.frameGenResult == XEFG_SWAPCHAIN_RESULT_SUCCESS;
         // P306z：XeSS-FG 没有"成功"日志，SDK 只在状态里回答"到底开没开"。每 300 帧留一行，
         // 这是判断"tag 都通了但 SDK 仍 disabled"的唯一入口。
         if (++statusPolls_ % 300 == 0) {
@@ -440,6 +462,7 @@ public:
     }
 
     int32_t presented() const override { return presented_; }
+    bool historyAcceptedAfterPresent() const override { return historyAccepted_; }
 
     void onResize(int32_t displayWidth, int32_t displayHeight) override {
         // 链重建后必须重新 InitFromSwapChain（P305）：XeSS-FG 的 context 绑在链上，
@@ -548,8 +571,14 @@ void dumpInfoQueue(ID3D12Device* device, const char* tag)
 
         xefg_swapchain_handle_t handle = nullptr;
         xefg_swapchain_result_t result = api.createContext(device, &handle);
+        // Adopt any returned context before later fallible initialization. A
+        // failed cleanup must remain reachable for checked teardown/retry.
+        handle_ = handle;
+        api_ = api;
+        handleInitialized_ = false;
         if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS || handle == nullptr) {
             dbgLogWarn("xess-fg: CreateContext failed result=0x%X", static_cast<unsigned>(result));
+            (void)tryUnwrapSwapChain();
             return 0;
         }
         // blocking=1：pipeline 编译完再往下走。非阻塞会把等待挪到 initFromSwapChain，
@@ -557,7 +586,7 @@ void dumpInfoQueue(ID3D12Device* device, const char* tag)
         result = api.buildPipelines(handle, nullptr, 1, kInitFlags);
         if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS) {
             dbgLogWarn("xess-fg: BuildPipelines failed result=0x%X", static_cast<unsigned>(result));
-            api.destroy(handle);
+            (void)tryUnwrapSwapChain();
             return 0;
         }
 
@@ -667,7 +696,7 @@ void dumpInfoQueue(ID3D12Device* device, const char* tag)
         if (latency != XEFG_SWAPCHAIN_RESULT_SUCCESS)
         {
             dbgLogWarn("xess-fg: SetLatencyReduction failed result=0x%X", static_cast<unsigned>(latency));
-            api.destroy(handle);
+            (void)tryUnwrapSwapChain();
             return 0;
         }
     }
@@ -677,16 +706,17 @@ void dumpInfoQueue(ID3D12Device* device, const char* tag)
     {
         dbgLogWarn("xess-fg: InitFromSwapChain failed result=0x%X", static_cast<unsigned>(result));
         dumpInfoQueue(device, "init");
-        api.destroy(handle);
+        (void)tryUnwrapSwapChain();
         return 0;
     }
+    handleInitialized_ = true;
 
     void* presentChain = nullptr;
     result = api.getSwapChainPtr(handle, __uuidof(IDXGISwapChain4), &presentChain);
     if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS || presentChain == nullptr)
     {
         dbgLogWarn("xess-fg: GetSwapChainPtr failed result=0x%X", static_cast<unsigned>(result));
-        api.destroy(handle);
+        (void)tryUnwrapSwapChain();
         return 0;
     }
 
@@ -732,31 +762,73 @@ void dumpInfoQueue(ID3D12Device* device, const char* tag)
         hasConstants_ = true;
     }
 
-    void setUiTexture(void* object) override {
+    void setUiTexture(void* object, std::shared_ptr<void> lease = {}) override {
         // P305c：用户裁决 = GUI 合成目标当 UI 纹理（XeSS 的 uiMode 用 HUDLESS_UITEXTURE）。
         // 逐帧 `TagFrameResource(type=UI)` 在 tagFrameInputs 里；第一次拿到纹理时顺带把
         // `SetUiCompositionState(ENABLED)` 打开（init 的 uiMode 只是声明，状态初始是 DISABLED）。
-        uiTexture_ = object;
+        uiTextureHold_ = static_cast<ID3D12Resource*>(object);
+        uiLease_ = std::move(lease);
+        uiTexture_ = uiTextureHold_.Get();
+        if (uiTexture_ == nullptr && uiEnabled_ && handle_ && api_.setUiCompositionState) {
+            const auto result = api_.setUiCompositionState(handle_, XEFG_SWAPCHAIN_UI_COMPOSITION_STATE_DISABLED);
+            if (result == XEFG_SWAPCHAIN_RESULT_SUCCESS) uiEnabled_ = false;
+        }
     }
 
-    void tagFrameInputs(const FgFrameInputs& in) override {
+    FgInputAcceptance tagFrameInputs(const FgFrameInputs& in) override {
+        taggedThisFrame_ = false;
+        historyAccepted_ = false;
+        if (desiredMode_ <= 0) return FgInputAcceptance::Skipped;
+        if (!api_.setPresentId || !api_.tagFrameConstants || !api_.tagFrameResource ||
+            !api_.setEnabled || !api_.setNumInterpolatedFrames || !api_.setUiCompositionState || !hasConstants_) {
+            return FgInputAcceptance::Failed;
+        }
         // 逐帧 tag 的完整序列（顺序不能颠倒，P305 那次 0xC0000409 就是"包装了但一步没做"）：
         //   1) SetPresentId（严格 +1，跳号会被 SDK 静默丢帧）+ 帧常量；
         //   2) 四个资源各一条 TagFrameResource（HUDless 颜色 / 深度 / MV / UI）；
         //   3) UI 合成开关（第一次拿到 UI 纹理时一次）；
         //   4) SetEnabled / SetNumInterpolatedFrames（只在生效值变化时）。
         ++tagCalls_;
-        if (handle_ == nullptr || in.cmdList == nullptr) {
-            return;
+        if (handle_ == nullptr || in.cmdList == nullptr || !in.resourceLease) {
+            return FgInputAcceptance::Failed;
         }
+        struct DisableRejectedFrame {
+            XessFgFrameGenProvider* provider;
+            bool accepted = false;
+            ~DisableRejectedFrame() {
+                if (!accepted && provider->api_.setEnabled(provider->handle_, 0u) == XEFG_SWAPCHAIN_RESULT_SUCCESS)
+                    provider->appliedMode_ = 0;
+            }
+        } rejection{this};
+        auto* ctx = static_cast<CommandContext*>(recordingContextForCommandList(in.cmdList));
+        if (ctx == nullptr) return FgInputAcceptance::Failed;
+        if (!in.pDepth || !in.pMotionVectors || !in.pUi || !in.motionVectorsDilated ||
+            in.renderWidth != in.displayWidth || in.renderHeight != in.displayHeight ||
+            in.displayWidth <= 0 || in.displayHeight <= 0 || (kTagHudless && !in.pColorOutput)) {
+            if (api_.setEnabled(handle_, 0u) == XEFG_SWAPCHAIN_RESULT_SUCCESS) appliedMode_ = 0;
+            return FgInputAcceptance::Failed;
+        }
+        for (void* resource : {in.pDepth, in.pMotionVectors, in.pColorOutput, in.pUi}) {
+            const auto description = static_cast<ID3D12Resource*>(resource)->GetDesc();
+            if (description.Width != static_cast<uint32_t>(in.displayWidth) ||
+                description.Height != static_cast<uint32_t>(in.displayHeight)) {
+                if (api_.setEnabled(handle_, 0u) == XEFG_SWAPCHAIN_RESULT_SUCCESS) appliedMode_ = 0;
+                return FgInputAcceptance::Failed;
+            }
+        }
+        mode_ = desiredMode_ > 0 ? 1 : 0;
+        frames_ = (std::min)((std::max)(desiredFrames_, 1), (std::max)(maxInterp_, 1));
         // P305d：四步顺序不能颠倒（P305 那次 0xC0000409 就是"包装了但一步没做"）。
         // 1) presentId 严格 +1 —— 跳号会被 SDK 静默丢帧。
         // P305ah：present id 与 XeLL marker 共用一个帧号，由 frameStart() 推进（guide :240）。
         // 这里不再自增：自增会让 marker 的 id 比 present 的 id 慢一帧，XeLL 侧的延迟窗口就
-        // 永远对不上。frameId_ == 0 只可能出现在 frameStart 没被调用的路径上，退回自增保底。
-        const uint32_t presentId = frameId_ != 0 ? frameId_ : ++presentId_;
+        // 永远对不上。
+        if (frameId_ == 0 || !markerOpen_) return FgInputAcceptance::Failed;
+        const uint32_t presentId = frameId_;
         presentId_ = presentId;
-        api_.setPresentId(handle_, presentId);
+        if (api_.setPresentId(handle_, presentId) != XEFG_SWAPCHAIN_RESULT_SUCCESS) {
+            return FgInputAcceptance::Failed;
+        }
             // xefgSwapChainTagFrameConstants 是必需输入（文档 :678-681）；presentId 必须与
             // 下面 TagFrameResource 用同一个，否则 SDK 会把常量算到另一帧上。
             if (api_.tagFrameConstants != nullptr && hasConstants_)
@@ -773,18 +845,19 @@ void dumpInfoQueue(ID3D12Device* device, const char* tag)
                 frameConstants.motionVectorScaleY = constants_.mvScaleY;
                 frameConstants.resetHistory = constants_.resetHistory != 0 ? 1u : 0u;
                 frameConstants.frameRenderTime = constants_.frameRenderTime;
-                api_.tagFrameConstants(handle_, presentId, &frameConstants);
+                if (api_.tagFrameConstants(handle_, presentId, &frameConstants) !=
+                    XEFG_SWAPCHAIN_RESULT_SUCCESS) return FgInputAcceptance::Failed;
             }
         // 2) 四个资源各一条 tag。incomingState 必须是调用方给的**当前真实**状态：
         //    SDK 会按它记录屏障，写错就会让资源实际状态与调用方的跟踪表错位。
         //    没有 BACKBUFFER 那条：`xess_fg_developer_guide_english.md:980` 说明它只在
         //    letterboxing（部分区域插帧）时用来定义插帧矩形，并且"其它字段被忽略"；官方
         //    sample 正常路径也只 tag HUDLESS/MV/DEPTH 三条（`basic_sample.cpp:1266-1329`）。
-        // `lazy = true` → `RV_UNTIL_NEXT_PRESENT` 且不传命令列表：SDK 在 Present 时自己拷贝。
-        // 官方 sample 只对 HUDLESS_COLOR 用这种（`basic_sample.cpp:1266-1290`），并注明
-        // "the SDK copies the texture at present time"。其余资源（MV/深度）用 RV_ONLY_NOW。
-        auto tagResource = [&](xefg_swapchain_resource_type_t type, void* resource, D3D12_RESOURCE_STATES state,
-                               bool lazy = false) {
+        // XeSS guide Resource Tagging (701-768): ONLY_NOW records the SDK-owned
+        // copy on this list and transitions from/to incomingState. Thus source
+        // leases retire with the actual caller submission, never with Present.
+        bool tagsOk = true;
+        auto tagResource = [&](xefg_swapchain_resource_type_t type, void* resource, D3D12_RESOURCE_STATES initial) {
             if (api_.tagFrameResource == nullptr) {
                 return;
             }
@@ -793,8 +866,12 @@ void dumpInfoQueue(ID3D12Device* device, const char* tag)
             }
             xefg_swapchain_d3d12_resource_data_t data{};
             data.type = type;
-            data.validity = lazy ? XEFG_SWAPCHAIN_RV_UNTIL_NEXT_PRESENT : XEFG_SWAPCHAIN_RV_ONLY_NOW;
+            data.validity = XEFG_SWAPCHAIN_RV_ONLY_NOW;
             data.pResource = static_cast<ID3D12Resource*>(resource);
+            // Normalize split tracking before handing the whole resource to SDK.
+            // Preserve the caller's state; XeSS restores this same state itself.
+            const auto state = static_cast<D3D12_RESOURCE_STATES>(resourceSubresourceState(ctx, resource, 0, initial));
+            transitionTo(ctx, data.pResource, initial, state);
             data.incomingState = state;
             // P305aj：`resourceSize` 必须显式给。结构体注释是 "Valid extent of the resource"，
             // 全零在 SDK 眼里是 0x0 的合法区域 —— 它按这个尺寸分配/拷贝就会失败（实测：
@@ -803,27 +880,24 @@ void dumpInfoQueue(ID3D12Device* device, const char* tag)
             // `resourceSize = {desc.Width, desc.Height}`（`basic_sample.cpp:1296-1301`）。
             // 约束（guide Resource Tagging）：HUDLESS / UI / back buffer 同尺寸；
             // MV 与 depth 同尺寸 —— 两边各自取整条资源即可。
-            const D3D12_RESOURCE_DESC desc =
-                static_cast<ID3D12Resource*>(resource)->GetDesc();
             data.resourceBase = {0, 0};
-            data.resourceSize = {static_cast<uint32_t>(desc.Width), desc.Height};
-            const xefg_swapchain_result_t tagged = api_.tagFrameResource(handle_, lazy ? nullptr : in.cmdList, presentId, &data);
-            if (tagged != XEFG_SWAPCHAIN_RESULT_SUCCESS && !tagFailLogged_) {
-                tagFailLogged_ = true;
-                dbgLogWarn("xess-fg: TagFrameResource(type=%d) failed result=0x%X",
-                           static_cast<int>(type), static_cast<unsigned>(tagged));
+            data.resourceSize = {static_cast<uint32_t>(in.displayWidth), static_cast<uint32_t>(in.displayHeight)};
+            const xefg_swapchain_result_t tagged = api_.tagFrameResource(handle_, in.cmdList, presentId, &data);
+            if (tagged != XEFG_SWAPCHAIN_RESULT_SUCCESS) {
+                tagsOk = false;
+                if (!tagFailLogged_) {
+                    tagFailLogged_ = true;
+                    dbgLogWarn("xess-fg: TagFrameResource(type=%d) failed result=0x%X",
+                               static_cast<int>(type), static_cast<unsigned>(tagged));
+                }
             }
         };
         // 深度直接用调用方给的真实资源：P305an 那条 D32_FLOAT 探针已经证伪（换格式后 -14 仍在），
         // 而且它 tag 的是一张从未写入的深度，语义上就是错的 —— 已删除，避免它成为新的崩溃点。
         tagResource(XEFG_SWAPCHAIN_RES_DEPTH, in.pDepth, in.depthState);
         tagResource(XEFG_SWAPCHAIN_RES_MOTION_VECTOR, in.pMotionVectors, in.motionVectorState);
-        // 世界层 = 无 HUD 的那一帧，就是 SR 的输出（P213 的 HUDless 约定同此）。
-        // HUDLESS 用懒拷贝（sample 的写法）：给 SDK 一个"Present 时再拷"的句柄，避免在这一帧
-        // 的渲染列表里插拷贝；这条也是 P305an 的单变量实验 —— 之前四条全是 RV_ONLY_NOW。
-        // P305ao：默认不发这条（见 `kTagHudless` 的说明），只保留最小契约。
         if (kTagHudless) {
-            tagResource(XEFG_SWAPCHAIN_RES_HUDLESS_COLOR, in.pColorOutput, in.colorState, /*lazy=*/true);
+            tagResource(XEFG_SWAPCHAIN_RES_HUDLESS_COLOR, in.pColorOutput, in.colorState);
         }
         // UI 合成状态：init 的 `uiMode` 只是"打算这么合成"的声明，合成开关本身初始是
         // DISABLED（`xefg_swapchain.h:495-511`），必须显式打开，否则 tag 的 UI 纹理不参与合成，
@@ -834,9 +908,16 @@ void dumpInfoQueue(ID3D12Device* device, const char* tag)
             uiEnabled_ = (ui == XEFG_SWAPCHAIN_RESULT_SUCCESS);
             dbgLogInfo("xess-fg: UI composition %s (result=0x%X texture=%p)",
                        uiEnabled_ ? "enabled" : "rejected", static_cast<unsigned>(ui), uiTexture_);
+            if (!uiEnabled_) return FgInputAcceptance::Failed;
         }
+        if (!uiEnabled_) return FgInputAcceptance::Failed;
         // UI 纹理 = GUI 合成目标（用户 2026-10-27 裁决，见 P305c）。
-        tagResource(XEFG_SWAPCHAIN_RES_UI, uiTexture_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        tagResource(XEFG_SWAPCHAIN_RES_UI, in.pUi, in.uiState);
+        if (!tagsOk) {
+            taggedThisFrame_ = false;
+            if (api_.setEnabled(handle_, 0u) == XEFG_SWAPCHAIN_RESULT_SUCCESS) appliedMode_ = 0;
+            return FgInputAcceptance::Failed;
+        }
         // 3) 描述符堆：只有 `initFlags` 里要了 `XEFG_SWAPCHAIN_INIT_FLAG_EXTERNAL_DESCRIPTOR_HEAP`
         //    时才需要 `setDescriptorHeap` 交外部堆。我们建链时没要（initFlags=0），SDK 自管它的堆，
         //    所以这里不调 —— 免得拿一个它不认识的偏移去绑。
@@ -845,23 +926,27 @@ void dumpInfoQueue(ID3D12Device* device, const char* tag)
         if (appliedMode_ != mode_) {
             const xefg_swapchain_result_t on =
                 api_.setEnabled(handle_, mode_ != 0 ? 1u : 0u);
-            appliedMode_ = mode_;
+            if (on == XEFG_SWAPCHAIN_RESULT_SUCCESS) appliedMode_ = mode_;
             // P306y：这个返回值以前被直接丢掉，于是"包装成功、SDK 却一直报 disabled"只能在
             // afterPresent 的 warn 里看到结果、看不到原因。
             if (on != XEFG_SWAPCHAIN_RESULT_SUCCESS) {
                 dbgLogWarn("xess-fg: SetEnabled(%d) failed result=0x%X",
                            mode_ != 0 ? 1 : 0, static_cast<unsigned>(on));
+                return FgInputAcceptance::Failed;
             }
         }
         if (mode_ != 0 && appliedFrames_ != frames_) {
             const xefg_swapchain_result_t nf =
                 api_.setNumInterpolatedFrames(handle_, static_cast<uint32_t>(frames_ < 1 ? 1 : frames_));
-            appliedFrames_ = frames_;
+            if (nf == XEFG_SWAPCHAIN_RESULT_SUCCESS) appliedFrames_ = frames_;
             if (nf != XEFG_SWAPCHAIN_RESULT_SUCCESS) {
                 dbgLogWarn("xess-fg: SetNumInterpolatedFrames(%d) failed result=0x%X",
                            frames_, static_cast<unsigned>(nf));
+                return FgInputAcceptance::Failed;
             }
         }
+        taggedThisFrame_ = true;
+        rejection.accepted = true;
         if (tagCalls_ == 1) {
             dbgLogInfo("xess-fg: tagging through the wrapped chain cmdList=%p color=%p depth=%p "
                        "mv=%p ui=%p mode=%d frames=%d",
@@ -869,27 +954,37 @@ void dumpInfoQueue(ID3D12Device* device, const char* tag)
                        static_cast<const void*>(in.pColorOutput), static_cast<const void*>(in.pDepth),
                        static_cast<const void*>(in.pMotionVectors), uiTexture_, mode_, frames_);
         }
+        return FgInputAcceptance::Accepted;
     }
 
     void unwrapSwapChain() override {
+        (void)tryUnwrapSwapChain();
+    }
+
+    bool tryUnwrapSwapChain() override {
         if (handle_ == nullptr) {
-            return;
+            return true;
         }
-        // P305ae：销毁前先放掉自己这边的引用，别让 SDK 看到"引用计数 ≠ 0"。
-        // 这里能放的只有 UI 纹理（GUI 合成目标的借用指针，不是我们的所有权），真正的
-        // 交换链引用在 surface 侧 —— 调用点必须在进这里之前 `swapChain.Reset()` +
-        // `backBuffers.clear()`（见 `rebuildSwapChainForFg` / `configureSurface` 的注释）。
-        uiTexture_ = nullptr;
+        // Surface releases swap-chain references first. UI ownership survives a
+        // failed Destroy; no context/lease is discarded on an SDK error.
+        if (api_.destroy == nullptr) return false;
+        if (handleInitialized_ && api_.setEnabled != nullptr &&
+            api_.setEnabled(handle_, 0u) != XEFG_SWAPCHAIN_RESULT_SUCCESS) return false;
+        const auto destroyed = api_.destroy(handle_);
+        if (destroyed != XEFG_SWAPCHAIN_RESULT_SUCCESS) {
+            dbgLogWarn("xess-fg: Destroy failed result=0x%X; keeping context and leases",
+                       static_cast<unsigned>(destroyed));
+            return false;
+        }
         uiEnabled_ = false;
-        if (api_.destroy != nullptr) {
-            api_.destroy(handle_);
-        }
         handle_ = nullptr;
+        handleInitialized_ = false;
         api_ = XessFgApi{};
         contextReady().store(false);
         maxInterpMirror().store(0);
         maxInterp_ = 0;
         dbgLogInfo("xess-fg: released the wrapped chain");
+        return true;
     }
 
 private:
@@ -928,6 +1023,7 @@ private:
     }
 
     xefg_swapchain_handle_t handle_ = nullptr;
+    bool handleInitialized_ = false;
     // P305an（诊断开关）：-14 INCORRECT_INPUT_RESOURCES 在 HUDless/MV/深度三条资源里到底
     // 是哪条"不对"，光看格式与尺寸已经排除不掉 —— 真实深度是 R32_TYPELESS（P76f 要求如此，
     // 否则它不能被采样），而 SDK 文档只承诺支持 D32_FLOAT / D24_UNORM 这类**有类型**的深度。
@@ -944,6 +1040,8 @@ private:
     int32_t frames_ = 1;
     int32_t maxInterp_ = 0;          // init 时 SDK 报的最大插帧数（P305ae）
     bool uiEnabled_ = false;         // SetUiCompositionState(ENABLED) 是否已成功下发
+    bool taggedThisFrame_ = false;
+    bool historyAccepted_ = false;
     bool tagFailLogged_ = false;
     bool notedDisabled_ = false;
     int32_t presentStatusFails_ = 0;
@@ -952,6 +1050,8 @@ private:
     int32_t appliedMode_ = -1;
     int32_t appliedFrames_ = -1;
     void* uiTexture_ = nullptr;
+    ComPtr<ID3D12Resource> uiTextureHold_;
+    std::shared_ptr<void> uiLease_;
     mcdr_fg_constants constants_ = {};
     bool hasConstants_ = false;
     XessFgApi api_{};

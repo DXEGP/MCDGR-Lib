@@ -293,7 +293,10 @@ void MCDR_CALL mcdr_dx12PresentSurface(mcdr_surface* surface) {
                               static_cast<void*>(surface));
         return;
     }
-    presentSurface(surface);
+    auto ticket = surface ? surface->frameGenerationTicket : FgPresentTicket{};
+    if (ticket.serial == 0) ticket = fgCurrentDisplayFrameTicket();
+    const auto result = presentSurface(surface, ticket);
+    completeDisplayPresentReceipt(ticket, result, 0, MCDR_PRESENT_RETIREMENT_NOT_REQUIRED);
     // The real result (ok / OCCLUDED / MODE_CHANGED / FAILED) is logged inside
     // presentSurface(); logging "ok" here unconditionally used to mask an
     // OCCLUDED/MODE_CHANGED result, which is what made MC misjudge suboptimal.
@@ -429,7 +432,15 @@ void MCDR_CALL mcdr_dx12SetSwapchainOptions(int32_t allowTearing, int32_t forceP
 // P198: 建链时实际用掉的 HDR 模式（-1 = 还没建过链），JVM 侧据此提示“需要重启”。
 int32_t MCDR_CALL mcdr_dx12GetHdrAppliedMode(void) { return mcdr_hdr_state_applied_mode(); }
 
-void MCDR_CALL mcdr_dx12DestroySurface(mcdr_surface* surface) { destroySurface(surface); }
+int32_t MCDR_CALL mcdr_dx12DestroySurfaceChecked(mcdr_surface* surface) {
+    auto result = destroySurface(surface);
+    if (!result) return mcdr::abi::failWith("mcdr_dx12DestroySurfaceChecked", result.error().message);
+    return 1;
+}
+
+void MCDR_CALL mcdr_dx12DestroySurface(mcdr_surface* surface) {
+    (void)mcdr_dx12DestroySurfaceChecked(surface);
+}
 
 mcdr_surface* MCDR_CALL mcdr_dx12GetActiveSurfaceHandle(void) { return getActiveSurface(); }
 

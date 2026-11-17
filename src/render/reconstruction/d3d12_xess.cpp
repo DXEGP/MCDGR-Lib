@@ -17,11 +17,6 @@
 //   * 深度：reverse-Z → `XESS_INIT_FLAG_INVERTED_DEPTH`。
 //   * MV：渲染分辨率的**像素**位移（D3D12Velocity 已乘 ScreenSize）→ 不置
 //     `XESS_INIT_FLAG_USE_NDC_VELOCITY`，也不置 `HIGH_RES_MV`（MV 与颜色同为渲染尺寸）。
-//   * MV 由 jittered 投影算出 → 置 `XESS_INIT_FLAG_JITTERED_MV`（头文件注释："Remove jitter
-//     from input velocity"），与 DLSS 的 motionVectorJitterCancellation、FSR 的
-//     MOTION_VECTORS_JITTER_CANCELLATION 对称。
-//   * 曝光：v1 不接曝光纹理 → 不置 `XESS_INIT_FLAG_EXPOSURE_SCALE_TEXTURE`，`exposureScale`
-//     按载荷里的 preExposure 直传（0 = 未填按 1）。
 //
 // 失败策略与其余后端一致：每条失败路径最多一行日志并钉住状态，不每帧重试；失败不让帧失败
 // —— 调用方（srEvaluateFrame）退回"没有超分"的老路径。
@@ -39,6 +34,7 @@ module;
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 module mcdr.d3d12.device;
 
@@ -48,6 +44,169 @@ namespace {
 constexpr const char* kXessDll = "libxess.dll";
 // 上限取 8K，与 FSR 一致：再大直接拒绝并报原因，比悄悄建错尺寸的上下文好。
 constexpr int kMaxSide = 8192;
+
+constexpr char kColorShader[] = R"hlsl(
+Texture2D<float4> sourceColor : register(t0);
+cbuffer Conversion : register(b0) { uint operation; };
+struct VertexOutput { float4 position : SV_Position; };
+VertexOutput ColorVertex(uint vertex : SV_VertexID) {
+    VertexOutput result;
+    result.position = float4(vertex == 2 ? 3.0 : -1.0, vertex == 1 ? 3.0 : -1.0, 0.0, 1.0);
+    return result;
+}
+float decodeChannel(float value) {
+    return value <= 0.04045 ? value / 12.92 : pow((value + 0.055) / 1.055, 2.4);
+}
+float encodeChannel(float value) {
+    return value <= 0.0031308 ? value * 12.92 : 1.055 * pow(value, 1.0 / 2.4) - 0.055;
+}
+float4 ColorPixel(VertexOutput input) : SV_Target0 {
+    float4 color = sourceColor.Load(int3(uint2(input.position.xy), 0));
+    color = all(isfinite(color)) ? color : 0.0;
+    color.rgb = max(color.rgb, 0.0);
+    if (operation == 1) color.rgb = float3(decodeChannel(color.r), decodeChannel(color.g), decodeChannel(color.b));
+    if (operation == 2) color.rgb = float3(encodeChannel(color.r), encodeChannel(color.g), encodeChannel(color.b));
+    return color;
+}
+)hlsl";
+
+bool srgbFormat(DXGI_FORMAT format) {
+    return format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+        format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
+}
+
+bool encodedColorFormat(DXGI_FORMAT format) {
+    return srgbFormat(format) || format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+        format == DXGI_FORMAT_B8G8R8A8_UNORM || format == DXGI_FORMAT_B8G8R8X8_UNORM ||
+        format == DXGI_FORMAT_R10G10B10A2_UNORM;
+}
+
+struct ColorConversionPipeline {
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> decode;
+    ComPtr<ID3D12PipelineState> encode;
+    DXGI_FORMAT outputFormat = DXGI_FORMAT_UNKNOWN;
+};
+
+struct ColorConversionSlot {
+    Dx12Object* input = nullptr;
+    Dx12Object* output = nullptr;
+    ComPtr<ID3D12DescriptorHeap> descriptors;
+    uint32_t inputWidth = 0, inputHeight = 0, outputWidth = 0, outputHeight = 0;
+    ~ColorConversionSlot() {
+        if (input) destroyObject(input);
+        if (output) destroyObject(output);
+    }
+};
+
+bool createColorPipeline(ColorConversionPipeline& pipeline, DXGI_FORMAT format) {
+    auto* device = deviceContext().device.Get();
+    D3D12_DESCRIPTOR_RANGE range{};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range.NumDescriptors = 1;
+    D3D12_ROOT_PARAMETER parameters[2]{};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[0].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[0].DescriptorTable.pDescriptorRanges = &range;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[1].Constants.Num32BitValues = 1;
+    D3D12_ROOT_SIGNATURE_DESC root{};
+    root.NumParameters = 2;
+    root.pParameters = parameters;
+    ComPtr<ID3DBlob> serialized, diagnostic;
+    if (FAILED(D3D12SerializeRootSignature(&root, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &diagnostic)) ||
+        FAILED(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&pipeline.root)))) return false;
+    std::vector<uint8_t> vertex, pixel;
+    if (!compileHlslToDxil(kColorShader, "ColorVertex", "vs_6_6", vertex) ||
+        !compileHlslToDxil(kColorShader, "ColorPixel", "ps_6_6", pixel)) return false;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC description{};
+    description.pRootSignature = pipeline.root.Get();
+    description.VS = {vertex.data(), vertex.size()};
+    description.PS = {pixel.data(), pixel.size()};
+    description.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+    description.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_ZERO;
+    description.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+    description.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+    description.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
+    description.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    description.BlendState.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_NOOP;
+    description.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    description.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    description.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    description.DepthStencilState.FrontFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+    description.DepthStencilState.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+    description.DepthStencilState.FrontFace.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+    description.DepthStencilState.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    description.DepthStencilState.BackFace = description.DepthStencilState.FrontFace;
+    description.SampleMask = UINT_MAX;
+    description.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    description.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    description.RasterizerState.DepthClipEnable = TRUE;
+    description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    description.NumRenderTargets = 1;
+    description.SampleDesc.Count = 1;
+    description.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if (FAILED(device->CreateGraphicsPipelineState(&description, IID_PPV_ARGS(&pipeline.decode)))) return false;
+    description.RTVFormats[0] = format;
+    if (FAILED(device->CreateGraphicsPipelineState(&description, IID_PPV_ARGS(&pipeline.encode)))) return false;
+    pipeline.outputFormat = format;
+    return true;
+}
+
+bool initializeColorSlot(ColorConversionSlot& slot, uint32_t width, uint32_t height, uint32_t displayWidth, uint32_t displayHeight) {
+    auto input = createTexture(4 | 8 | 32, 43, static_cast<int>(width), static_cast<int>(height), 1, 1);
+    if (!input) return false;
+    slot.input = static_cast<Dx12Object*>(*input);
+    auto output = createTexture(4 | 8 | 32, 43, static_cast<int>(displayWidth), static_cast<int>(displayHeight), 1, 1);
+    if (!output) return false;
+    slot.output = static_cast<Dx12Object*>(*output);
+    D3D12_DESCRIPTOR_HEAP_DESC description{};
+    description.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    description.NumDescriptors = 2;
+    description.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(deviceContext().device->CreateDescriptorHeap(&description, IID_PPV_ARGS(&slot.descriptors)))) return false;
+    slot.inputWidth = width;
+    slot.inputHeight = height;
+    slot.outputWidth = displayWidth;
+    slot.outputHeight = displayHeight;
+    return true;
+}
+
+bool convertColor(CommandContext* context, ColorConversionPipeline& pipeline, ColorConversionSlot& slot,
+    Dx12Object* source, Dx12Object* target, UINT index, uint32_t operation) {
+    auto targetRtv = acquireTextureRtv(context, target);
+    if (!targetRtv) return false;
+    retainObjectForRecording(context, source);
+    retainObjectForRecording(context, target);
+    transitionTextureTo(context, source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    transitionTextureTo(context, target, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const UINT increment = deviceContext().device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto cpu = slot.descriptors->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += static_cast<SIZE_T>(index) * increment;
+    auto gpu = slot.descriptors->GetGPUDescriptorHandleForHeapStart();
+    gpu.ptr += static_cast<uint64_t>(index) * increment;
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Format = source->dxgiFormat;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Texture2D.MipLevels = 1;
+    deviceContext().device->CreateShaderResourceView(source->resource.Get(), &view, cpu);
+    ID3D12DescriptorHeap* heaps[] = {slot.descriptors.Get()};
+    context->commandList->SetDescriptorHeaps(1, heaps);
+    context->commandList->SetGraphicsRootSignature(pipeline.root.Get());
+    context->commandList->SetPipelineState(index == 0 ? pipeline.decode.Get() : pipeline.encode.Get());
+    context->commandList->SetGraphicsRootDescriptorTable(0, gpu);
+    context->commandList->SetGraphicsRoot32BitConstant(1, operation, 0);
+    const auto description = target->resource->GetDesc();
+    D3D12_VIEWPORT viewport{0, 0, static_cast<float>(description.Width), static_cast<float>(description.Height), 0, 1};
+    D3D12_RECT scissor{0, 0, static_cast<LONG>(description.Width), static_cast<LONG>(description.Height)};
+    context->commandList->RSSetViewports(1, &viewport);
+    context->commandList->RSSetScissorRects(1, &scissor);
+    context->commandList->OMSetRenderTargets(1, &*targetRtv, FALSE, nullptr);
+    context->commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context->commandList->DrawInstanced(3, 1, 0, 0);
+    return true;
+}
 
 // 本模块所在目录。P108 的教训：GetModuleFileNameA(nullptr) 拿到的是宿主 exe（java.exe），
 // 必须用 GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS 问本模块自己。
@@ -76,6 +235,7 @@ struct XessApi {
     decltype(&xessD3D12Execute) execute = nullptr;
     decltype(&xessDestroyContext) destroy = nullptr;
     decltype(&xessGetVersion) getVersion = nullptr;
+    decltype(&xessSetExposureMultiplier) setExposureMultiplier = nullptr;
     decltype(&xessGetOptimalInputResolution) getOptimalInputResolution = nullptr;
     decltype(&xessD3D12BuildPipelines) buildPipelines = nullptr;
     decltype(&xessIsOptimalDriver) isOptimalDriver = nullptr;
@@ -84,7 +244,8 @@ struct XessApi {
 
     bool ready() const {
         return createContext != nullptr && init != nullptr && execute != nullptr &&
-               destroy != nullptr && getVersion != nullptr && getOptimalInputResolution != nullptr;
+               destroy != nullptr && getVersion != nullptr && getOptimalInputResolution != nullptr &&
+               setExposureMultiplier != nullptr;
     }
 };
 
@@ -132,6 +293,8 @@ bool loadLocked(XessRuntime& rt) {
     api.init = reinterpret_cast<decltype(api.init)>(::GetProcAddress(module, "xessD3D12Init"));
     api.execute = reinterpret_cast<decltype(api.execute)>(
         ::GetProcAddress(module, "xessD3D12Execute"));
+    api.setExposureMultiplier = reinterpret_cast<decltype(api.setExposureMultiplier)>(
+        ::GetProcAddress(module, "xessSetExposureMultiplier"));
     api.destroy = reinterpret_cast<decltype(api.destroy)>(
         ::GetProcAddress(module, "xessDestroyContext"));
     api.getVersion = reinterpret_cast<decltype(api.getVersion)>(
@@ -218,7 +381,7 @@ void fillCapsFields(mcdr_sr_caps& out, bool available, const std::string& note) 
     out.backend = MCDR_SR_BACKEND_XESS;
     out.available = available ? 1 : 0;
     out.coupledDenoise = 0;                 // XeSS-SR 不含降噪
-    out.needsExposure = 0;                  // v1 不接曝光纹理（P289）
+    out.needsExposure = 0;
     out.takesMasks = MCDR_SR_MASK_RESPONSIVE; // pResponsivePixelMaskTexture
     out.externalHeap = 1;                   // SDK 原生支持 pTempBufferHeap/pTempTextureHeap（P279 落地）
     out.jitterPhaseCount = 8;
@@ -239,6 +402,8 @@ void fillCapsFields(mcdr_sr_caps& out, bool available, const std::string& note) 
 class XessSrProvider final : public IUpscaleProvider {
 public:
     SrBackendId backend() const override { return SrBackendId::XeSS; }
+
+    std::string failureText() const override { return problem_; }
 
     void fillCaps(mcdr_sr_caps& out) const override {
         std::string why;
@@ -266,6 +431,8 @@ public:
         }
         adoptSizes(seed.renderWidth, seed.renderHeight, seed.displayWidth, seed.displayHeight);
         maskExpected_ = seed.pReactiveMask != nullptr;
+        exposureExpected_ = seed.pExposure != nullptr;
+        hdrInput_ = seed.hdrInput != 0;
         return ensureContext(ctx);
     }
 
@@ -286,14 +453,44 @@ public:
         Dx12Object* motion = asObject(dispatch.pMotionVectors);
         Dx12Object* output = asObject(dispatch.pColorOutput);
         Dx12Object* mask = asObject(dispatch.pReactiveMask);
+        Dx12Object* exposure = asObject(dispatch.pExposure);
         if (color == nullptr) { problem_ = "missing color input"; return false; }
         if (depth == nullptr) { problem_ = "missing depth"; return false; }
         if (motion == nullptr) { problem_ = "missing motion vectors"; return false; }
         if (output == nullptr) { problem_ = "missing color output"; return false; }
+        if (exposure != nullptr && (!exposure->resource || exposure->dxgiFormat != DXGI_FORMAT_R32_FLOAT ||
+            exposure->resource->GetDesc().Width != 1 || exposure->resource->GetDesc().Height != 1)) {
+            problem_ = "incompatible exposure texture";
+            return false;
+        }
         if (color->resource == nullptr || depth->resource == nullptr ||
             motion->resource == nullptr || output->resource == nullptr) {
             problem_ = "resource handle without d3d12 resource";
             return false;
+        }
+        const bool convertLdr = encodedColorFormat(color->dxgiFormat);
+        if (convertLdr && (!encodedColorFormat(output->dxgiFormat) || dispatch.hdrInput != 0 ||
+            (dispatch.preExposure != 0.0f && dispatch.preExposure != 1.0f))) {
+            problem_ = "encoded LDR color requires encoded output and unity preExposure";
+            return false;
+        }
+        const bool actualHdrInput = !convertLdr && dispatch.hdrInput != 0;
+        if (convertLdr) {
+            const auto sourceDescription = color->resource->GetDesc();
+            const auto outputDescription = output->resource->GetDesc();
+            if (sourceDescription.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                outputDescription.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                sourceDescription.SampleDesc.Count != 1 || outputDescription.SampleDesc.Count != 1 ||
+                sourceDescription.DepthOrArraySize != 1 || outputDescription.DepthOrArraySize != 1 ||
+                sourceDescription.Width != static_cast<uint64_t>(dispatch.renderWidth) ||
+                sourceDescription.Height != static_cast<uint32_t>(dispatch.renderHeight) ||
+                outputDescription.Width != static_cast<uint64_t>(dispatch.displayWidth) ||
+                outputDescription.Height != static_cast<uint32_t>(dispatch.displayHeight) ||
+                (sourceDescription.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
+                !(outputDescription.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
+                problem_ = "incompatible XeSS encoded color resources";
+                return false;
+            }
         }
         if (mask != nullptr && mask->resource == nullptr) { mask = nullptr; }
         // P291i：低于能力下限时 XeSS 同样给不出有效结果，明确拒绝并只记一次日志。
@@ -317,28 +514,89 @@ public:
         }
         adoptSizes(dispatch.renderWidth, dispatch.renderHeight, dispatch.displayWidth,
                    dispatch.displayHeight);
+        if (exposureExpected_ != (exposure != nullptr)) {
+            exposureExpected_ = exposure != nullptr;
+            needsRecreate_ = true;
+        }
+        if (hdrInput_ != actualHdrInput) {
+            hdrInput_ = actualHdrInput;
+            needsRecreate_ = true;
+        }
         if (!ensureContext(ctx)) { return false; }
+        const float inversePreExposure = dispatch.preExposure > 0.0f ? 1.0f / dispatch.preExposure : 1.0f;
+        if (runtime().api.setExposureMultiplier(handle_, inversePreExposure) != XESS_RESULT_SUCCESS) {
+            problem_ = "xessSetExposureMultiplier failed";
+            return false;
+        }
+
+        std::shared_ptr<ColorConversionSlot> conversion;
+        std::shared_ptr<ColorConversionPipeline> conversionPipeline;
+        Dx12Object* sdkColor = color;
+        Dx12Object* sdkOutput = output;
+        if (convertLdr) {
+            for (const auto& candidate : colorPipelines_) {
+                if (candidate->outputFormat == output->dxgiFormat) { conversionPipeline = candidate; break; }
+            }
+            if (!conversionPipeline) {
+                conversionPipeline = std::make_shared<ColorConversionPipeline>();
+                if (!createColorPipeline(*conversionPipeline, output->dxgiFormat)) {
+                    problem_ = "XeSS color conversion pipeline creation failed";
+                    return false;
+                }
+                colorPipelines_.push_back(conversionPipeline);
+            }
+            for (const auto& candidate : colorSlots_) {
+                if (candidate.use_count() == 1 && candidate->inputWidth == static_cast<uint32_t>(renderW_) &&
+                    candidate->inputHeight == static_cast<uint32_t>(renderH_) &&
+                    candidate->outputWidth == static_cast<uint32_t>(displayW_) && candidate->outputHeight == static_cast<uint32_t>(displayH_)) {
+                    conversion = candidate;
+                    break;
+                }
+            }
+            if (!conversion) {
+                colorSlots_.erase(std::remove_if(colorSlots_.begin(), colorSlots_.end(),
+                    [](const auto& candidate) { return candidate.use_count() == 1; }), colorSlots_.end());
+                conversion = std::make_shared<ColorConversionSlot>();
+                if (!initializeColorSlot(*conversion, static_cast<uint32_t>(renderW_), static_cast<uint32_t>(renderH_),
+                    static_cast<uint32_t>(displayW_), static_cast<uint32_t>(displayH_))) {
+                    problem_ = "XeSS linear color resource creation failed";
+                    return false;
+                }
+                colorSlots_.push_back(conversion);
+            }
+            contextPin(ctx, conversionPipeline, conversion);
+            if (!convertColor(ctx, *conversionPipeline, *conversion, color, conversion->input, 0,
+                srgbFormat(color->dxgiFormat) ? 0u : 1u)) {
+                problem_ = "XeSS input linearization failed";
+                restoreDrawHeap(ctx);
+                return false;
+            }
+            sdkColor = conversion->input;
+            sdkOutput = conversion->output;
+        }
 
         // XeSS 不替我们转输入输出（见文件头第 1 条）。走模块的状态跟踪过渡，不猜 Before 状态。
-        transitionTextureTo(ctx, color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        transitionTextureTo(ctx, sdkColor, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (convertLdr) transitionTextureTo(ctx, color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         transitionTextureTo(ctx, depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         transitionTextureTo(ctx, motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (exposure) transitionTextureTo(ctx, exposure, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         if (mask != nullptr) {
             transitionTextureTo(ctx, mask, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
-        transitionTextureTo(ctx, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        transitionTextureTo(ctx, sdkOutput, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
         xess_d3d12_execute_params_t params{};
-        params.pColorTexture = color->resource.Get();
+        params.pColorTexture = sdkColor->resource.Get();
         params.pVelocityTexture = motion->resource.Get();
         params.pDepthTexture = depth->resource.Get();
-        params.pExposureScaleTexture = nullptr;      // 没置 EXPOSURE_SCALE_TEXTURE
+        params.pExposureScaleTexture = exposure ? exposure->resource.Get() : nullptr;
         params.pResponsivePixelMaskTexture =
             mask != nullptr ? mask->resource.Get() : nullptr;
-        params.pOutputTexture = output->resource.Get();
+        params.pOutputTexture = sdkOutput->resource.Get();
         params.jitterOffsetX = dispatch.jitterOffsetX;
         params.jitterOffsetY = dispatch.jitterOffsetY;
-        params.exposureScale = dispatch.preExposure > 0.0f ? dispatch.preExposure : 1.0f;
+        params.exposureScale = 1.0f;
         params.resetHistory = dispatch.reset != 0 ? 1u : 0u;
         // 渲染分辨率是每帧给的（Dynamic Input Resolution），不是 init 时定死的。
         params.inputWidth = static_cast<uint32_t>(renderW_);
@@ -346,8 +604,16 @@ public:
         params.pDescriptorHeap = nullptr;            // v1 用 XeSS 内部堆（P279 接外部堆）
 
         const xess_result_t rc = runtime().api.execute(handle_, ctx->commandList, &params);
+        if (rc == XESS_RESULT_SUCCESS && conversion && !convertColor(ctx, *conversionPipeline, *conversion,
+            sdkOutput, output, 1, srgbFormat(output->dxgiFormat) ? 0u : 2u)) {
+            problem_ = "XeSS output encoding failed";
+            transitionTextureTo(ctx, output, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            restoreDrawHeap(ctx);
+            return false;
+        }
         // 无论成功与否都得把输出交回 RENDER_TARGET（P273 的接口契约）。
         transitionTextureTo(ctx, output, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        restoreDrawHeap(ctx);
         if (rc != XESS_RESULT_SUCCESS) {
             problem_ = "xessD3D12Execute failed rc=";
             problem_ += std::to_string(static_cast<int>(rc));
@@ -363,11 +629,21 @@ public:
 
     void shutdown() override {
         destroyContext();
+        colorSlots_.clear();
+        colorPipelines_.clear();
         problem_.clear();
         logged_ = false;
     }
 
 private:
+    void contextPin(CommandContext* context, const std::shared_ptr<ColorConversionPipeline>& pipeline,
+        const std::shared_ptr<ColorConversionSlot>& slot) {
+        context->recordingLeases[context->currentListSlot].push_back(pipeline);
+        context->recordingLeases[context->currentListSlot].push_back(slot);
+        retainObjectForRecording(context, slot->input);
+        retainObjectForRecording(context, slot->output);
+    }
+
     void adoptSizes(int32_t renderWidth, int32_t renderHeight, int32_t displayWidth,
                     int32_t displayHeight) {
         if (renderWidth > 0) { renderW_ = renderWidth; }
@@ -458,7 +734,10 @@ private:
             // 旧上下文的内部资源可能还在飞：先等 GPU 追平最后一次提交再销毁。
             // 只在首次建 / 换显示尺寸 / 输入分辨率越界 / 掩码开关变化时发生。
             if (ctx != nullptr && ctx->fenceValue > 0) {
-                (void)waitForFenceValue(ctx, ctx->fenceValue, 2000000000ull);
+                if (!waitForFenceValue(ctx, ctx->fenceValue, 2000000000ull)) {
+                    problem_ = "context resize fence timed out";
+                    return false;
+                }
             }
             destroyContext();
         }
@@ -491,8 +770,10 @@ private:
         inputMax_ = xess_2d_t{};
         const xess_quality_settings_t quality = pickQualityForSize(outputResolution, optimal);
 
-        uint32_t flags = XESS_INIT_FLAG_INVERTED_DEPTH | XESS_INIT_FLAG_JITTERED_MV;
+        uint32_t flags = XESS_INIT_FLAG_INVERTED_DEPTH;
         if (maskExpected_) { flags |= XESS_INIT_FLAG_RESPONSIVE_PIXEL_MASK; }
+        if (exposureExpected_) { flags |= XESS_INIT_FLAG_EXPOSURE_SCALE_TEXTURE; }
+        if (!hdrInput_) { flags |= XESS_INIT_FLAG_LDR_INPUT_COLOR; }
 
         // 非阻塞的管线预建：init 会等它完成，先发出去能省一点排队时间。
         if (runtime().api.buildPipelines != nullptr) {
@@ -628,11 +909,15 @@ private:
     int32_t displayW_ = 0;
     int32_t displayH_ = 0;
     bool maskExpected_ = false;
+    bool exposureExpected_ = false;
+    bool hdrInput_ = false;
     bool needsRecreate_ = false;
     std::string problem_;
     bool logged_ = false;
     /** P291i：尺寸过小只记一次日志，避免每帧刷屏。 */
     bool tooSmallLogged_ = false;
+    std::vector<std::shared_ptr<ColorConversionPipeline>> colorPipelines_;
+    std::vector<std::shared_ptr<ColorConversionSlot>> colorSlots_;
 };
 
 // caps 的 XeSS 分支（d3d12_sr.cpp 的 srFillCaps 调它）。**不建上下文**：

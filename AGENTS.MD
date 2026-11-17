@@ -72,5 +72,6 @@ DXC 单元拥有编译器缓存；postprocess 单元拥有 shader、SMAA/TAA 私
 文档入口为 `docs/overview.md`，集中渲染器目标契约见 `docs/rendering.md`。
 新模块按该契约组织资源与 SDK 所有权，不复制来源分支的整体帧调度和全量几何镜像。
 RenderPipeline 只组装调度；业务按 `src/module/render/<domain>/` 与 `src/render/<domain>/` 封装，SDK adapter 留在所属域内。
+生产模块不内置假资源、自检用读写或故障注入；启动只做实际设备初始化和运行时能力确认。必要的 ABI、资源寿命或硬件行为探针使用独立验证程序，不为 getter 或已有分支重复增加测试。
 领域状态单一写者，跨模块只传版本化值/只读视图/图资源；禁止全局服务定位器、跨域可变 manager 和 SDK 类型进入公共契约。
 SM6.9/WG/CoopVec 优先使用，实际能力由模块和选定图声明；配置、资源寿命、历史、生成资产和诊断一起交付。

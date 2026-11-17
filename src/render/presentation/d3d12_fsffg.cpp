@@ -77,23 +77,6 @@ constexpr bool kWrapWired = true;
 // 调用点，用文件级原子量传递，避免为了一个布尔量给 provider 加可变的"已建"状态。
 std::atomic<bool> gDeviceSupported{false};
 
-// 句柄来自 JVM。世界切换（维度加载）的那一帧，Java 侧的纹理对象可能已经 `close()`（native
-// 资源已释放）却还挂在主目标的字段上；`ffxApiGetResourceDX12` 内部第一件事就是
-// `pRes->GetDesc()`，对着野指针立刻是一次 AV（2026-10-28 12:58 的 hs_err 就是这个形状：
-// `ffxApiGetResourceDX12+0x4f` ← `applyFrameLocked` ← `tagFrameInputs`）。
-//
-// 这里用 SEH 做一次"这个指针还能不能当资源用"的探测：能拿到描述就用，拿不到就当作本帧没有
-// 输入（把插帧关掉、跳过这一帧）。探测函数刻意不带任何需要析构的局部对象，避免 /EHsc 下的
-// C2712。宁可少一帧插帧，也不能让整个游戏进程被一个过期句柄带走。
-__declspec(noinline) bool resourceIsUsable(ID3D12Resource* pRes, D3D12_RESOURCE_DESC& out) {
-    __try {
-        out = pRes->GetDesc();
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
 void writeCapsNote(char* dst, size_t cap, const char* text) {
     if (dst == nullptr || cap == 0) {
         return;
@@ -211,8 +194,40 @@ public:
         std::lock_guard<std::mutex> lk(lock_);
         desiredMode_ = desc.mode;
         desiredFrames_ = desc.numFrames < 1 ? 1 : desc.numFrames;
-        reset_ = desc.reset != 0;
+        reset_ = reset_ || desc.reset != 0;
         return true;
+    }
+
+    bool waitForPreviousFrame() override {
+        std::lock_guard<std::mutex> lock(lock_);
+        if (retirementFailed_) return false;
+        if (!inputFence_ || inputFenceValue_ == 0) return true;
+        const UINT64 completed = inputFence_->GetCompletedValue();
+        if (completed == UINT64_MAX) return false;
+        if (completed < inputFenceValue_) {
+            if (!inputFenceEvent_) inputFenceEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (!inputFenceEvent_) return false;
+            const HRESULT registration = inputFence_->SetEventOnCompletion(inputFenceValue_, inputFenceEvent_);
+            const DWORD waited = SUCCEEDED(registration) ? WaitForSingleObject(inputFenceEvent_, 5000) : WAIT_FAILED;
+            if (waited != WAIT_OBJECT_0) {
+                dbgLogError("fsr-fg: previous source reads did not finish; frame recording rejected");
+                return false;
+            }
+            const UINT64 retired = inputFence_->GetCompletedValue();
+            if (retired == UINT64_MAX || retired < inputFenceValue_) return false;
+        }
+        collectInputReadsLocked();
+        return true;
+    }
+
+    void discardFrameInputs() override {
+        std::lock_guard<std::mutex> lock(lock_);
+        applied_ = false;
+        historyAccepted_ = false;
+        reset_ = true;
+        hasConstants_ = false;
+        cmdList_ = nullptr;
+        hudlessColor_ = depth_ = motionVectors_ = nullptr;
     }
 
     // swapchain 在 Present 内部回调这个函数（`frame-interpolation-api.md:279` 的推荐用法）：
@@ -236,6 +251,8 @@ public:
     // 失败时回落到 1（= 这一帧没插），并把连续失败次数按 1/600 的节奏打出来：这是"包装成功但
     // 不插帧"的唯一可见证据（以前 dispatch 返回值被扔掉，日志里什么都没有）。
     void noteDispatch(const ffxDispatchDescFrameGeneration* params, ffxReturnCode_t rc) {
+        completedDispatchSucceeded_.store(rc == FFX_API_RETURN_OK, std::memory_order_relaxed);
+        completedDispatchFrame_.store(params->frameID, std::memory_order_release);
         if (rc == FFX_API_RETURN_OK) {
             int32_t generated = static_cast<int32_t>(params->numGeneratedFrames);
             if (generated < 0) {
@@ -286,16 +303,8 @@ public:
             needUiUnregister_ = true;
         }
         if (wantUi) {
+            if (uiRegisteredForPresent_ && registeredUi_ == uiTexture_ && !needUiUnregister_) return;
             if (swapCtx_ == nullptr || rt.fn.Configure == nullptr) {
-                return;
-            }
-            D3D12_RESOURCE_DESC uiDesc{};
-            if (!resourceIsUsable(static_cast<ID3D12Resource*>(uiTexture_), uiDesc)) {
-                // 句柄过期（换世界 / resize 那一帧）：撤销注册、退回"整帧 hudless 插值"，
-                // 别把坏指针交给 SDK 的 double-buffer 拷贝。下一帧由 JVM 重新推纹理。
-                dbgLogWarn("fsr-fg: ui texture %p is gone, unregistering", uiTexture_);
-                uiTexture_ = nullptr;
-                needUiUnregister_ = registeredUi_ != nullptr;
                 return;
             }
             ffxConfigureDescFrameGenerationSwapChainRegisterUiResourceDX12 uiCfg{};
@@ -312,7 +321,10 @@ public:
                           FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_ENABLE_INTERNAL_UI_DOUBLE_BUFFERING;
             const ffxReturnCode_t rc = rt.fn.Configure(&swapCtx_, &uiCfg.header);
             if (rc == FFX_API_RETURN_OK) {
+                registeredUiHold_ = uiTextureHold_;
+                registeredUiLease_ = uiLease_;
                 needUiUnregister_ = false;
+                uiRegisteredForPresent_ = true;
                 uiFailLogged_ = false;
                 if (registeredUi_ != uiTexture_) {
                     registeredUi_ = uiTexture_;
@@ -320,8 +332,8 @@ public:
                                uiTexture_);
                 }
             } else {
-                // 注册失败就别再试撤销：这一帧的 Present 会走"没有 UI"的合成路径，UI 会缺一帧。
-                needUiUnregister_ = false;
+                uiRegisteredForPresent_ = false;
+                needUiUnregister_ = registeredUi_ != nullptr;
                 logOnce(uiFailLogged_, "fsr-fg: register ui resource failed 0x%X", static_cast<unsigned>(rc));
             }
             return;
@@ -333,7 +345,10 @@ public:
             uiCfg.flags = 0;
             if (rt.fn.Configure(&swapCtx_, &uiCfg.header) == FFX_API_RETURN_OK) {
                 needUiUnregister_ = false;
+                uiRegisteredForPresent_ = false;
                 registeredUi_ = nullptr;
+                registeredUiHold_.Reset();
+                registeredUiLease_.reset();
                 dbgLogWarn("fsr-fg: ui resource unregistered (present = world + ui)");
             }
         }
@@ -375,9 +390,10 @@ public:
                        dispatchFailures_.load(std::memory_order_relaxed), frameId_);
         }
         }
-        const bool wantOn = desiredMode_ != 0;
         FsrFgRuntime& rt = runtime();
         std::lock_guard<std::mutex> lk(lock_);
+        collectInputReadsLocked();
+        const bool wantOn = desiredMode_ != 0 && !retirementFailed_;
         // UI 资源的注册/撤销每帧同步一次，且必须在下面的早退**之前** —— `wantOn && applied_`
         // 的常态帧正是最需要它生效的那些帧。
         syncUiResourceLocked(rt);
@@ -410,7 +426,7 @@ public:
     // `d3d12_surface.cpp:1837-1842`）。所以这个函数由 `tagFrameInputs` 在录制期调用。
     void applyFrameLocked(ID3D12GraphicsCommandList* cmd) {
         FsrFgRuntime& rt = runtime();
-        if (cmd == nullptr || swapCtx_ == nullptr || fgCtx_ == nullptr || rt.fn.Configure == nullptr) {
+        if (retirementFailed_ || cmd == nullptr || swapCtx_ == nullptr || fgCtx_ == nullptr || rt.fn.Configure == nullptr) {
             applied_ = false;
             return;
         }
@@ -431,49 +447,8 @@ public:
             return;
         }
 
-        // 句柄可能已经过期（世界切换那一帧，Java 侧对象活着但 native 资源已释放；见
-        // `resourceIsUsable` 的注释）。拿不到描述就先把自己关掉并跳过这一帧。
-        if (wantOn) {
-            bool stale = false;
-            void* bad = nullptr;
-            // UI 纹理是可选装饰：它过期了就把注册撤掉、退回"整帧 hudless 插值"，不该连累插帧本身。
-            // GUI 目标在换世界时会重建，而 JVM 只在句柄变化时推一次，很容易留下一个已释放的旧句柄。
-            if (uiTexture_ != nullptr) {
-                D3D12_RESOURCE_DESC uiDesc{};
-                if (!resourceIsUsable(static_cast<ID3D12Resource*>(uiTexture_), uiDesc)) {
-                    dbgLogWarn("fsr-fg: ui texture %p was released, dropping it", uiTexture_);
-                    uiTexture_ = nullptr;
-                    registeredUi_ = nullptr;
-                }
-            }
-            for (void* const p : {hudlessColor_, depth_, motionVectors_}) {
-                if (p == nullptr) {
-                    continue;
-                }
-                D3D12_RESOURCE_DESC desc{};
-                if (!resourceIsUsable(static_cast<ID3D12Resource*>(p), desc)) {
-                    stale = true;
-                    bad = p;
-                    break;
-                }
-            }
-            if (stale) {
-                logOnce(staleInputsLogged_,
-                        "fsr-fg: frame inputs were released under us (color=%p depth=%p mv=%p bad=%p)",
-                        hudlessColor_, depth_, motionVectors_, bad);
-                ffxConfigureDescFrameGeneration off{};
-                off.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
-                off.swapChain = proxyChain_;
-                off.frameGenerationEnabled = false;
-                off.frameID = frameId_;
-                if (rt.fn.Configure(&fgCtx_, &off.header) == FFX_API_RETURN_OK) {
-                    enabledInFg_ = false;
-                }
-                applied_ = false;
-                return;
-            }
-        }
-
+        // fgTagFrameInputs supplies a real recording lease, including COM refs
+        // and pool pins. GetDesc/SEH probing a borrowed pointer is not ownership.
         ffxConfigureDescFrameGeneration cfg{};
         cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
         // `swapChain` 要的是 **IDXGISwapChain 指针**，不是链上下文句柄（`ffx_framegeneration.h:118`）；
@@ -504,7 +479,10 @@ public:
         if (uiActive) {
             cfg.HUDLessColor = {};
         } else {
-            cfg.HUDLessColor = makeResource(hudlessColor_, hudlessColorState_);
+            // This external source is read in Present, after endCommandList has
+            // normalized tracked resources to COMMON. Prepare inputs below are
+            // read on the still-open caller list and use their current states.
+            cfg.HUDLessColor = makeResource(hudlessColor_, D3D12_RESOURCE_STATE_COMMON);
         }
         cfg.frameID = frameId_;
         // P306ac：**present 回调留空**，让 FFX 用自己内部的 UI 合成实现。
@@ -568,6 +546,10 @@ public:
         prep.cameraFar = cameraFar_;
         prep.cameraFovAngleVertical = cameraFovVertical_;
         prep.viewSpaceToMetersFactor = viewSpaceToMeters_;
+        std::copy_n(cameraPosition_, 3, prep.cameraPosition);
+        std::copy_n(cameraUp_, 3, prep.cameraUp);
+        std::copy_n(cameraRight_, 3, prep.cameraRight);
+        std::copy_n(cameraForward_, 3, prep.cameraForward);
         prep.depth = makeResource(depth_, depthState_);
         // 深度资源常常是 **R32_TYPELESS**：typeless 不能建 SRV，FFX 的 DX12 后端会失败并留下空
         // 描述符，插帧 compute 一执行就崩（现象是 DLL 里的 AV、无 SDK 消息）。同一块资源按
@@ -576,12 +558,6 @@ public:
             prep.depth.description.format = FFX_API_SURFACE_FORMAT_R32_FLOAT;
         }
         prep.motionVectors = makeResource(motionVectors_, motionVectorState_);
-        // `renderSize` 以深度/MV 的实际尺寸为准：DLSS 超分路径给的 `renderWidth` 可能是 0（退化成
-        // 显示尺寸），而 FFX 要求 `renderSize` 与深度/MV 的描述一致，否则 PrepareV2 返回 0x1。
-        if (prep.depth.description.width > 0 && prep.depth.description.height > 0) {
-            prep.renderSize.width = prep.depth.description.width;
-            prep.renderSize.height = prep.depth.description.height;
-        }
         const ffxReturnCode_t prepRc = rt.fn.Dispatch(&fgCtx_, &prep.header);
         if (prepRc != FFX_API_RETURN_OK) {
             logOnce(prepareFailLogged_, "fsr-fg: prepare failed 0x%X (render=%ux%u depth=%p mv=%p)",
@@ -591,13 +567,41 @@ public:
         }
 
         applied_ = true;
+        preparedFrame_ = frameId_;
+        preparedReset_ = reset_;
         reset_ = false;
         ++frameId_;
         // presented 由 `noteDispatch` 写：这里只代表"这一帧的 prepare 成功了"，不代表插了几帧。
     }
 
     void afterPresent() override {
-        // FFX 的插帧发生在它接管的 Present 里，这一侧无事可做（与另外两家一致）。
+        std::lock_guard<std::mutex> lk(lock_);
+        uiRegisteredForPresent_ = false;
+        historyAccepted_ = applied_ && !retirementFailed_ &&
+            (completedDispatchFrame_.load(std::memory_order_acquire) == preparedFrame_
+                ? completedDispatchSucceeded_.load(std::memory_order_relaxed) : preparedReset_);
+        if (gameQueue_ && inputFence_ && !retirementFailed_ &&
+            (frameLease_ || registeredUiHold_)) {
+            InputRead read;
+            read.value = ++inputFenceValue_;
+            read.frame = frameLease_;
+            read.uiLease = registeredUiLease_;
+            read.ui = registeredUiHold_;
+            inputReads_.push_back(std::move(read));
+            // Proven source-reader boundary only: allowAsyncWorkloads=false
+            // puts HUDLess interpolation on gameQueue; internal UI buffering
+            // copies the UI on gameQueue before Present returns. This fence
+            // does NOT claim completion of SDK composition/presentation queues.
+            if (FAILED(gameQueue_->Signal(inputFence_.Get(), inputFenceValue_))) {
+                retirementFailed_ = true;
+                dbgLogError("fsr-fg: input retirement Signal failed; retaining leases until SDK drain");
+            }
+        }
+        frameLease_.reset();
+        hudlessColor_ = depth_ = motionVectors_ = nullptr;
+        cmdList_ = nullptr;
+        applied_ = false; // a no-world/no-tag Present must not reuse old inputs
+        collectInputReadsLocked();
     }
 
     int32_t presented() const override { return static_cast<int32_t>(presented_.load()); }
@@ -619,8 +623,9 @@ public:
     // UI 合成：JVM 侧把 GUI 层纹理推过来时才启用（`D3D12FgSetUiTexture`）。FSR-FG 的 UI 是
     // 注册到**链上下文**上的（`ffxConfigureDescFrameGenerationSwapChainRegisterUiResourceDX12`），
     // 与 XeSS-FG 用 tag 的 UI 资源是两条完全不同的路径。
-    void setUiTexture(void* object) override {
+    void setUiTexture(void* object, std::shared_ptr<void> lease = {}) override {
         std::lock_guard<std::mutex> lk(lock_);
+        if (uiTexture_ != object) uiRegisteredForPresent_ = false;
         // 注册表已经把 `Dx12Object*` 解包成 `ID3D12Resource*`（P306m）。这里只记指针并在下一帧
         // 注册到链上下文；资源生命周期由 JVM 侧的 GUI 目标持有，撤销时注册表传 nullptr。
         if (uiTexture_ != object && registeredUi_ != nullptr) {
@@ -628,8 +633,9 @@ public:
             // 否则带 double-buffer 的每次 Present 拷贝都会踩到已释放的资源。
             needUiUnregister_ = true;
         }
-        uiTexture_ = object;
-        registeredUi_ = nullptr;
+        uiTextureHold_ = static_cast<ID3D12Resource*>(object);
+        uiLease_ = std::move(lease);
+        uiTexture_ = uiTextureHold_.Get();
     }
 
     // P306ac：hudless 呈现开关（JVM 在"当前后端是 FSR-FG + 本帧有 3D 世界层"时置 1）。
@@ -641,10 +647,12 @@ public:
             return;
         }
         hudlessUi_ = on;
+        uiRegisteredForPresent_ = false;
         if (!on && registeredUi_ != nullptr) {
             needUiUnregister_ = true;
         }
         applied_ = false;
+        syncUiResourceLocked(runtime());
         dbgLogWarn("fsr-fg: hudless ui composition %s",
                    on ? "on (present = world layer, ui composed by sdk)" : "off (present = world + ui)");
     }
@@ -653,24 +661,18 @@ public:
     // 之前的 `beforePresent` 里，先注册再 Present 才不会掉一帧 UI。也**不要求 hudlessUi_ 已打开**：
     // JVM 必须先问"你能不能合成"才敢打开（否则第一次永远打不开，见 P306ac 的 latch 顺序）。
     // 链没包上 / 没有 UI 纹理时回 0 —— 调用方据此继续走"自己把 UI 画进 backbuffer"的老路径。
-    bool uiCompositionReady() const override {
+    bool uiCompositionReady() override {
         std::lock_guard<std::mutex> lk(lock_);
-        // P306ad：必须有**真的发生过插帧 dispatch** 才算"SDK 正在合成 UI"。
-        // `proxyChain_` 只证明"链被包过"，不证明"游戏现在 Present 的是代理链"：包链与启用插帧
-        // 是两步，没有逐帧输入（没开超分 / 倍率 100%）时 provider 只是建了上下文，FFX 的
-        // `Present` 一次都没跑过，UI 注册就落在一条没人 Present 的链上。实测后果：JVM 照样
-        // "武装" hudless，present 只送世界层、UI 没人合成 ⇒ 界面整层消失（2026-10-28 19:26
-        // 的日志里 `P306ac: hudless presentation on` 之后既没有 `app_frames` 也没有
-        // `ui resource registered`）。
-        // `dispatchCount_` 由 FFX → `onFrameGenerationDispatch` 累加，只有真在插帧时才增长；
-        // 它 > 0 就证明代理链在 Present、`presentInterpolated` / `compositeSwapChainFrame` 在跑，
-        // UI 一定有人合成。
-        return uiTexture_ != nullptr && swapCtx_ != nullptr && proxyChain_ != nullptr &&
-               dispatchCount_.load(std::memory_order_relaxed) > 0;
+        if (retirementFailed_ || !uiTexture_ || !swapCtx_ || !proxyChain_ || !runtime().fn.Configure)
+            return false;
+        if (!hudlessUi_) return true;
+        syncUiResourceLocked(runtime());
+        return uiRegisteredForPresent_ && registeredUi_ == uiTexture_ && !needUiUnregister_ && !uiFailLogged_;
     }
 
     void setFrameConstants(const mcdr_fg_constants& constants) override {
         std::lock_guard<std::mutex> lk(lock_);
+        reset_ = reset_ || constants.resetHistory != 0;
         jitterX_ = constants.jitterX;
         jitterY_ = constants.jitterY;
         mvScaleX_ = constants.mvScaleX;
@@ -678,8 +680,26 @@ public:
         hasConstants_ = true;
     }
 
-    void tagFrameInputs(const FgFrameInputs& inputs) override {
+    FgInputAcceptance tagFrameInputs(const FgFrameInputs& inputs) override {
         std::lock_guard<std::mutex> lk(lock_);
+        if (!inputs.resourceLease || retirementFailed_) return FgInputAcceptance::Failed;
+        if (desiredMode_ == 0) return FgInputAcceptance::Skipped;
+        if (!inputs.pColorOutput || !inputs.pDepth || !inputs.pMotionVectors || !inputs.pUi ||
+            inputs.renderWidth != inputs.displayWidth || inputs.renderHeight != inputs.displayHeight ||
+            inputs.displayWidth != static_cast<int32_t>(displayWidth_) ||
+            inputs.displayHeight != static_cast<int32_t>(displayHeight_) ||
+            !std::isfinite(inputs.cameraNear) || !(inputs.cameraNear > 0) ||
+            !std::isfinite(inputs.cameraFar) || !(inputs.cameraFar > inputs.cameraNear) ||
+            !std::isfinite(inputs.cameraVerticalFov) || !(inputs.cameraVerticalFov > 0) ||
+            !std::isfinite(inputs.frameTimeDeltaMs) || !(inputs.frameTimeDeltaMs > 0) ||
+            !std::isfinite(inputs.viewSpaceToMeters) || !(inputs.viewSpaceToMeters > 0))
+            return FgInputAcceptance::Failed;
+        for (void* resource : {inputs.pColorOutput, inputs.pDepth, inputs.pMotionVectors, inputs.pUi}) {
+            const auto description = static_cast<ID3D12Resource*>(resource)->GetDesc();
+            if (description.Width != displayWidth_ || description.Height != displayHeight_)
+                return FgInputAcceptance::Failed;
+        }
+        frameLease_ = inputs.resourceLease;
         if (!tagLogged_) {
             tagLogged_ = true;
             // 打的是**本帧输入**的尺寸，不是成员里的 `displayWidth_` —— 后者在 wrap 阶段才填，
@@ -696,24 +716,29 @@ public:
         depthState_ = inputs.depthState;
         motionVectors_ = inputs.pMotionVectors;
         motionVectorState_ = inputs.motionVectorState;
-        renderWidth_ = inputs.renderWidth > 0 ? inputs.renderWidth : displayWidth_;
-        renderHeight_ = inputs.renderHeight > 0 ? inputs.renderHeight : displayHeight_;
-        // 相机与帧时：只接受有效值（0 表示上游没填），保留成员里的默认值。
-        if (inputs.cameraNear > 0.0f && inputs.cameraFar > inputs.cameraNear) {
-            cameraNear_ = inputs.cameraNear;
-            cameraFar_ = inputs.cameraFar;
-        }
-        if (inputs.cameraVerticalFov > 0.0f) {
-            cameraFovVertical_ = inputs.cameraVerticalFov;
-        }
-        if (inputs.frameTimeDeltaMs > 0.0f) {
-            frameTimeDeltaMs_ = inputs.frameTimeDeltaMs;
-        }
-        if (inputs.viewSpaceToMeters > 0.0f) {
-            viewSpaceToMeters_ = inputs.viewSpaceToMeters;
-        }
+        renderWidth_ = static_cast<uint32_t>(inputs.renderWidth);
+        renderHeight_ = static_cast<uint32_t>(inputs.renderHeight);
+        cameraNear_ = inputs.cameraNear;
+        cameraFar_ = inputs.cameraFar;
+        cameraFovVertical_ = inputs.cameraVerticalFov;
+        frameTimeDeltaMs_ = inputs.frameTimeDeltaMs;
+        viewSpaceToMeters_ = inputs.viewSpaceToMeters;
+        std::copy_n(inputs.cameraPosition, 3, cameraPosition_);
+        std::copy_n(inputs.cameraUp, 3, cameraUp_);
+        std::copy_n(inputs.cameraRight, 3, cameraRight_);
+        std::copy_n(inputs.cameraForward, 3, cameraForward_);
+        syncUiResourceLocked(runtime());
+        if (!hudlessUi_ || needUiUnregister_ || registeredUi_ != inputs.pUi)
+            return FgInputAcceptance::Failed;
         // 输入齐了就在本帧的命令列表上做 Configure + Prepare（见 applyFrameLocked 的时序说明）。
+        applied_ = false;
         applyFrameLocked(inputs.cmdList);
+        return applied_ ? FgInputAcceptance::Accepted : FgInputAcceptance::Failed;
+    }
+
+    bool historyAcceptedAfterPresent() const override {
+        std::lock_guard<std::mutex> lock(lock_);
+        return historyAccepted_ && !retirementFailed_;
     }
 
     int32_t wrapSwapChain(ID3D12Device* device, ID3D12CommandQueue* queue, IDXGISwapChain* appChain,
@@ -732,7 +757,12 @@ public:
             return 0;
         }
         if (swapCtx_ != nullptr) {
-            destroyContextsLocked(rt);
+            if (!destroyContextsLocked(rt)) return 0;
+        }
+        ComPtr<ID3D12Fence> inputFence;
+        if (queue == nullptr || FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&inputFence)))) {
+            dbgLogError("fsr-fg: cannot create source-reader retirement fence");
+            return 0;
         }
 
         // 交给 SDK 的链必须只有我们这一个引用（P305 在 XeSS 上踩过同样的坑）。QueryInterface
@@ -788,7 +818,8 @@ public:
         // 条件置位，`fsrapirendermodule.cpp:1107-1110`）。
         // DEBUG_CHECKING 是官方 UI 里的调试开关（sample `:1118-1121`，默认关）：它会在运行时
         // 校验 API 入参，Release 路径开着只会拖慢并放大“半套输入”的失败面，这里不带。
-        fgDesc.flags = FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED;
+        fgDesc.flags = FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED |
+            FFX_FRAMEGENERATION_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS;
         fgDesc.displaySize.width = static_cast<uint32_t>(width > 0 ? width : 1);
         fgDesc.displaySize.height = static_cast<uint32_t>(height > 0 ? height : 1);
         fgDesc.maxRenderSize = fgDesc.displaySize;
@@ -797,8 +828,14 @@ public:
         ffxContext fgCtx = nullptr;
         const ffxReturnCode_t fgRc = rt.fn.CreateContext(&fgCtx, &fgDesc.header, nullptr);
         if (fgRc != FFX_API_RETURN_OK || fgCtx == nullptr) {
-            rt.fn.DestroyContext(&swapCtx, nullptr);
+            // Keep the successfully wrapped chain/context reachable if its
+            // cleanup fails; a stack-local context must not become a leak.
+            swapCtx_ = swapCtx;
+            fgCtx_ = fgCtx;
+            failedChain_ = chain4;
+            proxyChain_ = chain4;
             chain4->Release();
+            (void)destroyContextsLocked(rt);
             dbgLogWarn("fsr-fg: frame generation context failed 0x%X", static_cast<unsigned>(fgRc));
             return 0;
         }
@@ -808,6 +845,7 @@ public:
         // 新的链上下文不认旧的 UI 注册；不清掉的话 `registeredUi_ == uiTexture_` 会让我们
         // 以为已经注册过，实际上新上下文里没有 UI —— 插帧照常出，只是画面里没有 GUI。
         registeredUi_ = nullptr;
+        uiRegisteredForPresent_ = false;
         // SDK 在内部把 `chain4` 原地替换成代理链（provider 的 `*desc->swapchain = ...`），所以这里
         // 拿到的就是之后要 Present 的那条链；surface 负责持有它的引用。
         proxyChain_ = reinterpret_cast<IDXGISwapChain*>(chain4);
@@ -860,13 +898,21 @@ public:
         dbgLogInfo("fsr-fg: wrapped display=%ux%u format=%d proxy=%p ctx(swap=%p fg=%p)",
                    displayWidth_, displayHeight_, static_cast<int>(format),
                    static_cast<void*>(chain4), swapCtx, fgCtx);
+        gameQueue_ = queue;
+        inputFence_ = std::move(inputFence);
+        inputFenceValue_ = 0;
+        retirementFailed_ = false;
         return 1;
     }
 
     void unwrapSwapChain() override {
+        (void)tryUnwrapSwapChain();
+    }
+
+    bool tryUnwrapSwapChain() override {
         FsrFgRuntime& rt = runtime();
         std::lock_guard<std::mutex> lk(lock_);
-        destroyContextsLocked(rt);
+        return destroyContextsLocked(rt);
     }
 
 private:
@@ -885,26 +931,39 @@ private:
     }
 
 
-    void destroyContextsLocked(FsrFgRuntime& rt) {
+    void collectInputReadsLocked() {
+        if (!inputFence_ || retirementFailed_) return;
+        const UINT64 completed = inputFence_->GetCompletedValue();
+        if (completed == UINT64_MAX) return;
+        std::erase_if(inputReads_, [completed](const InputRead& read) { return read.value <= completed; });
+    }
+
+    bool destroyContextsLocked(FsrFgRuntime& rt) {
         if (fgCtx_ != nullptr && rt.fn.Configure != nullptr) {
             ffxConfigureDescFrameGeneration off{};
             off.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
             off.swapChain = proxyChain_;
             off.frameGenerationEnabled = false;
-            rt.fn.Configure(&fgCtx_, &off.header);
+            if (rt.fn.Configure(&fgCtx_, &off.header) != FFX_API_RETURN_OK) {
+                dbgLogError("fsr-fg: disable/drain failed; preserving contexts and input leases");
+                return false;
+            }
         }
         if (swapCtx_ != nullptr && rt.fn.Dispatch != nullptr) {
             ffxDispatchDescFrameGenerationSwapChainWaitForPresentsDX12 wait{};
             wait.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WAIT_FOR_PRESENTS_DX12;
-            rt.fn.Dispatch(&swapCtx_, &wait.header);
+            if (rt.fn.Dispatch(&swapCtx_, &wait.header) != FFX_API_RETURN_OK) {
+                dbgLogError("fsr-fg: WaitForPresents failed; preserving contexts and input leases");
+                return false;
+            }
         }
         // 顺序按官方 Shutdown：先帧生成上下文，再链上下文。
         if (fgCtx_ != nullptr) {
-            rt.fn.DestroyContext(&fgCtx_, nullptr);
+            if (rt.fn.DestroyContext(&fgCtx_, nullptr) != FFX_API_RETURN_OK) return false;
             fgCtx_ = nullptr;
         }
         if (swapCtx_ != nullptr) {
-            rt.fn.DestroyContext(&swapCtx_, nullptr);
+            if (rt.fn.DestroyContext(&swapCtx_, nullptr) != FFX_API_RETURN_OK) return false;
             swapCtx_ = nullptr;
         }
         gDeviceSupported.store(false);
@@ -914,11 +973,28 @@ private:
         // 新链上下文要重新注册 UI 纹理（同一块纹理在新上下文里没有登记过）。
         registeredUi_ = nullptr;
         needUiUnregister_ = false;
+        uiRegisteredForPresent_ = false;
         if (proxyChain3_ != nullptr) {
             proxyChain3_->Release();
             proxyChain3_ = nullptr;
         }
         proxyChain_ = nullptr;
+        failedChain_.Reset();
+        // SDK drain covers its internal queues. The registry separately requires
+        // all caller recordings to finish before entering this teardown path.
+        inputReads_.clear();
+        frameLease_.reset();
+        registeredUiHold_.Reset();
+        registeredUiLease_.reset();
+        gameQueue_.Reset();
+        inputFence_.Reset();
+        if (inputFenceEvent_) {
+            CloseHandle(inputFenceEvent_);
+            inputFenceEvent_ = nullptr;
+        }
+        hudlessColor_ = depth_ = motionVectors_ = nullptr;
+        cmdList_ = nullptr;
+        return true;
     }
 
     mutable std::mutex lock_;
@@ -928,13 +1004,33 @@ private:
     IDXGISwapChain* proxyChain_ = nullptr;
     // 同一个代理链的 3 代接口，只为 `GetCurrentBackBufferIndex()` / `GetBuffer()`。
     IDXGISwapChain3* proxyChain3_ = nullptr;
+    ComPtr<IDXGISwapChain> failedChain_;
 
     void* hudlessColor_ = nullptr;
+    struct InputRead {
+        UINT64 value = 0;
+        std::shared_ptr<void> frame, uiLease;
+        ComPtr<ID3D12Resource> ui;
+    };
+    std::vector<InputRead> inputReads_;
+    std::shared_ptr<void> frameLease_, uiLease_, registeredUiLease_;
+    ComPtr<ID3D12Resource> uiTextureHold_, registeredUiHold_;
+    ComPtr<ID3D12CommandQueue> gameQueue_;
+    ComPtr<ID3D12Fence> inputFence_;
+    HANDLE inputFenceEvent_ = nullptr;
+    UINT64 inputFenceValue_ = 0;
+    bool retirementFailed_ = false;
+    uint64_t preparedFrame_ = UINT64_MAX;
+    bool preparedReset_ = false;
+    bool historyAccepted_ = false;
+    std::atomic<uint64_t> completedDispatchFrame_{UINT64_MAX};
+    std::atomic<bool> completedDispatchSucceeded_{false};
     void* uiTexture_ = nullptr;
     // 已经成功注册到当前 `swapCtx_` 上的 UI 纹理（裸指针只用于同一性比较，不持有引用）。
     void* registeredUi_ = nullptr;
     // P306ac：hudless 呈现模式（present 的世界层不含 UI、UI 由 SDK 合成）。
     bool hudlessUi_ = false;
+    bool uiRegisteredForPresent_ = false;
     // 需要在下一个 `beforePresent` 里显式撤销 UI 注册（空资源）。
     bool needUiUnregister_ = false;
     void* depth_ = nullptr;
@@ -953,13 +1049,12 @@ private:
     float jitterY_ = 0.0f;
     float mvScaleX_ = 1.0f;
     float mvScaleY_ = 1.0f;
-    float frameTimeDeltaMs_ = 16.6f;
-    // 相机参数：PrepareV2 要用（官方 sample 逐帧从相机取）。上游没给时保留这组保守默认值，
-    // 至少不会因为 0 近平面 / 0 视场让 SDK 判成非法输入。
-    float cameraNear_ = 0.05f;
-    float cameraFar_ = 1024.0f;
-    float cameraFovVertical_ = 1.0f;
-    float viewSpaceToMeters_ = 1.0f;
+    float frameTimeDeltaMs_ = 0;
+    float cameraNear_ = 0;
+    float cameraFar_ = 0;
+    float cameraFovVertical_ = 0;
+    float viewSpaceToMeters_ = 0;
+    float cameraPosition_[3]{}, cameraUp_[3]{}, cameraRight_[3]{}, cameraForward_[3]{};
     bool hasConstants_ = false;
     bool reset_ = false;
 

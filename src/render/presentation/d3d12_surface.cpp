@@ -221,6 +221,7 @@ static void paintWindowBlack(HWND hwnd) {
     GetClientRect(hwnd, &rc);
     FillRect(dc, &rc, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
     ReleaseDC(hwnd, dc);
+    GdiFlush();
 }
 
 // 销毁呈现子窗口前调用：子窗口消失后暴露出来的是父窗口（GLFW）从未绘制过的客户区
@@ -228,6 +229,39 @@ static void paintWindowBlack(HWND hwnd) {
 static void paintParentBlackBeforeDestroy(HWND child) {
     if (child == nullptr) return;
     paintWindowBlack(GetParent(child));
+}
+
+static bool prepareSurfaceWindowForDestroy(uintptr_t parentHandle, HWND child,
+                                           MCDR_WindowHost* host) {
+    if (host != nullptr) return mcdr_host_prepare_release(host) != 0;
+    if (child != nullptr && IsWindow(child)) {
+        // 先刷父窗口，再隐藏子窗口。顺序不能反：隐藏会立刻暴露父窗口，父窗口若还留着
+        // early-window 的最后一帧，用户会在这一瞬间看到它。resize 后旧 swapchain 仍可能
+        // 是子窗口当前可见内容，所以这一步必须发生在等待 GPU/DWM 的释放阶段之前。
+        HWND parent = GetParent(child);
+        paintWindowBlack(parent);
+        if (parent != nullptr && IsWindow(parent)) {
+            ShowWindow(parent, SW_HIDE);
+            SetWindowPos(parent, HWND_BOTTOM, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING |
+                             SWP_HIDEWINDOW);
+        }
+        ShowWindow(child, SW_HIDE);
+        SetWindowPos(child, HWND_BOTTOM, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING |
+                         SWP_HIDEWINDOW);
+        return true;
+    }
+    // DirectComposition 没有呈现子窗口，直接清理实际承载窗口。
+    HWND parent = reinterpret_cast<HWND>(parentHandle);
+    paintWindowBlack(parent);
+    if (parent != nullptr && IsWindow(parent)) {
+        ShowWindow(parent, SW_HIDE);
+        SetWindowPos(parent, HWND_BOTTOM, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING |
+                         SWP_HIDEWINDOW);
+    }
+    return true;
 }
 
 // P96 诊断（临时）：把窗口/子窗口的几何、可见性与"类背景刷"打进日志。
@@ -1004,10 +1038,10 @@ mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int p
     // P70：除了等 GPU，还要先把呈现管线本身"静止"下来——异步渲染线程提交中的帧
     // 会与 ResizeBuffers 并发访问同一条 swapchain，这是 INVALID_CALL 的主要来源。
     const double p98tWaitRender0 = nowMs();
-    waitForRenderThreadSubmit();          // 等异步渲染线程完成当前帧提交
+    if (!waitForRenderThreadSubmit()) return mcdr::err("configureSurface", "Render submission did not drain");
     p98waitRenderMs = nowMs() - p98tWaitRender0;
     if (!waitForPendingPresents(2000)) {  // 等已提交但尚未 Present 完成的帧
-        dbgLog("configureSurface: pending presents did not drain before ResizeBuffers (continuing)");
+        return mcdr::err("configureSurface", "Pending presents did not drain before ResizeBuffers");
     }
     p98waitPresentsMs = nowMs() - p98tWaitRender0 - p98waitRenderMs;
     const double p98tIdle0 = nowMs();
@@ -1019,6 +1053,7 @@ mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int p
         }
     }
     p98idleMs = nowMs() - p98tIdle0;
+    if (mcdr_dlss_invalidate_inputs() != 1) return mcdr::err("configureSurface", "Streamline input invalidation failed");
     dbgLogDebug("configureSurface: idle ok, ResizeBuffers %dx%d mode=%d", width, height, presentMode);
     // 防御：vanilla 在 acquire 与 present 之间若被窗口事件触发 configure，
     // 会残留"已 acquire 未 present"的 backbuffer；ResizeBuffers 对其返回
@@ -1119,7 +1154,7 @@ mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int p
             s->swapChain->Present(0, 0);
             s->currentImageIndex = -1;
         }
-        (void)deviceWaitIdle();
+        if (auto idle = deviceWaitIdle(); !idle) return std::unexpected<mcdr::Error>(idle.error());
         // P305 / P305ae：provider 的 context 绑在这条链上，销毁之前必须先解包（幂等）。
         // 顺序很关键：**先放掉本进程对这条链的所有引用**（surface 的 ComPtr + back buffer 资源，
         // flip model 下 back buffer 会反过来持有 swapchain），再让 provider 调
@@ -1129,7 +1164,7 @@ mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int p
         // `DXGI_ERROR_INVALID_CALL (0x887A0001)` —— P305ae 之前 resize 后第二次 wrap 失败就是这个。
         s->backBuffers.clear();
         s->swapChain.Reset();
-        fgUnwrapPresentChain();
+        if (!fgUnwrapPresentChain()) return mcdr::err("configureSurface", "Frame generation teardown is still active");
         // P71：不清 rtvHandles —— 句柄在 rtvHeap 上是 bump 分配，保留复用即可；
         // 旧实现每次重建都重新分配 3 个槽，反复 resize 会把 kRtvHeapSize 用尽
         // （"RTV descriptor heap exhausted"），随后 configureSurface 直接失败。
@@ -1206,9 +1241,11 @@ mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int p
         // P306af：包装失败时应用链已经被 SDK 交出去并销毁了，这里**不能**直接返回错误 ——
         // 那会把 surface 永久留在"没有链"的状态（画面冻结、游戏逻辑照跑）。关掉帧生成
         // （`picked` 清成 NONE 之后不会再尝试包装），按纯应用链重建，保证画面能回来。
-        fgAbortWrapAfterFailure(
+        if (!fgAbortWrapAfterFailure(
             "frame generation could not take the swap chain and was turned off; "
-            "the swap chain was rebuilt without it");
+            "the swap chain was rebuilt without it")) {
+            return mcdr::err("configureSurface", "Frame generation cleanup failed after swap chain wrapping");
+        }
         auto plain = rebuildSwapChainForFg(s, "wrap-failed");
         if (!plain) {
             return mcdr::err("configureSurface",
@@ -1277,7 +1314,7 @@ mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int p
 // 触发的，前几次 acquire 逐步写一行到 `P306_breadcrumb.log`（native 日志级别被 JVM
 // 门控，只有这个通道稳定可见）。定位完即可删除。
 
-mcdr::Result<void> rebuildSwapChainForFg(Dx12Surface* s, const char* why) {
+mcdr::Result<void> rebuildSwapChainForFg(Dx12Surface* s, const char* why, void* recording) {
     // P306af：这里**允许** `swapChain == nullptr`。包装失败时 SDK 已经把应用链拿走并销毁
     // （`wrapChainForFrameGen` 里 Detach 过），调用方正是要在这个状态下重建一条纯应用链；
     // 把空链当成"surface 没建"直接挡掉，就会把 surface 永久留在没有链的状态（画面冻结）。
@@ -1296,17 +1333,22 @@ mcdr::Result<void> rebuildSwapChainForFg(Dx12Surface* s, const char* why) {
     // Present(0,0) 交还（只用 bufferHeld 判定，避免对已 present 的 buffer 再推一帧），
     // 再等 GPU 真空闲 —— 旧链的 back buffer 仍被上一帧命令引用时，DWM 会拒绝同一 HWND
     // 上的新链（E_ACCESSDENIED）。
+    if ((!recording || gAsyncRenderCtx.load(std::memory_order_acquire) != recording) &&
+        !waitForRenderThreadSubmit())
+        return mcdr::err("rebuildSwapChainForFg", "Render submission did not drain");
+    if (!waitForPendingPresents(2000)) return mcdr::err("rebuildSwapChainForFg", "Pending presents did not drain");
     const bool held = s->bufferHeld.exchange(false);
     if (held && s->swapChain != nullptr) {
         s->swapChain->Present(0, 0);
     }
     s->currentImageIndex = -1;
-    (void)deviceWaitIdle();
+    if (auto idle = deviceWaitIdle(); !idle) return std::unexpected<mcdr::Error>(idle.error());
     // P305 / P305ae：同 configureSurface —— 先放掉本进程的全部引用（surface + back buffer），
     // 再让 provider 销毁 SDK 对象，否则 destroy 会看到引用计数 ≠ 0、native 链泄漏。
+    if (mcdr_dlss_invalidate_inputs() != 1) return mcdr::err("rebuildSwapChainForFg", "Streamline input invalidation failed");
     s->backBuffers.clear();
     s->swapChain.Reset();
-    fgUnwrapPresentChain();
+    if (!fgUnwrapPresentChain()) return mcdr::err("rebuildSwapChainForFg", "Frame generation teardown is still active");
     // P71：不清 rtvHandles —— 句柄在 rtvHeap 上是 bump 分配、可复用；清了反复重建会把
     // kRtvHeapSize 用尽（"RTV descriptor heap exhausted"）。
     s->lastBlitIndex = -1;
@@ -1375,13 +1417,15 @@ mcdr::Result<void> rebuildSwapChainForFg(Dx12Surface* s, const char* why) {
             return mcdr::err("rebuildSwapChainForFg",
                              "frame generation kept failing to take the swap chain");
         }
-        fgAbortWrapAfterFailure(
+        if (!fgAbortWrapAfterFailure(
             "frame generation could not take the swap chain and was turned off; "
-            "the swap chain was rebuilt without it");
+            "the swap chain was rebuilt without it")) {
+            return mcdr::err("rebuildSwapChainForFg", "Frame generation cleanup failed after swap chain wrapping");
+        }
         // 包装失败时 SDK 已经把我们的链销毁了（wrapChainForFrameGen 里 Detach 过）。
         s->backBuffers.clear();
         s->swapChain.Reset();
-        (void)deviceWaitIdle();
+        if (auto idle = deviceWaitIdle(); !idle) return std::unexpected<mcdr::Error>(idle.error());
         Sleep(static_cast<DWORD>(60 * (attempt + 1)));
     }
     s->backBuffers.resize(kSurfaceBufferCount);
@@ -1417,6 +1461,19 @@ mcdr::Result<void> rebuildSwapChainForFg(Dx12Surface* s, const char* why) {
 // 触发的，前几次 acquire 逐步写一行到 `P306_breadcrumb.log`（native 日志级别被 JVM
 // 门控，只有这个通道稳定可见）。定位完即可删除。
 
+mcdr::Result<void> prepareDisplayPresentChain(Dx12Surface* s, void* recording) {
+    if (!s || !s->swapChain) return mcdr::err("prepareDisplayPresentChain", "surface not created");
+    if (!fgChainRebuildPending()) return {};
+    if (auto rebuilt = rebuildSwapChainForFg(s, "fg-toggle", recording); !rebuilt) {
+        s->suboptimal = true;
+        const auto& reason = rebuilt.error().message;
+        fgNoteChainRebuildDone(fgChainOwner(), 0, reason.c_str());
+        return mcdr::err("prepareDisplayPresentChain", reason);
+    }
+    fgNoteChainRebuildDone(fgChainOwner(), 1, nullptr);
+    return {};
+}
+
 mcdr::Result<void> acquireSurface(Dx12Surface* s) {
     // P98 诊断：主线程帧间隔（>200 ms 视为停顿/掉帧），用于定位用户报告的
     // 「加载屏幕弹出瞬间帧时间骤增」。acquire 每帧一次，是主线程帧节拍的天然探针。
@@ -1434,29 +1491,6 @@ mcdr::Result<void> acquireSurface(Dx12Surface* s) {
     if (!s || !s->swapChain) {
         return mcdr::err("acquireSurface", "surface not created");
     }
-    // P296（D13）：帧生成开关挂起的链重建必须在这里消费 —— 帧首、上一帧已上屏、本帧
-    // 还没开画。放 Present 里会丢掉刚画完的那一帧；放 blit 里会与已 acquire 的 back
-    // buffer 冲突。失败不自动重试：`fgNoteChainRebuildDone(..., 0, msg)` 会撤销请求，
-    // 用户下次改开关才会再试一次。
-    if (fgChainRebuildPending()) {
-        auto rebuiltFgChain = rebuildSwapChainForFg(s, "fg-toggle");
-        if (!rebuiltFgChain) {
-            // 重建的前半程已经 Reset 过旧链：此刻 surface 手上没有任何 back buffer，绝不能
-            // 继续往下走（下面第一件事就是 GetCurrentBackBufferIndex，空指针即崩）。返回
-            // 失败让 JVM 跳过本帧 blit，同时置 suboptimal 让它走 surface 重建 —— 与
-            // waitForPendingPresents 超时那条既有路径同一语义。
-            s->suboptimal = true;
-            const std::string why = rebuiltFgChain.error().message;
-            fgNoteChainRebuildDone(fgChainOwner(), 0, why.c_str());
-            return mcdr::err("acquireSurface",
-                             "frame generation swapchain rebuild failed: " + why);
-        }
-        fgNoteChainRebuildDone(fgChainOwner(), 1, nullptr);
-    }
-    // P305ah：帧首钩子。必须在重建消费之后 —— 重建会换链，marker 的帧号要跟着新链的
-    // 第一次 Present 走；也必须在本帧开画之前 —— XeSS-FG 的 RENDERSUBMIT_START 语义就是
-    // "应用开始提交这一帧的渲染"。
-    fgFrameStart();
     // P48（多帧飞行）：Present 尚未完成时 GetCurrentBackBufferIndex 不会轮转，会返回
     // 上一帧已 Present 的同一个 back buffer（两帧写同一处 → 闪帧/撕裂）。真实 acquire
     // 已推迟到 blit 之前（Java Dx12GpuSurface.ensureAcquired），此时本帧录制已完成，
@@ -1478,6 +1512,8 @@ mcdr::Result<void> acquireSurface(Dx12Surface* s) {
                          "acquireSurface: present sync timeout (render thread stalled) — frame skipped to "
                          "avoid writing a non-current back buffer");
     }
+    if (!fgDisplayFrameStarted() && beginDisplayFrameRecording(nullptr) != 1)
+        return mcdr::err("acquireSurface", "display frame could not start");
     // 以下两条为逐帧诊断（原为 dbgLog，每帧 2 次 stderr+文件 flush，实测 ~0.1-0.2ms/条，
     // 属帧关键路径纯开销）→ 降为 DEBUG，需 DX12_LOG_VERBOSE=1 才输出。
     dbgLogDebug("acquireSurface: enter surface=%p", reinterpret_cast<void*>(s));
@@ -1655,6 +1691,7 @@ mcdr::Result<void> blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* 
         const D3D12_RESOURCE_DESC bbDesc = dst->GetDesc();
         D3D12_VIEWPORT blitVp{0.0f, 0.0f, static_cast<FLOAT>(bbDesc.Width),
                               static_cast<FLOAT>(bbDesc.Height), 0.0f, 1.0f};
+        invalidateGraphicsInputBindings(ctx, false);
         cmd->RSSetViewports(1, &blitVp);
         D3D12_RECT blitSc{0, 0, static_cast<LONG>(bbDesc.Width), static_cast<LONG>(bbDesc.Height)};
         cmd->RSSetScissorRects(1, &blitSc);
@@ -1778,7 +1815,10 @@ mcdr::Result<void> blitTextureToTexture(CommandContext* ctx, Dx12Object* src, Dx
         return mcdr::err("blitTextureToTexture", "blitTextureToTexture: blit pipeline unavailable");
     }
 
+    if (prepareSampledTextureWrite(ctx, dst, 0, 1) != SampledTextureContentStatus::Ready)
+        return mcdr::err("blitTextureToTexture", "Sampled texture contents could not be preserved before writing");
     D3D12_CPU_DESCRIPTOR_HANDLE dstRtv = rtv.value();
+    invalidateGraphicsInputBindings(ctx, false);
     cmd->OMSetRenderTargets(1, &dstRtv, FALSE, nullptr);
     D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<FLOAT>(dstDesc.Width), static_cast<FLOAT>(dstDesc.Height), 0.0f, 1.0f};
     cmd->RSSetViewports(1, &vp);
@@ -1827,6 +1867,8 @@ mcdr::Result<void> sharpenTextureToTexture(CommandContext* ctx, Dx12Object* src,
                          "sharpenTextureToTexture: dst is not a single-sampled 2D texture");
     }
 
+    if (prepareSampledTextureWrite(ctx, dst, 0, 1) != SampledTextureContentStatus::Ready)
+        return mcdr::err("sharpenTextureToTexture", "Sampled texture contents could not be preserved before writing");
     auto rtv = acquireTextureRtv(ctx, dst);
     if (!rtv) {
         return mcdr::err("sharpenTextureToTexture", "sharpenTextureToTexture: " + rtv.error().message);
@@ -1842,6 +1884,7 @@ mcdr::Result<void> sharpenTextureToTexture(CommandContext* ctx, Dx12Object* src,
     }
 
     D3D12_CPU_DESCRIPTOR_HANDLE dstRtv = rtv.value();
+    invalidateGraphicsInputBindings(ctx, false);
     cmd->OMSetRenderTargets(1, &dstRtv, FALSE, nullptr);
     D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<FLOAT>(dstDesc.Width), static_cast<FLOAT>(dstDesc.Height),
                       0.0f, 1.0f};
@@ -1875,10 +1918,33 @@ mcdr::Result<void> sharpenTextureToTexture(CommandContext* ctx, Dx12Object* src,
     return {};
 }
 
-void presentSurface(Dx12Surface* s) {
-    if (!s || !s->swapChain) {
-        return;
+SurfacePresentResult presentSurface(Dx12Surface* s, FgPresentTicket ticket) {
+    SurfacePresentResult result;
+    if (!s) {
+        fgAbortDisplayFrame(ticket);
+        return result;
     }
+    std::lock_guard<std::mutex> presentLock(s->presentMutex);
+    if (ticket.serial == 0) ticket = s->frameGenerationTicket;
+    if (ticket.serial != 0 && !fgDisplayFrameCurrent(ticket)) {
+        result.outcome = MCDR_PRESENT_CANCELLED;
+        return result;
+    }
+    struct CompleteFrame {
+        FgPresentTicket ticket;
+        ~CompleteFrame() {
+            fgAbortDisplayFrame(ticket);
+        }
+    } completion{ticket};
+    if (!s || !s->swapChain) {
+        return result;
+    }
+    const auto checkPresentInputs = [] {
+        if (mcdr_dlss_inputs_ready_for_present() == 1) return true;
+        dbgLogError("presentSurface: Streamline input invalidation is still pending");
+        return false;
+    };
+    if (!checkPresentInputs()) return result;
     // P109（#538 修复）状态约定：back buffer 的 RT→PRESENT 过渡**不能**在这里做——
     // 本函数跑在渲染线程上，调用时该帧的命令列表早已 Close+Execute（见
     // d3d12_device.cpp 的 renderThreadFunc：submitCommandList → presentSurface），
@@ -1898,7 +1964,7 @@ void presentSurface(Dx12Surface* s) {
     if (!s->blittedThisFrame || s->currentImageIndex < 0) {
         // 静默返回：这是"本帧没有内容可显示"的正常状态（启动、菜单、窗口被遮挡），
         // 原先的计数+日志会在空闲时每 60 帧刷一行，对用户控制台只有噪音没有信息。
-        return;
+        return result;
     }
     // IMMEDIATE=0 -> Present(0, ALLOW_TEARING)；FIFO_RELAXED=3 -> Present(1, 0)；
     // 其余（FIFO=2 等）-> Present(1, 0)。
@@ -1932,15 +1998,22 @@ void presentSurface(Dx12Surface* s) {
     // 让下面的失败分支把真正的原因（GetDeviceRemovedReason + InfoQueue）打进日志。
     const bool fgDeviceAlive = !deviceRemoved();
     if (fgDeviceAlive) {
-        fgBeforePresent();
+        fgBeforePresent(ticket);
     } else {
         static std::atomic<bool> fgDeviceLostLogged{false};
         if (!fgDeviceLostLogged.exchange(true, std::memory_order_relaxed)) {
             dbgLogWarn("presentSurface: device removed -> frame generation hooks skipped");
         }
     }
+    if (!checkPresentInputs()) return result;
     mcdr_reflex_before_present();
     HRESULT hr = s->swapChain->Present(syncInterval, flags);
+    result.dxgiStatus = static_cast<int32_t>(hr);
+    result.flags = MCDR_PRESENT_DXGI_STATUS_VALID;
+    result.outcome = hr == S_OK ? MCDR_PRESENT_SUCCEEDED :
+        hr == DXGI_STATUS_OCCLUDED ? MCDR_PRESENT_OCCLUDED :
+        hr == DXGI_STATUS_MODE_CHANGED ? MCDR_PRESENT_MODE_CHANGED :
+        FAILED(hr) ? MCDR_PRESENT_FAILED : MCDR_PRESENT_UNKNOWN;
     // P267: only now that a real frame reached the screen do we show the child window that
     // carries it -- this is what keeps the startup from flashing an unpainted white/black face.
     if (s->host != nullptr && SUCCEEDED(hr) && !s->hostRevealed) {
@@ -1951,12 +2024,17 @@ void presentSurface(Dx12Surface* s) {
     // P296：呈递之后的钩子（与上面 fgBeforePresent 成对，顺序见那里的注释）。
     // P306c：Present 期间设备也可能刚被移除，这里再查一次；失效就只记账不走 provider。
     if (fgDeviceAlive && !deviceRemoved()) {
-        fgAfterPresent();
+        const auto publication = fgAfterPresent(ticket, hr == S_OK ? 1 : 0);
+        result.flags |= publication.flags;
+        result.outputFrameCount = publication.outputFrameCount;
+    } else {
+        invalidateFrameGenerationHistory(1);
     }
     // present 后 backbuffer 所有权已释放（vanilla 每帧 acquire->blit->present，
     // 若此处不重置，configureSurface 的 ResizeBuffers 会误以为仍有 acquired
     // backbuffer 而返回 DXGI_ERROR_NOT_CURRENTLY_AVAILABLE -> 画面冻结）。
     s->currentImageIndex = -1;
+    s->frameGenerationTicket = {};
     // P95：本帧内容已随 Present 交给显示器；下一次 blit 之前都不应再 Present。
     s->blittedThisFrame.store(false, std::memory_order_release);
     // P95b：back buffer 已随 Present 交还 DXGI，本 surface 不再持有"未 present 的
@@ -1982,6 +2060,7 @@ void presentSurface(Dx12Surface* s) {
         dbgLogDebug("presentSurface: ok (syncInterval=%u)", syncInterval);
         s->suboptimal = false;  // 正常 present 清除 suboptimal 标记
     }
+    return result;
 }
 
 // P197：HDR 模式切换（0 = auto / 1 = 强制开 / 2 = 强制关）。只写进程级状态，
@@ -1993,10 +2072,14 @@ void setHdrMode(int32_t mode) {
 
 int32_t hdrActiveFlag() { return mcdr_hdr_state_active(); }
 
-void destroySurface(Dx12Surface* s) {
-    if (!s) return;
+mcdr::Result<void> destroySurface(Dx12Surface* s) {
+    if (!s) return {};
     dbgLogDebug("destroySurface: enter surface=%p", reinterpret_cast<void*>(s));
     dbgLogProgress("destroySurface stage: enter");
+    HWND presentChild = s->presentWindow;
+    MCDR_WindowHost* const surfaceHost = static_cast<MCDR_WindowHost*>(s->host);
+    const bool preparedWindow = prepareSurfaceWindowForDestroy(s->hwnd, presentChild, surfaceHost);
+    if (preparedWindow) dbgLogProgress("destroySurface stage: presentation hidden and parent painted");
     // P196：独占全屏必须在释放链之前退出，否则显示模式会停在独占状态（桌面黑屏 / 分辨率不回退）。
     if (s->swapChain && s->exclusive) {
         const HRESULT fsHr = s->swapChain->SetFullscreenState(FALSE, nullptr);
@@ -2006,17 +2089,15 @@ void destroySurface(Dx12Surface* s) {
     // P33 修复：async render thread 可能在 destroySurface 期间仍在操作同一 swapchain。
     // 先等待渲染线程完成当前帧（仅同步，不销毁线程），再等 GPU 空闲，
     // 避免 deviceWaitIdle → queue->Signal 与渲染线程的 Present 并发访问 swapchain 导致崩溃。
-    waitForRenderThreadSubmit();
+    if (!waitForRenderThreadSubmit()) return mcdr::err("destroySurface", "Render submission did not drain");
     dbgLogProgress("destroySurface stage: waited render thread");
-    (void)deviceWaitIdle();
+    if (auto idle = deviceWaitIdle(); !idle) return std::unexpected<mcdr::Error>(idle.error());
     dbgLogProgress("destroySurface stage: device idle");
-    // P96/P183：先立刻把父窗口刷黑 —— 退出时窗口消失前会短暂露出父窗口客户区，
-    // 早一步上色就少一帧灰/白幕；刷黑只动 GDI，不依赖下面的 fence 等待。
-    HWND presentChild = s->presentWindow;
-    MCDR_WindowHost* const surfaceHost = static_cast<MCDR_WindowHost*>(s->host);
+    if (mcdr_dlss_invalidate_inputs() != 1) return mcdr::err("destroySurface", "Streamline input invalidation failed");
+    s->backBuffers.clear();
+    s->swapChain.Reset();
+    if (!fgReleaseProviderWithWait(nullptr)) return mcdr::err("destroySurface", "Frame generation teardown is still active");
     s->host = nullptr;
-    if (surfaceHost == nullptr) paintParentBlackBeforeDestroy(presentChild);
-    dbgLogProgress("destroySurface stage: parent painted");
     // P33 fix：等待 per-surface present fence，确保 Display Controller 已完成
     // flip 并释放 backbuffer 引用。IMMEDIATE 模式 + FLIP_DISCARD 下，deviceWaitIdle
     // 不等待 display controller，backbuffer 仍可能被 DWM 异步读取。
@@ -2054,7 +2135,6 @@ void destroySurface(Dx12Surface* s) {
     dbgLogProgress("destroySurface stage: deleting surface");
     delete s;
     dbgLogProgress("destroySurface stage: surface deleted");
-    // P96：父窗口早在上面的 fence 等待之前就刷黑了（P183），这里只补日志与销毁子窗口。
     logWindowState("destroySurface child(before)", presentChild);
     logWindowState("destroySurface parent(before)", presentChild ? GetParent(presentChild) : nullptr);
     if (surfaceHost != nullptr) {
@@ -2064,6 +2144,7 @@ void destroySurface(Dx12Surface* s) {
     }
     logWindowState("destroySurface parent(after)", presentChild ? GetParent(presentChild) : nullptr);
     dbgLogDebug("destroySurface: done surface=%p", reinterpret_cast<void*>(s));
+    return {};
 }
 
 // 仅清理表面，不调用 deviceWaitIdle（供 C++ 内部使用：render thread 已自行退出后调用）
@@ -2071,18 +2152,18 @@ void destroySurfaceNoWaitIdle(Dx12Surface* s) {
     if (!s) return;
     if (getActiveSurface() == s) setActiveSurface(nullptr);
     HWND presentChild = s->presentWindow;
-    s->presentWindow = nullptr;
     MCDR_WindowHost* const surfaceHost = static_cast<MCDR_WindowHost*>(s->host);
+    const bool preparedWindow = prepareSurfaceWindowForDestroy(s->hwnd, presentChild, surfaceHost);
+    if (preparedWindow) dbgLogProgress("destroySurface stage: presentation hidden and parent painted");
+    s->presentWindow = nullptr;
     s->host = nullptr;
     dbgLogProgress("destroySurface stage: deleting surface");
     delete s;
     dbgLogProgress("destroySurface stage: surface deleted");
-    // P96：同 destroySurface —— 先刷黑父窗口再销毁子窗口（见该处说明）。
     if (surfaceHost != nullptr) {
         mcdr_host_release(surfaceHost);
-    } else {
-        paintParentBlackBeforeDestroy(presentChild);
-        if (presentChild != nullptr) DestroyWindow(presentChild);
+    } else if (presentChild != nullptr) {
+        DestroyWindow(presentChild);
     }
 }
 

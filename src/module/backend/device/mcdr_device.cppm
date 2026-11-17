@@ -20,6 +20,7 @@
 module;
 
 #include "_d3d12_module_prelude.h"
+#include "mcdr_graphics_recording.h"
 
 // RTX（DLSS/NGX + NRD）可用性探测结果类型 mcdr::RtxSupport。接口单元必须自己
 // 包含它：模块 purview 外的声明不会自动传给 import 方，而且这个头同时被实现单元
@@ -153,6 +154,8 @@ int setShadingRateCombiners(int first, int second);
 // 升采样到窗口尺寸（见 applySmaaToTexture / applyDlssToTexture 的注释）。
 // 返回 1=接受（该模式已生效） 0=该模式尚未实现（DLAA，等价于关） -1=非法取值。
 int setAntiAliasing(int mode);
+int antiAliasingMode();
+std::string antiAliasingLastFailureText();
 // 模式名（日志用）：OFF / SMAA / TAA / DLAA / UNKNOWN(n)。
 const char* antiAliasingName(int mode);
 
@@ -160,6 +163,8 @@ const char* antiAliasingName(int mode);
 // dxrMcAaMode）。默认关闭。与抗锯齿无关，两者可同时开；gate 见 applyDlssToTexture。
 // 返回 1=开 0=关（含"本来就是该状态"）。幂等，设备还没建也能调（只记录状态）。
 int setDlssEnabled(int enabled);
+bool dlssIsEnabled();
+std::string dlssLastFailureText();
 
 // P108：**深度快照**入口。JVM 在"世界深度还有效、vanilla 的 clearDepthTexture 之前"那一处
 // （与录速度矢量同一挂点）调用它，把当时的深度拷进 DLSS 实现单元的私有 D32 纹理；之后
@@ -246,13 +251,6 @@ struct DeviceContext {
     UINT computeUavStride = 0;                    // 堆的 DescriptorSize
     UINT computeUavNext = 0;                      // ring 游标（64 槽）
 
-    // P235：当前挂在命令列表 SRI 槽位上的着色率图像。绑定会把它的资源状态推到
-    // D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE，而这个状态只有"绑定期间"才是合法的；
-    // 解绑（image == nullptr）或换绑时必须把它转回 COMMON，否则后续任何按 COMMON
-    // 假设做状态转换的路径（读回、拷贝、UAV）都会踩到状态不匹配 —— 2026-10-25
-    // 实测到的现象是 SRI 自检在 `staging Map failed` 处失败。
-    Dx12Object* shadingRateImageBound = nullptr;
-
     // P33 async：开启异步分区后，drawHeap 的每个帧段被划出一部分给 worker 分区，
     // 同步 ring 只允许使用每段起始的 syncRingReserve 个槽位。0 = 未开启异步分区
     // （同步 ring 可用整段 kDrawHeapPerFrame）。由 dx12AsyncDescriptorCreate 设置。
@@ -278,6 +276,7 @@ struct DeviceContext {
         D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_12_2;  // 由 ensureDevice 覆写
         D3D_SHADER_MODEL shaderModel = D3D_SHADER_MODEL_5_1;  // 最高 SM；mesh shader 需 6_6+
         D3D12_MESH_SHADER_TIER meshShaderTier = D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
+        D3D12_WORK_GRAPHS_TIER workGraphsTier = D3D12_WORK_GRAPHS_TIER_NOT_SUPPORTED;
         D3D12_SAMPLER_FEEDBACK_TIER samplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
         D3D12_RAYTRACING_TIER raytracingTier = D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
         D3D12_VARIABLE_SHADING_RATE_TIER shadingRateTier = D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED;
@@ -288,21 +287,13 @@ struct DeviceContext {
         bool additionalShadingRates = false;
         D3D12_RESOURCE_BINDING_TIER resourceBindingTier = D3D12_RESOURCE_BINDING_TIER_1;
         bool enhancedBarriers = false;
+        bool barycentricsSupported = false;
         bool queried = false;  // false = CheckFeatureSupport 未被调用/全部失败
 
-        // P67：DXC（Shader Model 6.x 编译器）可用性。D3DCompile 只到 SM 5.1，而本项目
-        // **不再有 5.1 兜底**（2026-10-25 起）：图形管线硬要求 SM 6.9，mesh shader
-        // （ms_6_6/as_6_6）也必须是 DXC。设备初始化时动态加载 dxcompiler.dll 并做一次
-        // ms_6_9 冒烟编译，同时验证"这台 DXC 认 6_9"与"DXIL 链路通"。
         bool dxcAvailable = false;        // dxcompiler.dll 已加载且能拿到 IDxcCompiler3
-        bool meshShaderCompileOk = false;  // 冒烟编译（目标 ms_6_9）是否成功
         std::string dxcPath;    // 实际加载到的 dxcompiler.dll 完整路径
-        std::string dxcProfile;  // 冒烟编译使用的 target，恒为 "ms_6_9"
+        std::string dxcProfile;
         std::string dxcNote;    // 失败原因或 DXC 版本信息
-
-        // 这台 DXC 是否真的能产出 SM 6.9 的 DXIL。1.8 及更早对 6_9 报 invalid profile，
-        // 那种机器上图形管线无法建立（没有 5.1 兜底，见 graphicsShaderModelProfile）。
-        bool dxcSupportsSm69() const { return dxcProfile == "ms_6_9"; }
 
         constexpr bool meshShadersSupported() const {
             return meshShaderTier >= D3D12_MESH_SHADER_TIER_1;
@@ -385,6 +376,7 @@ struct DeviceContext {
     // （同源同调用点：模块建的目标读回 17.8/16.5/11.6/255，自建纹理全 0 且落定后仍 0）。
     // 只登记句柄、不持有引用；实现单元拿到的是本模块解包后的裸 ID3D12Resource*。
     mcdr_object* dlssOutputOverride = nullptr;
+    std::shared_ptr<void> dlssOutputOverrideLease;
     // 中间纹理：edges（边检测输出，源分辨率，RG8）→ weights（混合权重，源分辨率，RG8）。
     ComPtr<ID3D12Resource> smaaEdges;
     ComPtr<ID3D12Resource> smaaWeights;
@@ -397,10 +389,6 @@ struct DeviceContext {
     // 保持 false，权重趟退回解析式的 smaaWeightPso（见 kSmaaWeightPS 的说明），不影响渲染。
     ComPtr<ID3D12Resource> smaaAreaTex;
     ComPtr<ID3D12Resource> smaaSearchTex;
-    // 两张 LUT 的持久 SRV：自己的 2 槽 SHADER_VISIBLE 堆（不占每帧的 drawHeap 槽位）。
-    ComPtr<ID3D12DescriptorHeap> smaaLutSrvHeap;
-    D3D12_GPU_DESCRIPTOR_HANDLE smaaLutSrvGpu{};
-    UINT smaaLutSrvGpuInc = 0;
     bool smaaLutsReady = false;
     // 「用的是官方 LUT」那行 INFO 的一次性闸门：applySmaaToTexture 每帧都会走到选路代码，
     // 没有它就会逐帧刷屏（实测刷了 15 秒）。与 smaaLutFallbackWarned 互斥。
@@ -462,6 +450,19 @@ struct DeviceContext {
 // ---------------------------------------------------------------------------
 // 资源对象（Java long 句柄 = Dx12Object*）
 // ---------------------------------------------------------------------------
+struct TextureWriteRecording {
+    std::shared_ptr<const void> identity;
+    std::shared_ptr<std::atomic<bool>> discarded;
+    ComPtr<ID3D12Fence> fence;
+    uint64_t submission = 0;
+    uint32_t firstSubresource = 0;
+    uint32_t subresourceCount = 0;
+};
+struct TextureWriteRecordingEntry {
+    std::shared_ptr<void> budget;
+    TextureWriteRecording recording;
+    std::unique_ptr<TextureWriteRecordingEntry> next;
+};
 struct Dx12Object {
     // P234：ComputePipeline 不是资源，只承载 compute PSO + 它自己的固定根签名
     // （1 个 root UAV + 8 个根常量）。销毁仍走 destroyObject 的延迟删除，
@@ -469,6 +470,14 @@ struct Dx12Object {
     enum class Kind { Texture, Buffer, Sampler, TextureView, ComputePipeline };
 
     Kind kind = Kind::Buffer;
+    std::atomic<uint32_t> recordingReferences{0};
+    std::atomic<bool> closeRequested{false};
+    std::weak_ptr<void> packetContentOwner;
+    std::mutex sampledContentMutex;
+    uint32_t sampledSubresourceCount = 0;
+    TextureWriteRecording textureWriteRecording;
+    std::unique_ptr<TextureWriteRecordingEntry> additionalTextureWriteRecordings;
+    std::atomic<std::shared_ptr<void>> sampledContentOwner;
     ComPtr<ID3D12Resource> resource;  // Texture / Buffer
     D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle{};  // View / Sampler 的 CPU 句柄
     D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle{};  // View / Sampler 的 GPU 句柄
@@ -483,11 +492,16 @@ struct Dx12Object {
     // TextureView 指向的底层 Texture（采样前需 transition 到
     // PIXEL_SHADER_RESOURCE；Texture/Buffer 恒为 nullptr）。
     Dx12Object* sourceTexture = nullptr;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+    bool hasSrvDesc = false;
+    uint32_t texturePlanes = 0;
     // P234：Kind::ComputePipeline 时有效。根签名与 PSO 一起建，
     // 调用方不需要（也无法）从外部传根签名进来。
     ComPtr<ID3D12RootSignature> computeRootSignature;
     ComPtr<ID3D12PipelineState> computePipelineState;
+    bool terrainTileBinning = false;
 };
+
 
 // ---------------------------------------------------------------------------
 // 设备生命周期
@@ -498,6 +512,11 @@ struct Dx12Object {
 // 适配器常是核显，既拿不到 12_2，也会让 CreateSwapChainForHwnd 全部 E_ACCESSDENIED）。
 mcdr::Result<void> ensureDevice();
 void destroyDevice();
+mcdr::Result<void> destroyDeviceChecked();
+int32_t invalidateReconstructionInputs(void* context);
+std::shared_ptr<void> retainObjectLease(void* object);
+void* recordingContextForCommandList(void* commandList);
+void retainObjectForRecording(void* context, void* object);
 
 // P66：D3D_FEATURE_LEVEL → "12_2" 短名；未知值返回 "unknown"。
 const char* featureLevelName(D3D_FEATURE_LEVEL level);
@@ -528,10 +547,17 @@ void probeDxc(DeviceContext::Capabilities& caps);
 // 交给这里，拿回 DXIL 字节码再喂给 createMeshPipeline。失败时 Error 带 DXC 诊断首行。
 mcdr::Result<void> compileHlslToDxil(const std::string& source, const std::string& entry,
                                     const std::string& profile, std::vector<uint8_t>& outDxil);
+mcdr::Result<void> validateCapturePixelShader(const void* bytecode, uint32_t bytes);
+mcdr::Result<void> requireCaptureBarycentrics();
 
 // P234：compute 最小通路。根签名固定（1 个 root UAV(u0) + 8 个 int32 根常量(b0)），
 // 所以这里只要 DXIL 字节码，不需要绑定表；SRI / NRC 接入时换纹理格式即可，签名不用动。
 mcdr::Result<void*> createComputePipeline(const void* dxil, int32_t dxilSize);
+
+// Terrain tile binning compute PSO. The root signature is fixed to the shader
+// contract in space3: b0 draw constants, b1 batch constants, b2 binning
+// constants, t8 envelopes, and u0..u3 masks/prefixes/commands/control.
+mcdr::Result<void*> createTerrainTileBinningPipeline(const void* dxil, int32_t dxilSize);
 
 // 在已打开的命令列表上派发一次（内部做 COMMON → UNORDERED_ACCESS → COMMON 的转换）。
 // 返回 1=已派发 0=参数/资源状态不对 -2=没有打开的命令列表（与 setShadingRateNow 同一套码）。
@@ -625,6 +651,7 @@ void unmapBuffer(Dx12Object* buffer);
 // 按名引用它，且不应各自前向声明（模块内前向声明会得到另一个模块归属的类型，
 // 链接期报 LNK2001）。原本它在 PipelineDesc 之前，现前移到 CommandContext 之前。
 struct Dx12Pipeline {
+    std::atomic<uint32_t> lifetimeReferences{1};
     ComPtr<ID3D12RootSignature> rootSignature;
     ComPtr<ID3D12PipelineState> withDepth;  // 总是创建；DSV=D32_FLOAT（镜像官方 depthAttachmentFormat=126）
     ComPtr<ID3D12PipelineState> withoutDepth;  // 仅 depthState==null 时创建；DSV=UNKNOWN
@@ -634,12 +661,185 @@ struct Dx12Pipeline {
     // P72：mesh 管线（AS/MS）标记。mesh PSO 没有 IA 阶段，setPipeline 不再设置
     // IASetPrimitiveTopology（IA 状态对 mesh 管线无效，且 PSO 里本就不含输入布局）。
     bool isMesh = false;
+    bool rasterMotion = false;
+    bool rasterMotionWritesWorldColor = true;
+    UINT colorTargetCount = UINT_MAX;
+    std::vector<DXGI_FORMAT> colorTargetFormats;
+    DXGI_FORMAT depthTargetFormat = DXGI_FORMAT_UNKNOWN;
+    bool depthWrite = false;
     // P217：mesh 尾参在根签名里的参数索引（建根签名时按 CBV 稠密编号 + 地形 SRV 表
     // 的实际排版算出来，再经 createMeshPipeline 抄进来）。PushDescriptors 只设到地形
     // SRV 表（索引 = CBV 个数），b8 小常量与 t14/t15/t16 表由 drawMeshlets 补。
     // 0 表示该 PSO 没有 mesh 尾参。
     UINT segmentParam = 0;
     UINT geometryParam = 0;
+    bool meshVisibleWork = false;
+    UINT pushConstantBytes = 0;
+    UINT pushConstantParam = UINT_MAX;
+    UINT captureParam = UINT_MAX;
+    uint64_t captureHash = 0;
+    uint64_t captureGeneration = 0;
+    uint64_t shaderGeneration = 0;
+    std::shared_ptr<void> captureBudget;
+    std::shared_ptr<const void> normalizationProvenance;
+    std::vector<uint8_t> graphicsBindingTypes;
+    std::vector<uint8_t> graphicsBindingRegisters;
+    bool graphicsBindingLayoutKnown = false;
+    // Optional terrain tile route compiled from the same capture contract.
+    // The route is opaque to the device module; ownership stays with the mesh
+    // module and is retained here only while this pipeline is alive.
+    std::shared_ptr<void> terrainTileRoute;
+};
+
+struct DrawBinding {
+    uint8_t type = 0;
+    Dx12Object* buffer = nullptr;
+    long long offset = 0;
+    long long length = 0;
+    int texelFormat = 0;
+    Dx12Object* view = nullptr;
+};
+
+struct GraphicsResourceRange {
+    Dx12Object* object = nullptr;
+    uint32_t firstSubresource = 0;
+    uint32_t subresourceCount = 0;
+    uint32_t state = 0;
+    uint32_t access = 1;
+    std::shared_ptr<void> owner;
+    bool sampledWritePrepared = false;
+};
+
+struct GraphicsCaptureBinding {
+    uint64_t contractHash = 0;
+    uint64_t generation = 0;
+    uint32_t remainingDraws = 1;
+    D3D12_GPU_VIRTUAL_ADDRESS constants = 0;
+    D3D12_CPU_DESCRIPTOR_HANDLE descriptors{};
+    std::vector<GraphicsResourceRange> resources;
+    std::shared_ptr<void> lease;
+};
+
+struct GraphicsDrawState {
+    D3D12_VIEWPORT viewport{};
+    D3D12_RECT scissor{};
+    bool viewportValid = false;
+    bool scissorValid = false;
+    std::array<uint8_t, 128> pushConstants{};
+    uint32_t pushConstantBytes = 0;
+    ID3D12RootSignature* pushRoot = nullptr;
+    bool pushConstantsValid = false;
+};
+int bindGraphicsCommandObserver(void* context, const mcdr::graphics_recording::Observer& observer);
+void unbindGraphicsCommandObserver(void* context);
+int prepareGraphicsCommandCapture(void* context, const mcdr::graphics_recording::Command& command,
+    std::shared_ptr<const void>* output);
+int prepareGraphicsCommandCaptureWithInputs(void* context, const mcdr::graphics_recording::Command& command,
+    const DrawBinding* bindings, uint32_t bindingCount, D3D12_GPU_DESCRIPTOR_HANDLE geometry,
+    D3D12_GPU_VIRTUAL_ADDRESS globals, const mcdr::graphics_recording::AdapterFacts& adapter,
+    std::shared_ptr<const void>* output);
+int confirmGraphicsCommandCapture(void* context, const std::shared_ptr<const void>& packet);
+bool graphicsCommandPacketMatchesObserver(void* context, const std::shared_ptr<const void>& packet,
+    const mcdr::graphics_recording::Observer& observer, uint32_t commandFamily);
+int completeGraphicsCommandRecording(void* context, mcdr::graphics_recording::Completion completion);
+
+enum class PacketContentStatus : uint32_t {
+    Unfrozen, Frozen, UnsupportedContent, StaleRecording
+};
+struct PacketContentRange {
+    ComPtr<ID3D12Resource> resource;
+    uint32_t firstSubresource = 0, subresourceCount = 1;
+    uint64_t byteOffset = 0, byteLength = 0;
+    bool cpuWritable = false;
+    uint32_t initialState = D3D12_RESOURCE_STATE_COMMON;
+    Dx12Object* object = nullptr;
+    std::shared_ptr<void> immutableOwner;
+    ComPtr<ID3D12Resource> sourceResource;
+    uint64_t sourceByteOffset = 0;
+    Dx12Object* view = nullptr;
+};
+struct PacketContentTextureView {
+    Dx12Object* source = nullptr;
+    Dx12Object* frozen = nullptr;
+};
+struct PacketContentLease {
+    PacketContentStatus status = PacketContentStatus::Unfrozen;
+    std::shared_ptr<const void> recordingIdentity;
+    ComPtr<ID3D12Fence> fence;
+    uint64_t submission = 0;
+    std::vector<PacketContentRange> reads;
+    std::vector<PacketContentRange> frozenReads;
+    std::shared_ptr<void> frozenOwner;
+    std::vector<PacketContentTextureView> frozenViews;
+};
+std::shared_ptr<const void> retainPacketContent(void* context, void* ranges, uint32_t count);
+PacketContentStatus packetContentStatus(void* context, const std::shared_ptr<const void>& content);
+struct GraphicsCommandContentView {
+    PacketContentStatus status = PacketContentStatus::Unfrozen;
+    const DrawBinding* bindings = nullptr;
+    uint32_t bindingCount = 0;
+};
+mcdr::Result<GraphicsCommandContentView> resolveGraphicsCommandContent(
+    void* context, const std::shared_ptr<const void>& packet);
+
+enum class GraphicsPacketInspectionStatus : uint32_t {
+    Ready, StaleRecording, Unsupported, RecordingFailed
+};
+struct GraphicsPacketInspection {
+    GraphicsPacketInspectionStatus status = GraphicsPacketInspectionStatus::Unsupported;
+    mcdr::graphics_recording::ContentState content = mcdr::graphics_recording::ContentState::Unfrozen;
+    mcdr::graphics_recording::AdapterFacts adapter;
+    bool confirmed = false;
+    bool depthWrite = false;
+    bool depthTargetBound = false;
+    bool routeBound = false;
+    void* depthObject = nullptr;
+    uintptr_t pipelineIdentity = 0;
+    uint64_t shaderGeneration = 0;
+    uint32_t commandFamily = 0;
+    D3D12_CPU_DESCRIPTOR_HANDLE depthTarget{};
+    ComPtr<ID3D12PipelineState> pso;
+};
+GraphicsPacketInspection inspectGraphicsCommandPacket(void* context,
+    const std::shared_ptr<const void>& packet);
+
+enum class SampledTextureContentStatus : uint32_t {
+    Ready, UnsupportedView, OrderingUnavailable, BudgetExceeded, StaleRecording, RecordingFailed
+};
+struct SampledTextureContentCapture {
+    SampledTextureContentStatus status = SampledTextureContentStatus::UnsupportedView;
+    std::shared_ptr<const void> lease;
+    std::shared_ptr<const void> ownerIdentity;
+    uint64_t ownerGeneration = 0;
+    uint64_t contentVersion = 0;
+    uint32_t firstMip = 0, mipCount = 0, firstLayer = 0, layerCount = 0;
+};
+int captureSampledTextureContentV1(void* context, void* view, uint64_t totalBudgetBytes,
+    uint64_t* ownerIdentity, uint64_t* ownerGeneration, uint64_t* contentVersion,
+    uint32_t* firstMip, uint32_t* mipCount, uint32_t* firstLayer, uint32_t* layerCount);
+struct SampledTextureContentResolution {
+    SampledTextureContentStatus status = SampledTextureContentStatus::StaleRecording;
+    void* view = nullptr;
+};
+SampledTextureContentCapture captureSampledTextureContent(void* context, void* view, uint64_t totalBudgetBytes);
+void cancelSampledTextureContent(const std::shared_ptr<const void>& lease);
+SampledTextureContentResolution resolveSampledTextureContent(void* context, const std::shared_ptr<const void>& lease);
+SampledTextureContentStatus prepareSampledTextureWrite(void* context, void* texture, uint32_t firstSubresource, uint32_t subresourceCount);
+SampledTextureContentStatus prepareSampledRenderPassWrites(void* context);
+struct SampledTextureCpuWrite {
+    SampledTextureContentStatus status = SampledTextureContentStatus::UnsupportedView;
+    std::shared_ptr<void> lease;
+};
+// Ready lease 在当前线程保留到 CPU 写结束并在该线程释放；持有期间不得重入 sampled 操作或关闭纹理。
+// 失败返回空 lease；Ready lease 同时保留实际纹理和它的独占写锁。
+SampledTextureCpuWrite prepareSampledTextureCpuWrite(void* texture, uint32_t firstSubresource, uint32_t subresourceCount);
+
+struct GraphicsCaptureShadingRate {
+    ComPtr<ID3D12GraphicsCommandList5> commandList;
+    ID3D12GraphicsCommandList* recording = nullptr;
+    Dx12Object* image = nullptr;
+    D3D12_SHADING_RATE rate = D3D12_SHADING_RATE_1X1;
+    D3D12_SHADING_RATE_COMBINER combiners[2]{};
 };
 
 
@@ -656,6 +856,34 @@ struct RtvDsvKeyHash {
         return std::hash<void*>()(reinterpret_cast<void*>(k.resource))
                ^ (std::hash<UINT>()(k.mip) * static_cast<size_t>(0x9E3779B97F4A7C15ULL));
     }
+};
+
+struct FgPresentTicket {
+    uint64_t serial = 0;
+    uint64_t realFrameId = 0;
+    uint64_t providerGeneration = 0;
+    void* context = nullptr;
+    UINT64 fenceValue = 0;
+    bool operator==(const FgPresentTicket&) const = default;
+};
+
+struct DisplayHistoryPublication {
+    uint32_t flags = 0;
+    uint32_t outputFrameCount = 0;
+};
+
+struct SurfacePresentResult {
+    uint32_t outcome = MCDR_PRESENT_NOT_CALLED;
+    int32_t dxgiStatus = 0;
+    uint32_t flags = 0;
+    uint32_t outputFrameCount = 0;
+};
+
+enum class DisplayPresentPhase { Empty, Awaiting, Terminal, Consumed };
+
+struct DisplayPresentResult {
+    DisplayPresentPhase phase = DisplayPresentPhase::Empty;
+    mcdr_present_receipt_v1 receipt{};
 };
 
 struct CommandContext {
@@ -676,6 +904,34 @@ struct CommandContext {
     // P55：各槽位最后一次提交的 per-list fence 值。begin 时等本槽位的值，
     // 保证该槽位的 list/allocator 不再被 GPU 引用后再 Reset。
     UINT64 slotFence[3] = {0, 0, 0};
+    std::atomic<bool> submissionFailed{false};
+    std::atomic<bool> recordingFailed{false};
+    std::vector<std::shared_ptr<void>> recordingLeases[3];
+    std::shared_ptr<const void> recordingIdentity;
+    std::shared_ptr<std::atomic<bool>> recordingDiscarded;
+    std::unordered_map<Dx12Pipeline*, bool> retainedGraphicsPipelines;
+    std::unordered_map<Dx12Object*, bool> retainedRecordingObjects;
+    std::shared_ptr<void> vanillaFrameState;
+    uint64_t frameProgramGeneration = 0;
+    std::shared_ptr<void> frameprepState;
+    std::shared_ptr<void> displayFrameState;
+    DisplayPresentResult displayPresentResult;
+    std::shared_ptr<void> oitFrameState;
+    std::shared_ptr<void> oitHistoryState;
+    std::shared_ptr<void> oitPrograms;
+    GraphicsCaptureBinding graphicsCapture;
+    D3D12_SHADING_RATE recordedShadingRate = D3D12_SHADING_RATE_1X1;
+    D3D12_SHADING_RATE_COMBINER recordedShadingCombiners[2]{};
+    Dx12Object* shadingRateImageBound = nullptr;
+    GraphicsCaptureShadingRate captureShadingRate;
+    std::shared_ptr<void> controlIdentity;
+    bool graphicsHasDepth = false;
+    ComPtr<ID3D12DescriptorHeap> resourceDrawHeap;
+    UINT resourceDrawCapacity = 0;
+    ComPtr<ID3D12DescriptorHeap> resourceComputeHeap;
+    UINT resourceComputeCapacity = 0;
+    UINT resourceComputeNext = 0;
+    UINT lastSrvCbvCount = 0;
     // P55：指向 commandLists[currentListSlot] 的裸指针，供全部录制调用点直接使用
     // （保持原有 `ctx->commandList->Foo()` 写法不变）。由 beginCommandListWithWait 指向当前槽位。
     ID3D12GraphicsCommandList* commandList = nullptr;
@@ -692,6 +948,41 @@ struct CommandContext {
     // P17：整个 command list 是否有过任何 draw 写入（endRenderPass 后仍有效，供 blitSurface 判断）
     bool colorTargetsWritten = false;
     Dx12Object* activeDepthTarget = nullptr;
+    std::vector<GraphicsResourceRange> graphicsInputRanges;
+    std::vector<GraphicsResourceRange> activeAttachmentRanges;
+    std::vector<GraphicsResourceRange> graphicsBindingReadScratch;
+    std::vector<GraphicsResourceRange> graphicsBindingPendingScratch;
+    std::vector<GraphicsResourceRange> graphicsCollectScratch;
+    GraphicsDrawState graphicsDrawState;
+    mcdr::graphics_recording::Observer graphicsCommandObserver;
+    std::vector<DrawBinding> graphicsBindings;
+    bool graphicsBindingsValid = false;
+    ID3D12RootSignature* graphicsBindingRoot = nullptr;
+    D3D12_GPU_DESCRIPTOR_HANDLE graphicsBindingTable{};
+    Dx12Object* graphicsVertexBuffers[16]{};
+    Dx12Object* graphicsIndexBuffer = nullptr;
+    D3D12_VERTEX_BUFFER_VIEW graphicsVertexViews[16]{};
+    D3D12_INDEX_BUFFER_VIEW graphicsIndexView{};
+    Dx12Object* rasterMotionWorldColor = nullptr;
+    Dx12Object* rasterMotionWorldDepth = nullptr;
+    Dx12Object* rasterMotionTarget = nullptr;
+    std::vector<std::shared_ptr<void>> rasterMotionLeases;
+    std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> activePassRtvs;
+    D3D12_CPU_DESCRIPTOR_HANDLE activePassDsv{};
+    D3D12_CPU_DESCRIPTOR_HANDLE activeMotionRtv{};
+    D3D12_CPU_DESCRIPTOR_HANDLE additionalColorRtv{};
+    Dx12Object* additionalColorTarget = nullptr;
+    Dx12Object* activeMotionTarget = nullptr;
+    bool rasterMotionSelected = false;
+    UINT activePassBoundColorCount = UINT_MAX;
+
+    void* vanillaDepthSeedState = nullptr;
+    void (*vanillaDepthSeedBind)(void*, CommandContext*, Dx12Object*) = nullptr;
+    void (*vanillaDepthSeedClear)(void*, CommandContext*, Dx12Object*, UINT, double,
+                                  const D3D12_RECT*, D3D12_CPU_DESCRIPTOR_HANDLE) = nullptr;
+    void (*vanillaDepthSeedDraw)(void*, CommandContext*, Dx12Object*, Dx12Pipeline*, uint32_t,
+                                 uint64_t, const std::shared_ptr<const void>&) = nullptr;
+    uint64_t vanillaDepthSeedOrdinal = 0;
 
     // P6：本帧 drawHeap 瞬时描述符分配（ring：fenceValue%2 交替两个半区；
     // 帧 N+2 重写帧 N 半区时 submit 已等 N 完成，故 x2 足够）
@@ -728,10 +1019,7 @@ struct CommandContext {
     // 执行结束后所有提升状态已隐式 decay 回 COMMON，故每个新 list 一切资源
     // 都从初始态开始。绝不在 list 内显式回退 COMMON（D3D12 禁止）。
     std::unordered_map<ID3D12Resource*, D3D12_RESOURCE_STATES> resourceState;
-    // 本 command list 内被 transition 到 COPY_SOURCE 的 UPLOAD heap staging buffer。
-    // endCommandList 必须将它们回切 GENERIC_READ（而非 COMMON），因为下一帧
-    // beginCommandList 以 GENERIC_READ 为初始态假设，GPU 实际状态必须匹配。
-    std::unordered_set<ID3D12Resource*> stagingCopySourceResources;
+    std::unordered_map<ID3D12Resource*, std::unordered_map<UINT, D3D12_RESOURCE_STATES>> subresourceState;
 
     // P109（#538 根因修复）：本 ctx 的帧级 RTV/DSV 句柄缓存属于描述符堆的哪一代（见
     // d3d12_device.cpp 的 gFrameViewGeneration / UINT gNextFrameRtv 的说明）。代不一致 ⇒
@@ -760,11 +1048,18 @@ struct CommandContext {
 // 创建命令上下文：3 个 allocator + command list + fence + event。
 mcdr::Result<void*> createCommandEncoder();
 void destroyCommandEncoder(CommandContext* ctx);
+int destroyCommandEncoderChecked(CommandContext* ctx);
+int commandRecordingStatus(void* context) noexcept;
+enum class CommandContextControlStatus : int {
+    Ready,
+    Invalid,
+    Busy,
+    SubmissionUnknown,
+};
+int validateCommandContextControl(void* context) noexcept;
 
-// 开始录制：先等待 GPU 完成 waitForValue 对应的提交（若 waitForValue > 0），
-// 再 Reset 当前 allocator + list。用于异步多线程场景，确保 allocator 不被
-// 还在使用的 GPU 命令列表引用时覆写。waitForValue == 0 时跳过等待（兼容原有
-// 单线程路径及 createBuffer 一次性路径）。
+// 开始录制前至少等待当前槽最后一次提交完成，才能 Reset allocator + list。
+// waitForValue 是 context fence 的额外等待下限，传 0 仍保留当前槽的等待要求。
 mcdr::Result<void> beginCommandList(CommandContext* ctx);
 mcdr::Result<void> beginCommandListWithWait(CommandContext* ctx, UINT64 waitForValue);
 // 结束录制：Close list（之后可提交）。
@@ -783,6 +1078,10 @@ void restoreDrawHeap(CommandContext* ctx);
 // 非阻塞（GPU 异步执行）；fence 信号值同时写入当前 active surface 的 per-backbuffer 记录。
 // 返回本次提交的 fence value。
 mcdr::Result<UINT64> submitCommandList(CommandContext* ctx);
+int submitCommandListV1(CommandContext* ctx, uint64_t* submittedFence);
+int settleCommandSubmissionV1(CommandContext* ctx, uint64_t timeoutMs, uint64_t* submittedFence);
+int submitDisplayGuidesAndResume(void* opaqueContext, uint64_t* guideFence);
+mcdr::Result<void> abortDisplayFrame(void* opaqueContext);
 // 等待 fence 值达到 value；timeoutNs 为纳秒。返回是否完成。
 mcdr::Result<void> waitForFenceValue(CommandContext* ctx, UINT64 value, UINT64 timeoutNs);
 // 当前 fence value（Java 侧 createFence 记录用）。
@@ -806,9 +1105,9 @@ mcdr::Result<void> waitForContextFenceValue(CommandContext* ctx, UINT64 value, U
 //   4. SUBMIT_DONE      — 渲染线程发信号，命令已提交，回到步骤 1
 // ---------------------------------------------------------------------------
 bool initAsyncRenderer(UINT workerCount);
-void destroyAsyncRenderer();
+bool destroyAsyncRenderer();
 // 等待渲染线程完成当前帧（不销毁线程，仅同步到 gEvtSubmitDone 触发后）
-void waitForRenderThreadSubmit();
+bool waitForRenderThreadSubmit();
 // P48（多帧飞行）：等待所有已提交帧完成 Present。acquireSurface 在真正调用
 // GetCurrentBackBufferIndex 之前必须调用它——Present 未完成时 index 不会轮转，
 // 提前 acquire 会拿到同一个 back buffer（两帧写同一处 → 闪帧/撕裂）。
@@ -887,6 +1186,12 @@ void transitionBufferTo(CommandContext* ctx, Dx12Object* buf, D3D12_RESOURCE_STA
 // 不在 Dx12Object 包装中的资源。blitSurface 用它跟踪 back buffer 状态。
 void transitionTo(CommandContext* ctx, ID3D12Resource* res, D3D12_RESOURCE_STATES fromInitial,
                   D3D12_RESOURCE_STATES to);
+mcdr::Result<void> transitionResourceRange(void* context, void* resource, uint32_t first,
+                                          uint32_t count, uint32_t initialState, uint32_t state);
+mcdr::Result<void> adoptResourceRangeState(void* context, void* resource, uint32_t first,
+                                          uint32_t count, uint32_t initialState, uint32_t state);
+uint32_t resourceSubresourceState(void* context, void* resource, uint32_t subresource,
+                                 uint32_t initialState);
 
 // clear 颜色纹理（整纹理，RENDER_ATTACHMENT）。
 mcdr::Result<void> clearColorTexture(CommandContext* ctx, Dx12Object* tex, float r, float g, float b, float a);
@@ -947,6 +1252,8 @@ mcdr::Result<void> beginRenderPass(CommandContext* ctx, Dx12Object* const* color
                                   Dx12Object* depthView, int depthMip, int depthClearFlag, double depthClearValue,
                                   int x, int y, int w, int h);
 mcdr::Result<void> endRenderPass(CommandContext* ctx);
+mcdr::Result<void> setRasterMotionTarget(void* context, void* worldColor, void* worldDepth, void* motion);
+mcdr::Result<void> setAdditionalColorTarget(void* context, void* target);
 
 // ---------------------------------------------------------------------------
 // Timestamp query pool（P3）
@@ -978,6 +1285,11 @@ DXGI_FORMAT toDxgiVertexFormat(int gpuFormat);
 // ---------------------------------------------------------------------------
 // Java 侧 dx12CreateGraphicsPipeline 的 desc 解析产物（字段语义见 Dx12Native Javadoc）。
 struct PipelineDesc {
+    uint32_t pushConstantBytes = 0;
+    uint64_t captureHash = 0;
+    uint64_t captureGeneration = 0;
+    std::shared_ptr<const void> normalizationProvenance;
+    bool rasterMotion = false;
     struct ColorTarget {
         int format = 0;  // GpuFormat ordinal；-1 = 未使用槽位
         uint8_t writeMask = 0;
@@ -1012,6 +1324,8 @@ struct PipelineDesc {
 
 // 创建管线（D3DCompile + root signature + 双 PSO）；失败返回 mcdr::Error。
 mcdr::Result<void*> createGraphicsPipeline(const PipelineDesc& desc);
+uint64_t allocateGraphicsPipelineGeneration();
+mcdr::Result<void> pushGraphicsConstants(void* context, const void* data, uint32_t byteSize);
 void destroyPipeline(Dx12Pipeline* pipeline);
 
 // ---------------------------------------------------------------------------
@@ -1047,8 +1361,6 @@ struct SharpenPipeline {
 };
 mcdr::Result<void> initSharpenPipeline();
 const SharpenPipeline* getSharpenPipeline();
-// P22: 在 srvHeap 为 srcTex 分配 SRV 槽位并设置根描述符表（srvGpu 已绑定）。
-// 调用方无需关心 srvHeap 内部细节。
 mcdr::Result<void> blitBindSourceTexture(CommandContext* ctx, Dx12Object* srcTex, ID3D12GraphicsCommandList* cmd);
 
 // P104b：SMAA。对一张已渲染完成的纹理**就地**应用三个全屏阶段（边检测 → 混合权重 →
@@ -1059,7 +1371,7 @@ mcdr::Result<void> blitBindSourceTexture(CommandContext* ctx, Dx12Object* srcTex
 // P104/P108：**只在 aaMode == 1 时工作**（0/2/3 一律跳过）。DLSS 已从抗锯齿枚举里拆成独立
 // 开关（用户 m10920），所以本函数**不再**和 DLSS 互斥：两者都开时，这三趟先跑在低分辨率
 // 世界层上，然后由 applyDlssToTexture 把它升采样到窗口尺寸。
-bool applySmaaToTexture(CommandContext* ctx, Dx12Object* tex);
+int applySmaaToTexture(CommandContext* ctx, Dx12Object* tex);
 
 // P152：TAA（时域抗锯齿）—— 与 applySmaaToTexture 同一个调用点（世界层画完、GUI 之前），
 // 区别是状态在**本模块**里跨帧保留（历史纹理乒乓 + jitter），JVM 每帧只送参数。
@@ -1091,7 +1403,7 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
 // 任何一步失败（NGX 缺失 / Init / 建特征 / Evaluate）都只 WARN 或 ERROR 一次并永久关掉
 // DLSS，返回 false —— 调用方保持既有路径（线性 blit），绝不重试、绝不黑屏。
 // 静默跳过的条件：独立开关关闭（!gCtx.dlssEnabled，见 setDlssEnabled）或参数不全。
-bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in);
+int applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in);
 
 // P108：DLSS 可用性与状态的单行查询（UI / 日志用）。输出的一行文字写进 out
 // （NUL 结尾；out 可为 nullptr）。返回 1=可用 0=不可用 -1=参数非法。
@@ -1139,6 +1451,7 @@ public:
     virtual void onResize(int32_t renderWidth, int32_t renderHeight, int32_t displayWidth,
                           int32_t displayHeight) = 0;
     virtual bool evaluate(CommandContext* ctx, const mcdr_sr_dispatch& desc) = 0;
+    virtual std::string failureText() const { return {}; }
     // ^ 资源与屏障的责任分工（P273，实现方必须遵守）：
     //   1) **过渡归 provider**：它自己把输入过渡到后端要的状态、把输出过渡到 UAV / RT。
     //      必须走 transitionTextureTo / transitionTo 的跟踪路径，不许自己写裸 ResourceBarrier
@@ -1169,14 +1482,19 @@ void srFillCaps(int32_t backendId, mcdr_sr_caps& out);
 // 返回 1=已生效 0=后端不可用 -1=参数非法。重复调用同一个后端是幂等的。
 int32_t srCreateProvider(CommandContext* ctx, int32_t backendId, int32_t maxRenderWidth,
                          int32_t maxRenderHeight, int32_t displayWidth, int32_t displayHeight);
-int32_t srResizeProvider(int32_t renderWidth, int32_t renderHeight, int32_t displayWidth,
+int32_t srResizeProvider(CommandContext* ctx, int32_t renderWidth, int32_t renderHeight, int32_t displayWidth,
                          int32_t displayHeight);
+int32_t srPrepareProvider(CommandContext* ctx, const mcdr_sr_dispatch& description,
+    int32_t dlssQuality, int32_t dlssPreset, uint64_t* token);
+int32_t srCommitPreparedProvider(uint64_t token);
+int32_t srAbortPreparedProvider(uint64_t token);
 int32_t srEvaluateFrame(CommandContext* ctx, const mcdr_sr_dispatch& desc);
+std::string srLastFailureText();
 // P274：后端报告它期望的 jitter 相位长度（0 = 不适用）。上层据此决定是"让后端接受我们
 // 的序列"（DLSS/SL）还是"切到后端序列"（FSR/XeSS），见 `D3D12Temporal.adoptPhaseCount`。
 int32_t srJitterPhaseCount(int32_t backendId, int32_t renderWidth, int32_t displayWidth);
 // 释放当前 provider（幂等）。调用后生效后端回到 None。
-void srReleaseProvider(void);
+bool srReleaseProvider(void);
 std::string srStatusText(void);
 
 // ---- 后端工厂（P277 起：每个后端一个实现单元，注册表按需懒建）----
@@ -1229,7 +1547,9 @@ struct FgFrameInputs {
     void* pDepth = nullptr;
     D3D12_RESOURCE_STATES depthState = D3D12_RESOURCE_STATE_DEPTH_READ;
     void* pMotionVectors = nullptr;
+    void* pUi = nullptr;
     D3D12_RESOURCE_STATES motionVectorState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    D3D12_RESOURCE_STATES uiState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     int32_t renderWidth = 0;
     int32_t renderHeight = 0;
     int32_t displayWidth = 0;
@@ -1241,7 +1561,23 @@ struct FgFrameInputs {
     float cameraVerticalFov = 0.0f;  // 弧度
     float frameTimeDeltaMs = 0.0f;
     float viewSpaceToMeters = 0.0f;
+    float cameraPosition[3] = {};
+    float cameraRight[3] = {};
+    float cameraUp[3] = {};
+    float cameraForward[3] = {};
+    float currentViewProjection[16] = {};
+    float previousViewProjection[16] = {};
+    float projection[16] = {};
+    float jitterX = 0.0f;
+    float jitterY = 0.0f;
+    float mvScaleX = 0.0f;
+    float mvScaleY = 0.0f;
+    uint64_t realFrameId = 0;
+    bool motionVectorsDilated = false;
+    std::shared_ptr<void> resourceLease;
 };
+
+enum class FgInputAcceptance : uint32_t { Skipped, Accepted, Failed };
 
 class IFrameGenProvider {
 public:
@@ -1256,10 +1592,9 @@ public:
     // 设期望值。**只记录**：真正下发发生在下一次 beforePresent（渲染线程）。
     // 返回 true = 已接受（不代表已生效，生效看 presented()）。
     virtual bool setMode(const mcdr_fg_dispatch& desc) = 0;
-    // 帧首（`acquireSurface` 消费完挂起的链重建之后、本帧还没有开画）。给需要"帧起点"
-    // 语义的后端用：XeSS-FG 的 XeLL marker（RENDERSUBMIT_START）必须在这里发，且帧号要与
-    // 后面的 `SetPresentId` 一致（`xess_fg_developer_guide_english.md:240`）。默认空实现。
     virtual void frameStart() {}
+    virtual bool waitForPreviousFrame() { return true; }
+    virtual void discardFrameInputs() {}
     // Present 之前 / 之后各一次，都在渲染线程。**不许在这里 Present**（D4）：
     // 链的所有权见 chainOwner()，provider 只做"Present 之前该做的准备"。
     virtual void beforePresent() = 0;
@@ -1295,13 +1630,13 @@ public:
     }
     // 解包：链要重建/后端要换人时先调它（SDK 的 context 必须先于链释放）。
     virtual void unwrapSwapChain() {}
+    virtual bool tryUnwrapSwapChain() { unwrapSwapChain(); return true; }
 
-    // P305b：**这一帧**的输入 tag。Context 里带着本帧的命令列表，调用点在 `srEvaluateFrame`
-    // 的 `restoreDrawHeap` 之后 —— 那里 SR 已跑完、render pass 已结束、命令列表还开着，正是
-    // XeSS 的 `TagFrameResource(cmdList, …)` 与 FSR 的 `InterpolationCommandListDX12` 要的时机。
-    // 默认空实现：DLSS-G 在 `d3d12_dlss.cpp` 里自己交 tag（同一次 `slSetTagForFrame`）。
     // P305c：UI 纹理（用户裁决 = GUI 合成目标）。传 nullptr 撤销。只在目标重建时调。
-    virtual void setUiTexture(void* object) { static_cast<void>(object); }
+    virtual void setUiTexture(void* object, std::shared_ptr<void> lease = {}) {
+        static_cast<void>(object);
+        static_cast<void>(lease);
+    }
     // P306ac：hudless 呈现开关。1 = 应用 Present 的**世界层不含 UI**，UI 单独作为一张
     // UI-only 纹理交给后端合成（FSR-FG 的 `RegisterUiResource` 路径）；0 = 老路径，应用自己
     // 把 UI 合成进 backbuffer，后端不得再注册 UI（否则同一份 HUD 会被画两遍）。
@@ -1310,15 +1645,15 @@ public:
     virtual void setUiComposition(int32_t enabled) { static_cast<void>(enabled); }
     // P306ac：后端是否真的会替我们把 UI 合成到 presented 帧上。只有它返回 true，应用才敢
     // Present 一张不含 UI 的图。默认 false = "没人合成 UI"。
-    virtual bool uiCompositionReady() const { return false; }
+    virtual bool uiCompositionReady() { return false; }
     // P305z：帧常量（View/Projection 等）由 FG 载荷带进来，provider 自己决定怎么喂给 SDK。
     virtual void setFrameConstants(const mcdr_fg_constants& constants) { (void)constants; }
 
-    // P305b：**这一帧**的输入 tag。命令列表还开着、SR 已跑完 —— 正是 XeSS 的
-    // `TagFrameResource(cmdList, …)` 与 FSR 的 `InterpolationCommandListDX12` 要的时机。
-    // P305ag：载荷换成 `FgFrameInputs`（SR 通用路径与 DLSS 路径都能交，见上面的结构注释）。
-    // 默认空实现：DLSS-G 在 `d3d12_dlss.cpp` 里自己交 tag（同一次 `slSetTagForFrame`）。
-    virtual void tagFrameInputs(const FgFrameInputs& inputs) { static_cast<void>(inputs); }
+    virtual FgInputAcceptance tagFrameInputs(const FgFrameInputs& inputs) {
+        static_cast<void>(inputs);
+        return FgInputAcceptance::Skipped;
+    }
+    virtual bool historyAcceptedAfterPresent() const { return true; }
 };
 
 // ---- 注册表（与 SR 注册表同风格：期望 → 生效两级）----
@@ -1330,11 +1665,34 @@ void fgFillCaps(int32_t backendId, mcdr_fg_caps& out);
 int32_t fgEnsureProvider(void);
 // 记下期望值并转给 provider（provider 未建时按需建）。返回 1=已接受 0=不可用 -1=参数非法。
 int32_t fgSetMode(const mcdr_fg_dispatch& desc);
-// 由 presentSurface 在 Present 前后调用（渲染线程）。没有生效后端时是空操作。
-// `fgFrameStart` 挂在 `acquireSurface` 帧首（XeSS-FG 的 XeLL marker 需要帧起点语义）。
-void fgFrameStart(void);
-void fgBeforePresent(void);
-void fgAfterPresent(void);
+int32_t fgPrepareMode(const mcdr_fg_dispatch& description, uint64_t* token);
+int32_t fgCommitPreparedConfiguration(uint64_t token, uint64_t srToken, int32_t antiAliasing);
+int32_t fgAbortPreparedMode(uint64_t token);
+int beginDisplayFrameRecording(void* context);
+mcdr::Result<int32_t> settleDisplayFrame(void* context, uint64_t timeoutMs, void* receipt, uint32_t byteCount);
+mcdr::Result<void> beginDisplayPresentReceipt(const FgPresentTicket& ticket);
+void attachDisplayPresentIdentity(void* context, const mcdr_frame_identity& identity, uint64_t historyGeneration);
+void queueDisplayPresentReceipt(const FgPresentTicket& ticket, uint32_t submissionState);
+void failDisplayPresentSubmission(void* context);
+void cancelDisplayPresentReceipt(void* context);
+void completeDisplayPresentReceipt(const FgPresentTicket& ticket, SurfacePresentResult result,
+    uint64_t presentQueueFenceValue, uint32_t retirementState);
+int fgAttachWorldFrame(void* context, const mcdr_vanilla_frame_input& frame);
+int fgMarkGuiReady(void* context, const mcdr_frame_identity& identity);
+bool fgDisplayFrameQueued(void* context);
+bool fgDisplayFrameStarted();
+FgPresentTicket fgDisplayFrameTicket(void* context);
+FgPresentTicket fgCurrentDisplayFrameTicket();
+bool fgDisplayFrameCurrent(const FgPresentTicket& ticket);
+mcdr::Result<FgPresentTicket> fgQueueDisplayFrame(CommandContext* context, UINT64 fenceValue);
+void fgAbortDisplayFrame(void* context);
+void fgAbortDisplayFrame(const FgPresentTicket& ticket);
+void fgBeforePresent(const FgPresentTicket& ticket);
+DisplayHistoryPublication fgAfterPresent(const FgPresentTicket& ticket, int32_t presentSucceeded);
+int evaluatePreparedReconstruction(void* context, const void* frameCopy,
+    const void* preparedCopy, const void* requestCopy);
+void invalidateFrameGenerationHistory(uint32_t reason);
+void invalidatePreparedReconstructionHistory();
 // 上一次真正提交的帧数；没有生效后端时返回 1（= 没插帧），与老语义一致。
 int32_t fgPresented(void);
 void fgOnResize(int32_t displayWidth, int32_t displayHeight);
@@ -1343,7 +1701,7 @@ void fgOnResize(int32_t displayWidth, int32_t displayHeight);
 // DLSS-G 不提交 —— 帧 token 由 SL 自己管，所以它从不调这里，backendFrameId 恒为 0。
 void fgNoteBackendFrame(uint64_t backendFrameId);
 // 释放（幂等）。等 GPU 追平的做法与 P280 一致：只等已提交的 fence 值，不等 +1。
-void fgReleaseProviderWithWait(CommandContext* ctx);
+bool fgReleaseProviderWithWait(CommandContext* ctx);
 std::string fgStatusText(void);
 // P300：状态打包成 int32（位布局见 `include\mcdr_abi.h` 的 `mcdr_dx12FgState`）。
 // 存在理由：回滚会在 native 侧把期望的 mode 清成 0，而 JVM 的 options.txt 仍写着「开」，
@@ -1364,18 +1722,14 @@ int32_t fgChainOwnerFast(void);
 // 链之前调用 —— provider 的 context 绑在那条链上。
 int32_t fgWrapPresentChain(void* device, void* queue, void* appChain, int32_t width, int32_t height, int32_t format,
                            void** outPresentChain);
-void fgUnwrapPresentChain(void);
+bool fgUnwrapPresentChain(void);
 
-// P305b：把本帧的输入 tag 交给包装型 provider。注册表侧持锁调用，provider 内部不得回头
-// 调注册表（`std::mutex` 不可重入）。
-// P305ag：两个入口 —— SR 通用路径把 `mcdr_sr_dispatch` 折成 `FgFrameInputs`（`fgMakeFrameInputs`）；
-// DLSS（Streamline / NGX）路径不走 `srEvaluateFrame`，自己填 `FgFrameInputs` 直接交。
-FgFrameInputs fgMakeFrameInputs(CommandContext* ctx, const mcdr_sr_dispatch& sr);
-void fgTagFrameInputs(const FgFrameInputs& inputs);
+int checkDisplayFramePreparation(void* context, const void* input, uint32_t bytes);
+int skipDisplayFrameGeneration(void* context, const void* input, uint32_t bytes);
+int submitDisplayFrameGeneration(void* context, const void* input, uint32_t bytes, const FgFrameInputs& guides);
 
 // P305c：登记/撤销 UI 纹理句柄（`Dx12Object*`）。注册表侧持锁保存，provider 在 tag 时读取。
 void fgSetUiTexture(void* object);
-void fgSetFrameConstants(const mcdr_fg_constants* constants);
 
 // P306ac：hudless 呈现模式（present 的世界层不含 UI、UI 由 SDK 合成）。只记期望值并转给
 // 当前 provider；登记表在 provider 后建时回放（与 `uiTexture` 同一条纪律）。
@@ -1400,11 +1754,11 @@ void fgNoteChainRebuildDone(int32_t ownerAfterRebuild, int32_t ok, const char* r
 // 销毁（`swapChain.Detach()` 之后回不来），此时如果照旧返回错误，surface 就停在"没有链"的状态：
 // 游戏逻辑还在跑、画面一帧都不再上屏。所以失败路径必须先调这里 —— 它关掉期望、把链归属记回
 // 原生、拆掉 provider，并记下 `lastReason`；随后调用方按"不需要包装"重建一条纯应用链。
-void fgAbortWrapAfterFailure(const char* reason);
+bool fgAbortWrapAfterFailure(const char* reason);
 
 // P305ad：链重建属于**帧边界**职责，不能只挂在 `acquireSurface` 上 —— 那个函数由 JVM 在特定渲染路径才调，
 // 于是 `rebuildPending` 置真之后可能永远没人消费。这里把它暴露给其它实现单元（帧首消费点）。
-mcdr::Result<void> rebuildSwapChainForFg(Dx12Surface* s, const char* why);
+mcdr::Result<void> rebuildSwapChainForFg(Dx12Surface* s, const char* why, void* recording = nullptr);
 
 // ---- 后端工厂（P293 起：每家一个实现单元，注册表按需懒建）----
 // DLSS-G 的 provider 在 `src\core\d3d12_framegen.cpp` 里，是对既有
@@ -1461,17 +1815,22 @@ mcdr::Result<void> setIndexBuffer(CommandContext* ctx, Dx12Object* buffer, int i
 //   type 0 = CBV（buffer + offset + length，offset 须 256 对齐）
 //   type 1 = SRV（复制 texture view 的现有描述符）
 //   type 2 = SRV（texel buffer，按 texelFormat 建 Buffer SRV）
-struct DrawBinding {
-    uint8_t type = 0;
-    Dx12Object* buffer = nullptr;  // CBV / TEXEL 的 buffer
-    long long offset = 0;  // CBV offset
-    long long length = 0;  // CBV length（内部向上取整 256）
-    int texelFormat = 0;  // TEXEL SRV 的 GpuFormat ordinal
-    Dx12Object* view = nullptr;  // SAMPLED_IMAGE 的 texture view
-};
 // B（拆根签名）：CBV 走 root descriptor（SetGraphicsRootConstantBufferView，不占堆
 // 槽位），SRV 写入本帧 drawHeap 瞬时槽位并 SetGraphicsRootDescriptorTable(cbvCount)。
 mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindings);
+struct DrawDescriptorRange {
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu{};
+    UINT offset = 0;
+};
+mcdr::Result<DrawDescriptorRange> allocateDrawDescriptors(CommandContext* context, UINT count);
+mcdr::Result<void> collectGraphicsInputs(void* context, bool indexed, void* indirectCommands);
+mcdr::Result<void> appendGraphicsInputBindings(void* context, const void* bindings, uint32_t bindingCount);
+mcdr::Result<void> applyGraphicsInputReads(void* context);
+mcdr::Result<void> applyGraphicsCapture(void* context);
+void restoreGraphicsCaptureRate(void* context);
+void invalidateGraphicsInputBindings(void* context, bool invalidateIa);
+void restoreGraphicsInputAssembly(void* context);
 
 mcdr::Result<void> drawIndexedInstanced(CommandContext* ctx, UINT indexCount, UINT instanceCount,
                                         INT startIndexLocation, INT baseVertexLocation,
@@ -1499,6 +1858,7 @@ mcdr::Result<void> drawMeshlets(CommandContext* ctx, Dx12Object* vertexBuffer, l
 constexpr UINT kSurfaceBufferCount = 3;  // 镜像官方 minImageCount max(3, min)
 
 struct Dx12Surface {
+    std::mutex presentMutex;
     ComPtr<IDXGISwapChain3> swapChain;
     uintptr_t hwnd = 0;  // 重建 swapchain 时需要；ResizeBuffers 失败时销毁重建用
     // RTSS/OSD 修复：GLFW 主窗口一旦用 GL 呈现过画面，DXGI 就永久拒绝对该 HWND
@@ -1585,6 +1945,7 @@ struct Dx12Surface {
     // IMMEDIATE 模式 + FLIP_DISCARD 下 deviceWaitIdle 不等待 display controller，
     // 此 fence 填补该空档，避免 backbuffer 被 DWM/显示器读取时释放导致 CORRUPTION。
     std::vector<UINT64> surfacePresentFences;
+    FgPresentTicket frameGenerationTicket;
 };
 
 // P18：当前 active surface（单例，渲染线程访问）。submit 时写入 per-backbuffer fence。
@@ -1594,13 +1955,13 @@ inline Dx12Surface* getActiveSurface() { return gActiveSurface; }
 // P33：async 渲染线程 handle（供 destroySurface 在关闭渲染线程后等待 GPU 空闲使用）
 extern std::thread gRenderThread;
 // P33：渲染线程运行标志（供 destroySurface 判断是否需要等待线程退出）
-extern bool gRenderRunning;
+extern std::atomic<bool> gRenderRunning;
 // P33：当前正在处理的 ctx（nullptr = 无活动帧），供诊断读回函数检测 ASYNC 管道活跃。
-extern CommandContext* gAsyncRenderCtx;
+extern std::atomic<CommandContext*> gAsyncRenderCtx;
 // P33：本帧的 Present 是否已由渲染线程执行（true = Java 侧 present() 必须跳过，
 // 否则会重复 Present：一个渲染完成的帧 + 一个未渲染的 back buffer 交替显示，
 // 表现为窗口闪烁各种颜色）。由渲染线程 present 后置位，Java present() 消费后清位。
-extern bool gAsyncOwnsPresent;
+extern std::atomic<bool> gAsyncOwnsPresent;
 
 // 从 rtvHeap 分配一个 RTV CPU 句柄（surface 的 back buffer 用）。
 mcdr::Result<D3D12_CPU_DESCRIPTOR_HANDLE> allocRtvHandle();
@@ -1628,6 +1989,7 @@ void setHdrMode(int32_t mode);
 int32_t hdrActiveFlag();
 // 获取当前 back buffer index（DXGI FLIP 模型下 Present 内部同步）。
 mcdr::Result<void> acquireSurface(Dx12Surface* s);
+mcdr::Result<void> prepareDisplayPresentChain(Dx12Surface* s, void* recording);
 // 录制 blit（源纹理 -> back buffer）：在 command list 录制状态下调用；
 // 源与目标格式须一致（RGBA8/BGRA8 族可直接拷贝）。返回 Error 表示未录制。
 mcdr::Result<void> blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex);
@@ -1643,8 +2005,8 @@ mcdr::Result<void> sharpenTextureToTexture(CommandContext* ctx, Dx12Object* src,
 mcdr::Result<D3D12_CPU_DESCRIPTOR_HANDLE> acquireTextureRtv(CommandContext* ctx, Dx12Object* tex);
 // Present(interval, flags)：FIFO=Present(1,0)；IMMEDIATE=Present(0,0)；
 // FIFO_RELAXED=Present(1,ALLOW_TEARING)。
-void presentSurface(Dx12Surface* s);
-void destroySurface(Dx12Surface* s);
+SurfacePresentResult presentSurface(Dx12Surface* s, FgPresentTicket ticket = {});
+mcdr::Result<void> destroySurface(Dx12Surface* s);
 // 仅清理表面，不调用 deviceWaitIdle（供 C++ 内部调用，在 render thread 已停止后使用）
 void destroySurfaceNoWaitIdle(Dx12Surface* s);
 // P6 诊断：把当前 back buffer 读回 CPU 并打印 3x3 采样点 RGBA（每 ~60 帧调用
@@ -1674,7 +2036,6 @@ mcdr::Result<void> deviceWaitIdle();
 
 // 自检：创建 texture/buffer/sampler/view 各一，验证资源层可用后销毁。
 // 返回描述字符串（成功/失败明细）。
-std::string runResourceSelfTest();
 
 // 枚举所有 D3D12 适配器，返回 JSON 数组字符串：
 // [{"name":"...","luid":0x...,"vid":0x...,"did":0x...,"vram_gb":N,...},...]
@@ -1702,4 +2063,6 @@ std::string graphicsShaderModelProfile();
 std::string sm69RequirementText();
 std::string firstLine(const std::string& text);
 std::string errorMessage(const mcdr::Error& error);
+FgPresentTicket fgDisplayGuideTicket(void* context);
+void fgNoteRecordingSubmitted(CommandContext* context, UINT64 fenceValue);
 }

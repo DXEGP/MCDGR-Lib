@@ -6,10 +6,9 @@
 module;
 
 #include "_d3d12_module_prelude.h"
+#include "mcdr_abi.h"
 
 module mcdr.abi.common;
-
-#include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
 
 import mcdr.d3d12.device;
 import mcdr.d3d12.mesh;
@@ -65,6 +64,22 @@ using namespace d3d12_mc;
 //     proved every draw in the batch shares the same SRV set (`srvUniform`).
 
 namespace {
+
+PartitionedDescriptorAllocator* descriptorAllocator(mcdr_desc_alloc* handle) {
+    return reinterpret_cast<PartitionedDescriptorAllocator*>(handle);
+}
+
+BundleRecorderPool* bundlePool(mcdr_bundle_pool* handle) {
+    return reinterpret_cast<BundleRecorderPool*>(handle);
+}
+
+AsyncFenceManager* fenceManager(mcdr_fence_mgr* handle) {
+    return reinterpret_cast<AsyncFenceManager*>(handle);
+}
+
+MainCommandExecutor* commandExecutor(mcdr_executor* handle) {
+    return reinterpret_cast<MainCommandExecutor*>(handle);
+}
 
 // 统一走 native 日志前缀（与 JVM 侧 log4j 同形），与 dbgLog* 的行外观一致。
 void logFail(const char* what) {
@@ -306,14 +321,6 @@ int32_t prepareObjects(mcdr_command_ctx* ctx, mcdr_object* const* objects, int32
 
 }  // namespace
 
-// BundleRecorder::correctedStride 读取本 bundle 记下的 per-slot 修正 stride 映射。
-// 映射由 setCorrectedStride 在 mcdr_dx12AsyncBundleSetPipelineState 里从 Dx12Pipeline
-// 抄入；本模块（异步 bundle）不 import 设备模块，故不持有 Dx12Pipeline*。
-UINT BundleRecorder::correctedStride(int slot) const {
-    auto it = m_correctedStrides.find(slot);
-    return it == m_correctedStrides.end() ? 0u : it->second;
-}
-
 extern "C" {
 
 // ===========================================================================
@@ -348,7 +355,7 @@ mcdr_desc_alloc* MCDR_CALL mcdr_dx12AsyncDescriptorCreate(int32_t workerCount) {
     // worker partitions and the sync ring cannot silently overwrite worker
     // descriptors. Must equal the reservedPerSection used by alloc->init above.
     dc.syncRingReserve = kAsyncSyncRingReserve;
-    return alloc;
+    return reinterpret_cast<mcdr_desc_alloc*>(alloc);
 }
 
 void MCDR_CALL mcdr_dx12AsyncDescriptorDestroy(mcdr_desc_alloc* alloc) {
@@ -357,7 +364,7 @@ void MCDR_CALL mcdr_dx12AsyncDescriptorDestroy(mcdr_desc_alloc* alloc) {
         // drawHeap section again.
         deviceContext().syncRingReserve = 0;
     }
-    delete alloc;
+    delete descriptorAllocator(alloc);
 }
 
 int32_t MCDR_CALL mcdr_dx12AsyncDescriptorRegionBase(mcdr_desc_alloc* alloc, int32_t frameSlot,
@@ -365,7 +372,8 @@ int32_t MCDR_CALL mcdr_dx12AsyncDescriptorRegionBase(mcdr_desc_alloc* alloc, int
     if (!alloc) {
         return -1;
     }
-    const UINT base = alloc->regionBaseSlot(static_cast<UINT>(frameSlot), static_cast<UINT>(worker));
+    const UINT base = descriptorAllocator(alloc)->regionBaseSlot(static_cast<UINT>(frameSlot),
+                                                                 static_cast<UINT>(worker));
     return base == UINT_MAX ? -1 : static_cast<int32_t>(base);
 }
 
@@ -374,14 +382,14 @@ int32_t MCDR_CALL mcdr_dx12AsyncDescriptorAllocate(mcdr_desc_alloc* alloc, int32
     if (!alloc || count <= 0) {
         return -1;
     }
-    const UINT slot =
-        alloc->allocate(static_cast<UINT>(frameSlot), static_cast<UINT>(worker), static_cast<UINT>(count));
+    const UINT slot = descriptorAllocator(alloc)->allocate(
+        static_cast<UINT>(frameSlot), static_cast<UINT>(worker), static_cast<UINT>(count));
     return slot == UINT_MAX ? -1 : static_cast<int32_t>(slot);
 }
 
 void MCDR_CALL mcdr_dx12AsyncDescriptorResetFrame(mcdr_desc_alloc* alloc, int32_t frameSlot) {
     if (alloc) {
-        alloc->resetFrame(static_cast<UINT>(frameSlot));
+        descriptorAllocator(alloc)->resetFrame(static_cast<UINT>(frameSlot));
     }
 }
 
@@ -389,7 +397,7 @@ uint64_t MCDR_CALL mcdr_dx12AsyncDescriptorGpuHandle(mcdr_desc_alloc* alloc, int
     if (!alloc || slot < 0) {
         return 0;
     }
-    return static_cast<uint64_t>(alloc->gpuHandle(static_cast<UINT>(slot)).ptr);
+    return static_cast<uint64_t>(descriptorAllocator(alloc)->gpuHandle(static_cast<UINT>(slot)).ptr);
 }
 
 int32_t MCDR_CALL mcdr_dx12AsyncDescriptorWriteCBV(mcdr_desc_alloc* alloc, int32_t slot, mcdr_object* buffer,
@@ -406,8 +414,8 @@ int32_t MCDR_CALL mcdr_dx12AsyncDescriptorWriteCBV(mcdr_desc_alloc* alloc, int32
         return mcdr::abi::failWith("mcdr_dx12AsyncDescriptorWriteCBV",
                                    "CBV is not 256-byte aligned (buffer offset=" + std::to_string(offset) + ")");
     }
-    return alloc->writeCBV(static_cast<UINT>(slot), buf->resource.Get(), static_cast<UINT64>(offset),
-                           static_cast<UINT64>(size))
+    return descriptorAllocator(alloc)->writeCBV(static_cast<UINT>(slot), buf->resource.Get(),
+                                               static_cast<UINT64>(offset), static_cast<UINT64>(size))
                ? 1
                : 0;
 }
@@ -417,7 +425,7 @@ int32_t MCDR_CALL mcdr_dx12AsyncDescriptorWriteSRV(mcdr_desc_alloc* alloc, int32
     if (!alloc || !v || v->cpuHandle.ptr == 0 || slot < 0) {
         return mcdr::abi::failWith("mcdr_dx12AsyncDescriptorWriteSRV", "invalid args");
     }
-    return alloc->writeDescriptor(static_cast<UINT>(slot), v->cpuHandle) ? 1 : 0;
+    return descriptorAllocator(alloc)->writeDescriptor(static_cast<UINT>(slot), v->cpuHandle) ? 1 : 0;
 }
 
 // ===========================================================================
@@ -444,14 +452,14 @@ mcdr_bundle_pool* MCDR_CALL mcdr_dx12AsyncBundlePoolCreate(int32_t workerCount) 
         delete pool;
         return nullptr;
     }
-    return pool;
+    return reinterpret_cast<mcdr_bundle_pool*>(pool);
 }
 
-void MCDR_CALL mcdr_dx12AsyncBundlePoolDestroy(mcdr_bundle_pool* pool) { delete pool; }
+void MCDR_CALL mcdr_dx12AsyncBundlePoolDestroy(mcdr_bundle_pool* pool) { delete bundlePool(pool); }
 
 int32_t MCDR_CALL mcdr_dx12AsyncBundleBegin(mcdr_bundle_pool* pool, int32_t worker, int32_t frameSlot,
                                             uint64_t frameValue) {
-    BundleRecorder* r = pool ? pool->recorder(static_cast<UINT>(worker)) : nullptr;
+    BundleRecorder* r = pool ? bundlePool(pool)->recorder(static_cast<UINT>(worker)) : nullptr;
     if (!r || frameSlot < 0 || !r->begin(static_cast<UINT>(frameSlot), frameValue)) {
         return mcdr::abi::failWith("mcdr_dx12AsyncBundleBegin", "begin failed");
     }
@@ -459,7 +467,7 @@ int32_t MCDR_CALL mcdr_dx12AsyncBundleBegin(mcdr_bundle_pool* pool, int32_t work
 }
 
 uint64_t MCDR_CALL mcdr_dx12AsyncBundleEnd(mcdr_bundle_pool* pool, int32_t worker) {
-    BundleRecorder* r = pool ? pool->recorder(static_cast<UINT>(worker)) : nullptr;
+    BundleRecorder* r = pool ? bundlePool(pool)->recorder(static_cast<UINT>(worker)) : nullptr;
     if (!r) {
         return 0;
     }
@@ -468,7 +476,7 @@ uint64_t MCDR_CALL mcdr_dx12AsyncBundleEnd(mcdr_bundle_pool* pool, int32_t worke
 
 int32_t MCDR_CALL mcdr_dx12AsyncBundleSetPipelineState(mcdr_bundle_pool* pool, int32_t worker,
                                                        mcdr_pipeline* pipeline, int32_t hasDepth) {
-    BundleRecorder* r = pool ? pool->recorder(static_cast<UINT>(worker)) : nullptr;
+    BundleRecorder* r = pool ? bundlePool(pool)->recorder(static_cast<UINT>(worker)) : nullptr;
     Dx12Pipeline* pl = pipeline;
     if (!r || !pl) {
         return mcdr::abi::failWith("mcdr_dx12AsyncBundleSetPipelineState", "invalid args");
@@ -493,7 +501,7 @@ int32_t MCDR_CALL mcdr_dx12AsyncBundleSetPipelineState(mcdr_bundle_pool* pool, i
 
 int32_t MCDR_CALL mcdr_dx12AsyncBundleSetDescriptorTable(mcdr_bundle_pool* pool, int32_t worker, int32_t slot,
                                                          uint64_t gpuHandle) {
-    BundleRecorder* r = pool ? pool->recorder(static_cast<UINT>(worker)) : nullptr;
+    BundleRecorder* r = pool ? bundlePool(pool)->recorder(static_cast<UINT>(worker)) : nullptr;
     if (!r) {
         return mcdr::abi::failWith("mcdr_dx12AsyncBundleSetDescriptorTable", "invalid recorder");
     }
@@ -505,7 +513,7 @@ int32_t MCDR_CALL mcdr_dx12AsyncBundleSetDescriptorTable(mcdr_bundle_pool* pool,
 
 int32_t MCDR_CALL mcdr_dx12AsyncBundleSetVertexBuffer(mcdr_bundle_pool* pool, int32_t worker, int32_t slot,
                                                       mcdr_object* buffer, int64_t offset, int32_t stride) {
-    BundleRecorder* r = pool ? pool->recorder(static_cast<UINT>(worker)) : nullptr;
+    BundleRecorder* r = pool ? bundlePool(pool)->recorder(static_cast<UINT>(worker)) : nullptr;
     Dx12Object* buf = buffer;
     if (!r || !buf || buf->kind != Dx12Object::Kind::Buffer || !buf->resource || slot < 0 || offset < 0
         || offset >= buf->size) {
@@ -529,7 +537,7 @@ int32_t MCDR_CALL mcdr_dx12AsyncBundleSetVertexBuffer(mcdr_bundle_pool* pool, in
 
 int32_t MCDR_CALL mcdr_dx12AsyncBundleSetIndexBuffer(mcdr_bundle_pool* pool, int32_t worker,
                                                      mcdr_object* buffer, int32_t indexType) {
-    BundleRecorder* r = pool ? pool->recorder(static_cast<UINT>(worker)) : nullptr;
+    BundleRecorder* r = pool ? bundlePool(pool)->recorder(static_cast<UINT>(worker)) : nullptr;
     Dx12Object* buf = buffer;
     if (!r || !buf || buf->kind != Dx12Object::Kind::Buffer || !buf->resource) {
         return mcdr::abi::failWith("mcdr_dx12AsyncBundleSetIndexBuffer", "invalid args");
@@ -545,7 +553,7 @@ int32_t MCDR_CALL mcdr_dx12AsyncBundleSetIndexBuffer(mcdr_bundle_pool* pool, int
 int32_t MCDR_CALL mcdr_dx12AsyncBundleDrawIndexed(mcdr_bundle_pool* pool, int32_t worker, int32_t indexCount,
                                                   int32_t instanceCount, int32_t firstIndex,
                                                   int32_t baseVertex, int32_t firstInstance) {
-    BundleRecorder* r = pool ? pool->recorder(static_cast<UINT>(worker)) : nullptr;
+    BundleRecorder* r = pool ? bundlePool(pool)->recorder(static_cast<UINT>(worker)) : nullptr;
     if (!r) {
         return 0;
     }
@@ -558,7 +566,7 @@ int32_t MCDR_CALL mcdr_dx12AsyncBundleDrawIndexed(mcdr_bundle_pool* pool, int32_
 int32_t MCDR_CALL mcdr_dx12AsyncBundleDraw(mcdr_bundle_pool* pool, int32_t worker, int32_t vertexCount,
                                            int32_t instanceCount, int32_t firstVertex,
                                            int32_t firstInstance) {
-    BundleRecorder* r = pool ? pool->recorder(static_cast<UINT>(worker)) : nullptr;
+    BundleRecorder* r = pool ? bundlePool(pool)->recorder(static_cast<UINT>(worker)) : nullptr;
     if (!r) {
         return 0;
     }
@@ -570,7 +578,7 @@ int32_t MCDR_CALL mcdr_dx12AsyncBundleDraw(mcdr_bundle_pool* pool, int32_t worke
 int32_t MCDR_CALL mcdr_dx12AsyncBundleDrawIndexedIndirect(mcdr_bundle_pool* pool, int32_t worker,
                                                           mcdr_object* commands, int64_t offset,
                                                           int32_t drawCount) {
-    BundleRecorder* r = pool ? pool->recorder(static_cast<UINT>(worker)) : nullptr;
+    BundleRecorder* r = pool ? bundlePool(pool)->recorder(static_cast<UINT>(worker)) : nullptr;
     Dx12Object* cmds = commands;
     if (!r || !cmds || cmds->kind != Dx12Object::Kind::Buffer || !cmds->resource) {
         return mcdr::abi::failWith("mcdr_dx12AsyncBundleDrawIndexedIndirect", "invalid args");
@@ -587,12 +595,13 @@ int32_t MCDR_CALL mcdr_dx12AsyncBundleRecordPartition(mcdr_desc_alloc* alloc, mc
                                                       int32_t sharedBindings,
                                                       const mcdr_binding_slot* bindings,
                                                       const mcdr_partition_draw* draws, int32_t drawCount) {
-    BundleRecorder* r = pool ? pool->recorder(static_cast<UINT>(worker)) : nullptr;
+    BundleRecorder* r = pool ? bundlePool(pool)->recorder(static_cast<UINT>(worker)) : nullptr;
     if (!alloc || !r || bindingCount <= 0 || drawCount <= 0 || baseSlot < 0 || !bindings || !draws) {
         return mcdr::abi::failWith("mcdr_dx12AsyncBundleRecordPartition", "invalid args");
     }
-    const int32_t ok = recordPartition(alloc, r, baseSlot, bindingCount, sharedBindings, bindings, draws,
-                                       drawCount, "dx12AsyncBundleRecordPartition");
+    const int32_t ok = recordPartition(descriptorAllocator(alloc), r, baseSlot, bindingCount,
+                                       sharedBindings, bindings, draws, drawCount,
+                                       "dx12AsyncBundleRecordPartition");
     if (!ok) {
         mcdr::abi::setLastError("mcdr_dx12AsyncBundleRecordPartition", "invalid buffer/view in partition");
     }
@@ -625,13 +634,13 @@ mcdr_fence_mgr* MCDR_CALL mcdr_dx12AsyncFenceCreate(void) {
         delete mgr;
         return nullptr;
     }
-    return mgr;
+    return reinterpret_cast<mcdr_fence_mgr*>(mgr);
 }
 
-void MCDR_CALL mcdr_dx12AsyncFenceDestroy(mcdr_fence_mgr* manager) { delete manager; }
+void MCDR_CALL mcdr_dx12AsyncFenceDestroy(mcdr_fence_mgr* manager) { delete fenceManager(manager); }
 
 int32_t MCDR_CALL mcdr_dx12AsyncFenceSignal(mcdr_fence_mgr* manager, uint64_t value) {
-    return (manager && manager->signal(value)) ? 1 : 0;
+    return (manager && fenceManager(manager)->signal(value)) ? 1 : 0;
 }
 
 int32_t MCDR_CALL mcdr_dx12AsyncFenceWait(mcdr_fence_mgr* manager, uint64_t value, int64_t timeoutMs) {
@@ -639,11 +648,13 @@ int32_t MCDR_CALL mcdr_dx12AsyncFenceWait(mcdr_fence_mgr* manager, uint64_t valu
         return 0;
     }
     // timeoutMs == 0 means wait forever; a negative value means the same.
-    return manager->waitFence(value, static_cast<UINT64>(timeoutMs < 0 ? 0 : timeoutMs)) ? 1 : 0;
+    return fenceManager(manager)->waitFence(value, static_cast<UINT64>(timeoutMs < 0 ? 0 : timeoutMs))
+               ? 1
+               : 0;
 }
 
 int32_t MCDR_CALL mcdr_dx12AsyncFenceIsComplete(mcdr_fence_mgr* manager, uint64_t value) {
-    return (manager && manager->isFenceComplete(value)) ? 1 : 0;
+    return (manager && fenceManager(manager)->isFenceComplete(value)) ? 1 : 0;
 }
 
 int32_t MCDR_CALL mcdr_dx12AsyncFenceRegisterCallback(mcdr_fence_mgr* manager, uint64_t value,
@@ -656,7 +667,7 @@ int32_t MCDR_CALL mcdr_dx12AsyncFenceRegisterCallback(mcdr_fence_mgr* manager, u
     // may legally re-register or unregister. The stub must not throw -- the Java
     // side wraps it with MethodHandles.catchException, because an escaping
     // exception out of an upcall terminates the JVM abruptly.
-    manager->registerCallback(
+    fenceManager(manager)->registerCallback(
         value, [cb, userHandle](UINT64 v, bool ok) { cb(userHandle, v, ok ? 1 : 0); },
         static_cast<UINT64>(timeoutMs < 0 ? 0 : timeoutMs));
     return 1;
@@ -690,6 +701,8 @@ int32_t MCDR_CALL mcdr_dx12ExecuteBundle(mcdr_command_ctx* ctx, uint64_t bundle)
         return mcdr::abi::failWith("mcdr_dx12ExecuteBundle", "invalid args");
     }
     ctx->commandList->ExecuteBundle(b);
+    d3d12_mc::restoreGraphicsInputAssembly(ctx);
+    d3d12_mc::invalidateGraphicsInputBindings(ctx, false);
     // P64: a PSO/root signature set inside a bundle does not roll back to the
     // parent list, so the parent's binding state is no longer knowable --
     // invalidate the setPipeline fast-path cache to force a full re-issue.
@@ -761,13 +774,13 @@ mcdr_executor* MCDR_CALL mcdr_dx12AsyncExecutorCreate(void) {
         delete exec;
         return nullptr;
     }
-    return exec;
+    return reinterpret_cast<mcdr_executor*>(exec);
 }
 
-void MCDR_CALL mcdr_dx12AsyncExecutorDestroy(mcdr_executor* executor) { delete executor; }
+void MCDR_CALL mcdr_dx12AsyncExecutorDestroy(mcdr_executor* executor) { delete commandExecutor(executor); }
 
 int32_t MCDR_CALL mcdr_dx12AsyncExecutorTryBeginFrame(mcdr_executor* executor) {
-    return (executor && executor->tryBeginFrame()) ? 1 : 0;
+    return (executor && commandExecutor(executor)->tryBeginFrame()) ? 1 : 0;
 }
 
 int32_t MCDR_CALL mcdr_dx12AsyncExecutorAddBundle(mcdr_executor* executor, uint64_t bundle) {
@@ -775,7 +788,7 @@ int32_t MCDR_CALL mcdr_dx12AsyncExecutorAddBundle(mcdr_executor* executor, uint6
         return 0;
     }
     auto* list = reinterpret_cast<ID3D12GraphicsCommandList*>(static_cast<uintptr_t>(bundle));
-    return executor->addBundle(list) ? 1 : 0;
+    return commandExecutor(executor)->addBundle(list) ? 1 : 0;
 }
 
 int32_t MCDR_CALL mcdr_dx12AsyncExecutorAddTransition(mcdr_executor* executor, mcdr_object* object,
@@ -784,22 +797,23 @@ int32_t MCDR_CALL mcdr_dx12AsyncExecutorAddTransition(mcdr_executor* executor, m
     if (!executor || !obj || !obj->resource) {
         return mcdr::abi::failWith("mcdr_dx12AsyncExecutorAddTransition", "invalid args");
     }
-    return executor->addTransition(obj->resource.Get(), static_cast<D3D12_RESOURCE_STATES>(stateBefore),
-                                   static_cast<D3D12_RESOURCE_STATES>(stateAfter))
+    return commandExecutor(executor)->addTransition(
+               obj->resource.Get(), static_cast<D3D12_RESOURCE_STATES>(stateBefore),
+               static_cast<D3D12_RESOURCE_STATES>(stateAfter))
                ? 1
                : 0;
 }
 
 uint64_t MCDR_CALL mcdr_dx12AsyncExecutorEndFrame(mcdr_executor* executor) {
-    return executor ? static_cast<uint64_t>(executor->endFrame()) : 0;
+    return executor ? static_cast<uint64_t>(commandExecutor(executor)->endFrame()) : 0;
 }
 
 uint64_t MCDR_CALL mcdr_dx12AsyncExecutorLastFenceValue(mcdr_executor* executor) {
-    return executor ? static_cast<uint64_t>(executor->lastFenceValue()) : 0;
+    return executor ? static_cast<uint64_t>(commandExecutor(executor)->lastFenceValue()) : 0;
 }
 
 int32_t MCDR_CALL mcdr_dx12AsyncExecutorIsFrameInProgress(mcdr_executor* executor) {
-    return (executor && executor->isFrameInProgress()) ? 1 : 0;
+    return (executor && commandExecutor(executor)->isFrameInProgress()) ? 1 : 0;
 }
 
 int32_t MCDR_CALL mcdr_dx12AsyncExecutorWaitFrame(mcdr_executor* executor, uint64_t fenceValue,
@@ -807,7 +821,10 @@ int32_t MCDR_CALL mcdr_dx12AsyncExecutorWaitFrame(mcdr_executor* executor, uint6
     if (!executor) {
         return 0;
     }
-    return executor->waitForFrame(fenceValue, static_cast<UINT64>(timeoutMs < 0 ? 0 : timeoutMs)) ? 1 : 0;
+    return commandExecutor(executor)->waitForFrame(
+               fenceValue, static_cast<UINT64>(timeoutMs < 0 ? 0 : timeoutMs))
+               ? 1
+               : 0;
 }
 
 }  // extern "C"

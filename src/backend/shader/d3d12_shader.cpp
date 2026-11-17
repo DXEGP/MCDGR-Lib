@@ -1,8 +1,10 @@
 module;
 
 #include "_d3d12_module_prelude.h"
+#include "mcdr_oit_shader.h"
 #if __has_include(<dxcapi.h>)
 #include <dxcapi.h>
+#include <d3d12shader.h>
 #define MCDR_HAVE_DXCAPI 1
 #else
 #define MCDR_HAVE_DXCAPI 0
@@ -17,21 +19,6 @@ namespace d3d12_mc {
 namespace {
 
 using PFN_DxcCreateInstance = HRESULT(WINAPI*)(REFCLSID, REFIID, LPVOID);
-
-// 最小可编译 mesh shader：只用于验证 DXC 能产出 ms_6_x 的 DXIL，不参与渲染。
-constexpr char kMeshSmokeHlsl[] = R"hlsl(
-struct MeshVertex { float4 position : SV_Position; };
-
-[outputtopology("triangle")]
-[numthreads(1, 1, 1)]
-void main(out vertices MeshVertex verts[3], out indices uint3 tris[1]) {
-    SetMeshOutputCounts(3, 1);
-    verts[0].position = float4(0.0, 0.0, 0.0, 1.0);
-    verts[1].position = float4(1.0, 0.0, 0.0, 1.0);
-    verts[2].position = float4(0.0, 1.0, 0.0, 1.0);
-    tris[0] = uint3(0, 1, 2);
-}
-)hlsl";
 
 std::string hexHr(HRESULT hr) {
     char buf[16] = {};
@@ -97,20 +84,6 @@ std::wstring sdkDxcDirectory() {
 
 // 搜索顺序：MCDR_DXC_DIR 环境变量 → MCDR.dll 同目录 → SDK 最新版本。
 std::wstring findDxcDirectory() {
-    // 实机验收开关：`MCDR_DXC_DISABLE=1` 时**三站全不查**，直接返回空目录。
-    //
-    // 为什么需要它：`MCDR_DXC_DIR` 只是**追加一个候选**，不是权威覆盖 —— 即便把它指向空目录，
-    // 模块目录与 Windows SDK 那两站照样能把 dxcompiler.dll 供上（实测：把 `run\dxrmc\` 里两个
-    // DLL 改名后，客户端仍从 `C:\Program Files (x86)\Windows Kits\10\bin\…\dxcompiler.dll`
-    // 拿到，`dxc=yes` 依旧）。系统目录不能改，所以"确实找不到 DXC"这种现场只能靠一个显式
-    // 开关来验证 —— 2026-10-25 起找不到 DXC 不再回退 D3DCompile(5.1)，而是图形管线直接报错，
-    // 这条开关的用途就变成"验证失败路径本身"。
-    //
-    // 只认完全等于 "1" 的值；未设置、空串、其它值一律照旧 —— 验收专用，不是产品行为开关。
-    if (const wchar_t* off = _wgetenv(L"MCDR_DXC_DISABLE");
-        off != nullptr && off[0] == L'1' && off[1] == L'\0') {
-        return std::wstring();
-    }
     std::vector<std::wstring> candidates;
     if (const wchar_t* env = _wgetenv(L"MCDR_DXC_DIR")) {
         if (env[0] != L'\0') {
@@ -167,11 +140,14 @@ mcdr::Result<void> compileWithDxc(IDxcUtils* utils, IDxcCompiler3* compiler, con
 
     const std::wstring targetW = toWide(target);
     const std::wstring entryW = toWide(entry);
-    const wchar_t* args[] = {L"-T",  targetW.c_str(), L"-E", entryW.c_str(),
-                             L"-HV", L"2018",         L"-O3"};
+    std::vector<const wchar_t*> args{L"-T", targetW.c_str(), L"-HV", L"2018", L"-O3"};
+    if (!target.starts_with("lib_")) {
+        args.push_back(L"-E");
+        args.push_back(entryW.c_str());
+    }
     ComPtr<IDxcResult> result;
     const HRESULT hr =
-        compiler->Compile(&buffer, args, static_cast<UINT32>(std::size(args)), nullptr,
+        compiler->Compile(&buffer, args.data(), static_cast<UINT32>(args.size()), nullptr,
                           IID_PPV_ARGS(&result));
     if (FAILED(hr) || !result) {
         return mcdr::err("compileWithDxc", "IDxcCompiler3::Compile entry failed hr=" + hexHr(hr));
@@ -245,7 +221,28 @@ bool dxilCacheLoad(const std::wstring& dir, uint64_t key, std::vector<uint8_t>& 
     DWORD read = 0;
     const BOOL ok = ReadFile(f, out.data(), static_cast<DWORD>(out.size()), &read, nullptr);
     CloseHandle(f);
-    if (!ok || static_cast<size_t>(read) != out.size()) {
+    bool validContainer = false;
+    if (ok && static_cast<size_t>(read) == out.size() && out.size() >= 32 &&
+        std::memcmp(out.data(), "DXBC", 4) == 0) {
+        uint32_t containerSize = 0;
+        std::memcpy(&containerSize, out.data() + 24, sizeof(containerSize));
+        validContainer = containerSize == out.size();
+        uint32_t partCount = 0;
+        std::memcpy(&partCount, out.data() + 28, sizeof(partCount));
+        validContainer = validContainer && partCount != 0 && partCount <= (out.size() - 32) / 4;
+        for (uint32_t part = 0; validContainer && part < partCount; ++part) {
+            uint32_t offset = 0;
+            std::memcpy(&offset, out.data() + 32 + static_cast<size_t>(part) * 4, sizeof(offset));
+            validContainer = offset >= 32ull + static_cast<uint64_t>(partCount) * 4 &&
+                offset <= out.size() - 8;
+            if (validContainer) {
+                uint32_t length = 0;
+                std::memcpy(&length, out.data() + offset + 4, sizeof(length));
+                validContainer = length <= out.size() - offset - 8;
+            }
+        }
+    }
+    if (!validContainer) {
         out.clear();
         return false;
     }
@@ -255,12 +252,20 @@ bool dxilCacheLoad(const std::wstring& dir, uint64_t key, std::vector<uint8_t>& 
 void dxilCacheStore(const std::wstring& dir, uint64_t key, const std::vector<uint8_t>& dxil) {
     if (dir.empty() || dxil.empty()) return;
     CreateDirectoryW(dir.c_str(), nullptr);  // 已存在时返回 ERROR_ALREADY_EXISTS，忽略
-    const HANDLE f = CreateFileW(dxilCachePath(dir, key).c_str(), GENERIC_WRITE, 0, nullptr,
-                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    static std::atomic<uint64_t> serial{0};
+    const std::wstring target = dxilCachePath(dir, key);
+    const std::wstring temporary = target + L"." + std::to_wstring(GetCurrentProcessId()) +
+        L"." + std::to_wstring(serial.fetch_add(1)) + L".tmp";
+    const HANDLE f = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr,
+                                CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return;
     DWORD written = 0;
-    WriteFile(f, dxil.data(), static_cast<DWORD>(dxil.size()), &written, nullptr);
+    const bool complete = WriteFile(f, dxil.data(), static_cast<DWORD>(dxil.size()), &written, nullptr)
+        && written == dxil.size();
     CloseHandle(f);
+    if (!complete || !MoveFileExW(temporary.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(temporary.c_str());
+    }
 }
 
 }  // namespace
@@ -274,16 +279,7 @@ void probeDxc(DeviceContext::Capabilities& caps) {
 #else
     const std::wstring dir = findDxcDirectory();
     if (dir.empty()) {
-        // 保留既有文案（其它调用方/工具会 grep 它），只在验收开关生效时额外说明**原因**：
-        // 正常机器上"找不到 dxcompiler.dll"与"我们主动短路了搜索链"是两件事，日志必须能区分，
-        // 否则这条回退路径的验收结论就成了空话。
         caps.dxcNote = "dxcompiler.dll not found (MCDR_DXC_DIR / MCDR.dll dir / Windows SDK)";
-        if (const wchar_t* off = _wgetenv(L"MCDR_DXC_DISABLE");
-            off != nullptr && off[0] == L'1' && off[1] == L'\0') {
-            dbgLogInfo("DXC discovery was short-circuited by MCDR_DXC_DISABLE=1 — this is the "
-                       "acceptance switch for the \"no DXC\" path (graphics pipelines now fail "
-                       "instead of falling back to D3DCompile SM5.1), not a missing-SDK condition");
-        }
         return;
     }
     const std::wstring dllPath = dir + L"\\dxcompiler.dll";
@@ -309,34 +305,14 @@ void probeDxc(DeviceContext::Capabilities& caps) {
     }
     caps.dxcAvailable = true;
 
-    // 冒烟编译目标：**固定 ms_6_9**（2026-10-25 起图形管线硬要求 SM 6.9，没有 5.1 兜底）。
-    // 这里只回答"DXC 能不能产出 6_9 的 DXIL"，与设备能力无关 —— 设备那一半由
-    // graphicsShaderModelProfile() 查 caps.shaderModel 单独把关。
-    // 实测 DXC 1.9.2602.17 接受 vs/ps/as_6_9；1.8 及更早对 6_9 报 invalid profile
-    // （6_10 至今没有 DXC 认，所以 6_9 就是天花板）。
-    const std::string profile = "ms_6_9";
-    caps.dxcProfile = profile;
-
-    std::vector<uint8_t> dxil;
-    auto smoke = compileWithDxc(utils.Get(), compiler.Get(), kMeshSmokeHlsl, std::strlen(kMeshSmokeHlsl),
-                                "main", profile, dxil);
-    if (smoke) {
-        caps.meshShaderCompileOk = true;
-        caps.dxcNote = "mesh smoke compile OK (" + profile + ", "
-                       + std::to_string(dxil.size()) + " bytes DXIL)";
-    } else {
-        caps.dxcNote = "mesh smoke compile failed: " + firstLine(smoke.error().message);
-    }
+    caps.dxcProfile = "ms_6_9";
+    caps.dxcNote = "DXC compiler interfaces available; shader target is validated by production compilation";
 #endif
 }
 
 // ---------------------------------------------------------------------------
 // P72：可复用的 DXC 编译入口（mesh shader 基础）
 // ---------------------------------------------------------------------------
-// probeDxc 只回答"这台机器能不能编译 mesh shader"，随后就把 IDxcUtils/IDxcCompiler3
-// 释放掉了；mesh 管线真正需要的是一个运行期可反复调用的编译入口：Java 侧给 HLSL 源码
-// + 入口点 + profile（as_6_6 / ms_6_6 / ps_6_0 ...），拿回 DXIL 字节码交给
-// createMeshPipeline。这里把 dxcompiler.dll 与两个接口缓存成进程级单例，只加载一次。
 mcdr::Result<void> compileHlslToDxil(const std::string& source, const std::string& entry,
                                     const std::string& profile, std::vector<uint8_t>& outDxil) {
 #if !MCDR_HAVE_DXCAPI
@@ -368,14 +344,6 @@ mcdr::Result<void> compileHlslToDxil(const std::string& source, const std::strin
         const std::wstring dir = findDxcDirectory();
         if (dir.empty()) {
             cached.note = "dxcompiler.dll not found (MCDR_DXC_DIR / MCDR.dll dir / Windows SDK)";
-            // 同 capa 探测那一处：验收开关生效时说明**原因**，否则"主动短路"与"真缺 SDK"
-            // 在日志里长得一样，回退路径就无法取证。
-            if (const wchar_t* off = _wgetenv(L"MCDR_DXC_DISABLE");
-                off != nullptr && off[0] == L'1' && off[1] == L'\0') {
-                dbgLogInfo("DXC discovery was short-circuited by MCDR_DXC_DISABLE=1 (acceptance "
-                           "switch for the no-DXC path; graphics pipelines now fail instead of "
-                           "falling back to D3DCompile SM5.1)");
-            }
         } else {
             const std::wstring dllPath = dir + L"\\dxcompiler.dll";
             // P99：记录 dxcompiler.dll 的大小+写入时间，作为 DXIL 缓存键的一部分。
@@ -416,15 +384,22 @@ mcdr::Result<void> compileHlslToDxil(const std::string& source, const std::strin
     if (profile.empty()) {
         return mcdr::err("compileHlslToDxil", "compileHlslToDxil: empty profile");
     }
-    const std::string entryName = entry.empty() ? std::string("main") : entry;
+    const std::string entryName = profile.starts_with("lib_") ? std::string() :
+        (entry.empty() ? std::string("main") : entry);
     // P99：先查 DXIL 磁盘缓存（键含 dxcompiler.dll 版本 + profile + entry + 源码）。
     const char* cacheEnv = std::getenv("MCDR_DXIL_CACHE");
     const bool cacheEnabled = !(cacheEnv != nullptr && cacheEnv[0] == '0');
     const std::wstring cacheDir = cacheEnabled ? dxilCacheDirectory() : std::wstring();
     uint64_t cacheKey = 0;
     if (cacheEnabled) {
-        cacheKey = fnv1a64(cached.versionTag.data(), cached.versionTag.size());
+        constexpr char contract[] = "mcdr-dxc-cache-v2";
+        cacheKey = fnv1a64(contract, sizeof(contract));
+        cacheKey = fnv1a64(cached.versionTag.data(), cached.versionTag.size(), cacheKey);
+        const uint64_t profileLength = profile.size();
+        cacheKey = fnv1a64(&profileLength, sizeof(profileLength), cacheKey);
         cacheKey = fnv1a64(profile.data(), profile.size(), cacheKey);
+        const uint64_t entryLength = entryName.size();
+        cacheKey = fnv1a64(&entryLength, sizeof(entryLength), cacheKey);
         cacheKey = fnv1a64(entryName.data(), entryName.size(), cacheKey);
         cacheKey = fnv1a64(source.data(), source.size(), cacheKey);
         if (dxilCacheLoad(cacheDir, cacheKey, outDxil)) {
@@ -450,6 +425,61 @@ mcdr::Result<void> compileHlslToDxil(const std::string& source, const std::strin
 }
 
 
+mcdr::Result<void> validateCapturePixelShader(const void* bytecode, uint32_t bytes) {
+#if !MCDR_HAVE_DXCAPI
+    (void)bytecode; (void)bytes;
+    return mcdr::err("capture.shader", "DXIL reflection is unavailable");
+#else
+    const auto module=GetModuleHandleW(L"dxcompiler.dll");
+    if (!module || !bytecode || !bytes) return mcdr::err("capture.shader", "Missing DXIL compiler or bytecode");
+    const auto create=reinterpret_cast<PFN_DxcCreateInstance>(GetProcAddress(module,"DxcCreateInstance"));
+    ComPtr<IDxcUtils> utils;
+    ComPtr<IDxcContainerReflection> container;
+    ComPtr<IDxcBlobEncoding> blob;
+    if (!create || FAILED(create(CLSID_DxcUtils,IID_PPV_ARGS(&utils))) ||
+        FAILED(create(CLSID_DxcContainerReflection,IID_PPV_ARGS(&container))) ||
+        FAILED(utils->CreateBlob(bytecode,bytes,DXC_CP_ACP,&blob)) || FAILED(container->Load(blob.Get())))
+        return mcdr::err("capture.shader", "DXIL container reflection failed");
+    UINT part=0;
+    constexpr UINT dxilPart=0x4c495844u;
+    ComPtr<ID3D12ShaderReflection> reflection;
+    if (FAILED(container->FindFirstPartKind(dxilPart,&part)) || FAILED(container->GetPartReflection(part,IID_PPV_ARGS(&reflection))))
+        return mcdr::err("capture.shader", "DXIL shader reflection failed");
+    D3D12_SHADER_DESC description{};
+    if (FAILED(reflection->GetDesc(&description)) || D3D12_SHVER_GET_TYPE(description.Version)!=D3D12_SHVER_PIXEL_SHADER ||
+        !(reflection->GetRequiresFlags()&D3D_SHADER_REQUIRES_EARLY_DEPTH_STENCIL) || reflection->IsSampleFrequencyShader())
+        return mcdr::err("capture.shader", "Capture requires an early-depth pixel-frequency shader");
+    for (UINT index=0; index<description.OutputParameters; ++index) {
+        D3D12_SIGNATURE_PARAMETER_DESC output{};
+        if (FAILED(reflection->GetOutputParameterDesc(index,&output)) || output.SystemValueType!=D3D_NAME_TARGET)
+            return mcdr::err("capture.shader", "Capture pixel outputs must contain color targets only");
+    }
+    UINT uavs=0;
+    bool constants=false;
+    for (UINT index=0; index<description.BoundResources; ++index) {
+        D3D12_SHADER_INPUT_BIND_DESC binding{};
+        if (FAILED(reflection->GetResourceBindingDesc(index,&binding))) return mcdr::err("capture.shader", "Invalid resource reflection");
+        if (binding.Type==D3D_SIT_CBUFFER && binding.Space==2 && binding.BindPoint==0 && binding.BindCount==1) {
+            auto* constantBuffer=reflection->GetConstantBufferByName(binding.Name);
+            D3D12_SHADER_BUFFER_DESC buffer{};
+            if (!constantBuffer || FAILED(constantBuffer->GetDesc(&buffer)) || buffer.Size!=mcdr::oit_shader::captureConstantsBytes)
+                return mcdr::err("capture.shader", "Capture constant buffer layout differs from the contract");
+            constants=true;
+        }
+        if (binding.Type==D3D_SIT_UAV_RWBYTEADDRESS) {
+            if (binding.Space!=2 || binding.BindPoint>2 || binding.BindCount!=1)
+                return mcdr::err("capture.shader", "Capture raw UAV layout differs from the contract");
+            uavs|=1u<<binding.BindPoint;
+        } else if (binding.Type==D3D_SIT_UAV_RWTYPED || binding.Type==D3D_SIT_UAV_RWSTRUCTURED ||
+            binding.Type==D3D_SIT_UAV_APPEND_STRUCTURED || binding.Type==D3D_SIT_UAV_CONSUME_STRUCTURED ||
+            binding.Type==D3D_SIT_UAV_RWSTRUCTURED_WITH_COUNTER)
+            return mcdr::err("capture.shader", "Capture contains an unsupported UAV");
+    }
+    if (!constants || uavs!=7u) return mcdr::err("capture.shader", "Capture shader does not append bounded records");
+    return {};
+#endif
+}
+
 std::string backendWideToUtf8(const std::wstring& w) {
     if (w.empty()) {
         return std::string();
@@ -472,7 +502,7 @@ std::string formatBackendResult(HRESULT hr) {
 }
 
 std::string graphicsShaderModelProfile() {
-    if (!deviceContext().caps.dxcAvailable || !deviceContext().caps.dxcSupportsSm69()) return {};
+    if (!deviceContext().caps.dxcAvailable) return {};
     if (effectiveShaderModel(deviceContext().caps) < D3D_SHADER_MODEL_6_9) return {};
     return "6_9";
 }
@@ -483,11 +513,6 @@ std::string sm69RequirementText() {
     if (!deviceContext().caps.dxcAvailable) {
         return "shader model 6.9 is required and there is no SM 5.1 fallback any more, but "
                "dxcompiler.dll was not found (MCDR_DXC_DIR / MCDR.dll dir / Windows SDK)";
-    }
-    if (!deviceContext().caps.dxcSupportsSm69()) {
-        return "shader model 6.9 is required and there is no SM 5.1 fallback any more, but this "
-               "dxcompiler.dll cannot compile 6_9 (profile probe: " + deviceContext().caps.dxcProfile +
-               "; needs DXC 1.9.2502 or newer)";
     }
     return "shader model 6.9 is required and there is no SM 5.1 fallback any more, but the device "
            "reports SM " + std::string(shaderModelName(deviceContext().caps.shaderModel)) +

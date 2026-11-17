@@ -48,35 +48,12 @@ extern "C" {
 // Bumped whenever ANY struct layout or signature below changes. The Java side
 // asserts equality at load time and aborts backend creation on mismatch.
 //
-// P108 待办（这一版**故意仍为 1**，因为下面这组改动全是「只增不改」的追加项，而
-// Kotlin 侧当前正被包重构重写，此刻把这里改成 2 会让 MCDR_ABI.kt 的
-// `version != MCDR_ABI_VERSION` 断言在设备创建时硬失败）：
-//   1. MCDR_ABI.kt 补上 mcdr_dx12CreateDlssFeature / mcdr_dx12EvaluateDlss /
-//      mcdr_dx12QueryDlss 三个 FFM 绑定（签名见 mcdr_abi.h 与 P108 报告）；
-//   2. MCDR_Layout.kt 登记 MCDR_DLSS_INPUT 并加 EXPECTED_C_SIZES 行（C sizeof = 112）；
-//   3. 完成 1、2 之后把这里改成 2u，并同步 MCDR_ABI.kt 的 MCDR_ABI_VERSION = 2。
-//
-// v2 -> v3（P271，超分抽象层）：
-//   - 新增 mcdr_sr_caps（sizeof = 80 / align = 4）与 mcdr_sr_dispatch（sizeof = 136 /
-//     align = 8）两张表，以及 8 个 mcdr_dx12Sr* 入口（声明见本文件 P271 段）。
-//     注：这里原来写 128，是笔误 —— 结构体自身的注释（P275 段）与 abi_meta.cpp 的
-//     MCDR_FIELD 表都按 136 走（末尾 _pad2 在 132，align 8 再补 4）。
-//   - 老导出一个都没删、一个签名都没改；DLSS 的既有路径原样保留，SrEvaluate 在 v1 里
-//     就是把载荷翻译成 mcdr_dlss_input 后转发给同一条实现。
-//   - **必须同一次改齐**：MCDR_ABI.kt 的 MCDR_ABI_VERSION = 3、两张表的 FFM 镜像、
-//     MCDR_Layout.kt 的 SR_CAPS / SR_DISPATCH 与 EXPECTED_C_SIZES 行、以及
-//     abi_meta.cpp 的 layoutTable()（那边少一个字段，Kotlin 的 verify() 会直接 abort）。
-//
-// v3 -> v4（P293–P295，帧生成抽象层）：
-//   - 新增 mcdr_fg_caps（sizeof = 80 / align = 4）与 mcdr_fg_dispatch（sizeof = 96 /
-//     align = 8）两张表，以及 5 个 mcdr_dx12Fg* 入口（声明见本文件 P293 段）。
-//   - 老导出仍然一个没删：mcdr_dx12SetDlssgMode / mcdr_dx12GetDlssgPresented 降级为
-//     **转发**（组一个 dispatch 调 FgSetMode / 直接回 FgPresented），语义与签名不变，
-//     Kotlin 侧 MCDR_ABI.kt 的既有绑定不用改。
-//   - 同一次改齐的四件：MCDR_ABI.kt 的 MCDR_ABI_VERSION = 4 + 5 个新绑定、
-//     MCDR_Layout.kt 的 FG_CAPS / FG_DISPATCH 与 EXPECTED_C_SIZES 行、
-//     abi_meta.cpp 的 layoutTable()（两张新表）、以及本文件的 FG 段。
-#define MCDR_ABI_VERSION 4u
+// Current append-only milestones are reflected in the matching Kotlin mirrors:
+// SR/FG dispatch contracts, transactional frame configuration, graphics/OIT
+// recording contracts, and terrain tile stage registration. Any new aggregate or
+// signature must update this version, MCDR_Layout.kt, MCDR_ABI.kt and abi_meta.cpp
+// together; the loader rejects a partial update before device creation.
+#define MCDR_ABI_VERSION 26u
 
 // The same value at runtime, so a stale Java-side constant cannot be optimised
 // away and a mismatched pair fails at load time rather than at first draw.
@@ -85,12 +62,10 @@ MCDR_API uint32_t MCDR_CALL mcdrABIVersion(void);
 // ---------------------------------------------------------------------------
 // Opaque handles
 //
-// Each typedef forward-declares the real C++ class; the native side
-// reinterpret_casts between them. The Java side only ever sees a MemorySegment
-// address and must never invent one.
-// Real class names, not invented ones: query the core headers, do not guess.
-// Each handle names the real C++ class so the native side can reinterpret_cast
-// with no intermediate wrapper object and no runtime cost. In C++ the tag is
+// The Java side only ever sees a MemorySegment address and must never invent one.
+// Async handles use independent opaque tags; the ABI adapter converts them to
+// the owning module's class without an intermediate wrapper object.
+// Other handles name their existing public C++ classes. In C++ the tag is
 // declared with the SAME class-key the definition uses, because MSVC's C4099
 // ("type name first seen using 'class' now seen using 'struct'") becomes a
 // hard error under this project's TreatWarningAsError=true.
@@ -100,10 +75,6 @@ MCDR_API uint32_t MCDR_CALL mcdrABIVersion(void);
 // call site would fail with C2664 "cannot convert argument 1".
 #ifdef __cplusplus
 namespace d3d12_mc {
-class PartitionedDescriptorAllocator;
-class BundleRecorderPool;
-class MainCommandExecutor;
-class AsyncFenceManager;
 struct Dx12Object;
 struct CommandContext;
 struct Dx12Pipeline;
@@ -116,21 +87,18 @@ typedef d3d12_mc::CommandContext mcdr_command_ctx;  // one command encoder (3-de
 typedef d3d12_mc::Dx12Pipeline mcdr_pipeline;
 typedef d3d12_mc::Dx12Surface mcdr_surface;
 typedef d3d12_mc::QueryPool mcdr_query_pool;
-typedef d3d12_mc::PartitionedDescriptorAllocator mcdr_desc_alloc;
-typedef d3d12_mc::BundleRecorderPool mcdr_bundle_pool;
-typedef d3d12_mc::MainCommandExecutor mcdr_executor;
-typedef d3d12_mc::AsyncFenceManager mcdr_fence_mgr;
 #else
 typedef struct mcdr_object mcdr_object;
 typedef struct mcdr_command_ctx mcdr_command_ctx;
 typedef struct mcdr_pipeline mcdr_pipeline;
 typedef struct mcdr_surface mcdr_surface;
 typedef struct mcdr_query_pool mcdr_query_pool;
+#endif
+
 typedef struct mcdr_desc_alloc mcdr_desc_alloc;
 typedef struct mcdr_bundle_pool mcdr_bundle_pool;
 typedef struct mcdr_executor mcdr_executor;
 typedef struct mcdr_fence_mgr mcdr_fence_mgr;
-#endif
 
 // ---------------------------------------------------------------------------
 // Cross-language aggregates
@@ -206,7 +174,7 @@ typedef struct mcdr_pipeline_binding_desc {
 
 // Full graphics-pipeline description. Replaces the LITTLE_ENDIAN packed
 // ByteBuffer that dx12CreateGraphicsPipeline() unpacked by hand.
-// `vsData`/`psData` point at DXBC bytecode (not NUL-terminated).
+// `vsData`/`psData` point at HLSL source with entry `main` (not NUL-terminated).
 typedef struct mcdr_pipeline_desc {
     const void* vsData;
     int32_t vsLen;
@@ -216,7 +184,7 @@ typedef struct mcdr_pipeline_desc {
     int32_t colorCount;
     const mcdr_color_target_desc* colorTargets;
     int32_t hasDepth;
-    int32_t _pad1;
+    uint32_t pipelineFlags;
     mcdr_depth_state_desc depth;
     int32_t topology;       // PrimitiveTopology ordinal
     int32_t cullEnabled;
@@ -259,6 +227,8 @@ typedef struct mcdr_mesh_pipeline_desc {
     int32_t bindingCount;
     int32_t _pad3;
     const mcdr_pipeline_binding_desc* bindings;
+    int32_t rasterMotion;
+    int32_t _pad4;
 } mcdr_mesh_pipeline_desc;
 
 // ---------------------------------------------------------------------------
@@ -533,7 +503,7 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12SetDlssOutput(mcdr_object* tex);
 
 // How the constant exposure value below is interpreted.
 #define MCDR_DLSS_EXPOSURE_NONE 0u   // pure constant: exposureScale is the pre-exposure
-#define MCDR_DLSS_EXPOSURE_AUTO 1u   // reserved: a GPU exposure texture (not available yet)
+#define MCDR_DLSS_EXPOSURE_AUTO 1u   // current-frame GPU exposure texture in pInExposure
 
 // Everything one DLSS Evaluate needs. Field names that start with pIn* are opaque
 // mcdr_object* texture handles; every other field is a plain value. All comments live to
@@ -544,7 +514,7 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12SetDlssOutput(mcdr_object* tex);
 //   targetHeight 12, jitterOffsetX 16, jitterOffsetY 20, mvScaleX 24, mvScaleY 28,
 //   preExposure 32, exposureScale 36, exposureMode 40, alphaUpscaling 44, nearZ 48,
 //   farZ 52, depthInverted 56, reset 60, depthFormatOrdinal 64, _pad0 68, pInColor 72,
-//   pInDepth 80, pInMotionVectors 88, pInOutput 96, _pad1 104, _pad2 108.
+//   pInDepth 80, pInMotionVectors 88, pInOutput 96, pInExposure 104.
 // _pad0 covers the four bytes the compiler would otherwise insert silently between
 // depthFormatOrdinal and the first pointer; _pad1 keeps the total a multiple of 8. Both
 // are named fields on purpose: MCDR_Layout.kt mirrors them, and abi_check.py only sees
@@ -569,7 +539,7 @@ typedef struct mcdr_dlss_input {
     // Constant exposure scale, only read when exposureMode == MCDR_DLSS_EXPOSURE_NONE.
     // 1.0 means "the colour buffer is already exposed correctly".
     float exposureScale;
-    uint32_t exposureMode;     // MCDR_DLSS_EXPOSURE_NONE (0) or _AUTO (1, reserved)
+    uint32_t exposureMode;     // MCDR_DLSS_EXPOSURE_NONE (0) or _AUTO (1)
     uint32_t alphaUpscaling;   // 1 = upscale alpha too. False for the Minecraft world layer.
     // Markers (diagnostics only — the native side decides the real numbers, but the JVM
     // has the authoritative values, so they are reported back and cross-checked).
@@ -584,29 +554,8 @@ typedef struct mcdr_dlss_input {
     mcdr_object* pInDepth;          // main render target depth, render size, D32_FLOAT
     mcdr_object* pInMotionVectors;  // D3D12Velocity.kt output, render size, RG16_FLOAT
     mcdr_object* pInOutput;         // target-size colour target (the GUI's own target)
-    int32_t _pad1;
-    int32_t _pad2;   // trailing padding: keeps sizeof a multiple of the 8-byte alignment
+    mcdr_object* pInExposure;
 } mcdr_dlss_input;
-
-// Creates (or recreates, after a size change) the DLSS feature on the currently open
-// command list. Call it once per (renderWidth, renderHeight, targetWidth, targetHeight)
-// tuple, before the first mcdr_dx12EvaluateDlss for that tuple; the Java side can simply
-// call it every frame and let the native side decide whether the descriptor really
-// changed. On any failure this logs ONE warning naming the stage and the NGX result, and
-// then returns 0 for the rest of the process — the caller keeps the existing path (linear
-// blit) and must not retry. Returns 1 when a feature handle is ready.
-MCDR_API int32_t MCDR_CALL mcdr_dx12CreateDlssFeature(mcdr_command_ctx* ctx,
-                                                      const mcdr_dlss_input* in);
-
-// Runs one DLSS Evaluate. Requires an open command list; the Java side calls it after the
-// world has rendered and before the GUI, exactly where mcdr_dx12ApplySmaaToTexture used to
-// be called (the two are mutually exclusive — see the anti-aliasing mode note above).
-// Returns 1 when the evaluate really ran, 0 when it was skipped (mode != DLSS, a size
-// changed without a successful create, or a previous failure disabled DLSS), -1 on
-// invalid arguments. Never blocks, never fails the frame: a failure disables DLSS for the
-// rest of the process after one WARN.
-MCDR_API int32_t MCDR_CALL mcdr_dx12EvaluateDlss(mcdr_command_ctx* ctx,
-                                                 const mcdr_dlss_input* in);
 
 // One-line DLSS availability/state query for the UI and the log. `note` receives a
 // NUL-terminated human-readable status (the reason when DLSS cannot run); NULL is fine.
@@ -673,6 +622,7 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12SetDlssVendorDir(const char* utf8Dir);
 // responsive pixel mask），这里是并集，具体怎么喂由 Provider 决定。
 #define MCDR_SR_MASK_REACTIVE 1
 #define MCDR_SR_MASK_RESPONSIVE 2
+#define MCDR_SR_MASK_TRANSPARENCY_AND_COMPOSITION 4
 
 // 后端能力面。sizeof = 80、align = 4。Kotlin 侧镜像见 MCDR_Layout.kt 的 SR_CAPS。
 // note 是给 UI 与日志的短原因（UTF-8，NUL 结尾），不是给机器判断的。
@@ -693,7 +643,7 @@ typedef struct mcdr_sr_caps {
     char note[28];           // 52 短原因，NUL 结尾（52 + 28 = 80）
 } mcdr_sr_caps;
 
-// 与厂商无关的每帧载荷。sizeof = 136、align = 8（六个指针在 72..119，正好落在 8 边界）。
+// 与厂商无关的每帧载荷。sizeof = 144、align = 8（composition mask 是末尾追加字段）。
 // Kotlin 侧镜像见 MCDR_Layout.kt 的 SR_DISPATCH。
 //
 // 约定（与 mcdr_dlss_input 一致，别改）：渲染尺寸是**渲染目标**尺寸，显示尺寸是**窗口**尺寸；
@@ -702,6 +652,8 @@ typedef struct mcdr_sr_caps {
 // 后端按各自的安全默认处理（aspect = displayWidth/displayHeight、meters = 1.0）。
 // `cameraVerticalFov` 就是 FSR 的 `cameraFovAngleVertical`（弧度），DLSS 侧走 `mcdr_dlss_constants`
 // 的同义字段，两处必须同源（都取自 `GameRenderer.getFov` 的实际值，不要用视场设置的标称值）。
+struct mcdr_raster_camera;
+
 typedef struct mcdr_sr_dispatch {
     int32_t renderWidth;          // 0
     int32_t renderHeight;         // 4
@@ -731,6 +683,8 @@ typedef struct mcdr_sr_dispatch {
     float cameraAspectRatio;      // 124 P275：显示尺寸的宽高比（FSR 可选、DLSS 常量里有同义字段）
     float viewSpaceToMetersFactor;// 128 P275：1.0 = 一个世界单位算 1 米；0 = 未填（后端按 1.0 处理）
     int32_t _pad2;                // 132（补到 136 = align 8 的整数倍）
+    void* pTransparencyAndComposition; // 136 FSR transparency-and-composition mask，可 0
+    const struct mcdr_raster_camera* pCamera;
 } mcdr_sr_dispatch;
 
 // 记录期望后端。纯记录：不建、不销毁、不重建（重建在下一帧帧首，见 P280）。
@@ -753,9 +707,22 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12SrCreate(mcdr_command_ctx* ctx, int32_t back
 MCDR_API int32_t MCDR_CALL mcdr_dx12SrResize(mcdr_command_ctx* ctx, int32_t renderWidth,
                                               int32_t renderHeight, int32_t displayWidth,
                                               int32_t displayHeight);
+typedef enum mcdr_sr_prepare_result {
+    MCDR_SR_PREPARE_READY = 1,
+    MCDR_SR_PREPARE_NOT_READY = 0,
+    MCDR_SR_PREPARE_INVALID_ARGUMENT = -1,
+    MCDR_SR_PREPARE_REJECTED = -2,
+    MCDR_SR_PREPARE_COMPLETION_UNKNOWN = -3
+} mcdr_sr_prepare_result;
+
+MCDR_API int32_t MCDR_CALL mcdr_dx12SrPrepare(mcdr_command_ctx* ctx,
+                                               const mcdr_sr_dispatch* description,
+                                               int32_t dlssQuality, int32_t dlssPreset,
+                                               uint64_t* token);
+MCDR_API int32_t MCDR_CALL mcdr_dx12SrCommit(uint64_t token);
+MCDR_API int32_t MCDR_CALL mcdr_dx12SrAbort(uint64_t token);
 
 // 逐帧提交。返回 1 = 已执行，0 = 跳过（后端未就绪 / 本帧不适用），-1 = 参数非法。
-MCDR_API int32_t MCDR_CALL mcdr_dx12SrEvaluate(mcdr_command_ctx* ctx, const mcdr_sr_dispatch* desc);
 
 // 该后端偏好的亚像素 jitter。返回 1 = 已写 outX/outY，0 = 无意见（沿用 D3D12Temporal 的
 // Halton(2,3)，这时 outX/outY 不被修改），-1 = 参数非法。
@@ -884,10 +851,23 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12FgQueryCaps(int32_t backend, mcdr_fg_caps* o
 // 落到不确定的那次 Present 上（SL 官方文档 §6 明确说了这一点）。
 // 返回 1 = 已记录 0 = 后端不可用（原因进 FgStatus）-1 = 参数非法。
 MCDR_API int32_t MCDR_CALL mcdr_dx12FgSetMode(const mcdr_fg_dispatch* desc);
+typedef enum mcdr_fg_prepare_result {
+    MCDR_FG_PREPARE_READY = 1,
+    MCDR_FG_PREPARE_NOT_READY = 0,
+    MCDR_FG_PREPARE_INVALID_ARGUMENT = -1,
+    MCDR_FG_PREPARE_RESTART_REQUIRED = -2,
+    MCDR_FG_PREPARE_REJECTED = -3
+} mcdr_fg_prepare_result;
+
+// NOT_READY 仅用于未结束的帧、录制或 GPU 工作；SDK/设备不支持请求时返回 REJECTED。
+// 成功返回非零 token；调用方必须提交或中止，其他结果不会转移已生效配置的所有权。
+MCDR_API int32_t MCDR_CALL mcdr_dx12FgPrepare(const mcdr_fg_dispatch* description, uint64_t* token);
+MCDR_API int32_t MCDR_CALL mcdr_dx12CommitPreparedConfiguration(uint64_t srToken,
+    uint64_t fgToken, int32_t antiAliasing);
+MCDR_API int32_t MCDR_CALL mcdr_dx12FgAbort(uint64_t token);
 
 // 上一次 Present 真正提交的帧数（1 = 没插帧，与 mcdr_dx12GetDlssgPresented 同义）。
 MCDR_API int32_t MCDR_CALL mcdr_dx12FgPresented(void);
-MCDR_API void MCDR_CALL mcdr_dx12FgSetConstants(const mcdr_fg_constants* constants);
 
 // 一行状态文本：期望/生效后端、可用性、链归属、最近一次失败原因。
 // 返回 1 = 已写（NUL 结尾），0 = 没有内容，-1 = 参数非法。
@@ -935,18 +915,6 @@ MCDR_API void MCDR_CALL mcdr_dx12FgSetUiTexture(void* object);
 MCDR_API void MCDR_CALL mcdr_dx12FgSetUiComposition(int32_t enabled);
 MCDR_API int32_t MCDR_CALL mcdr_dx12FgUiCompositionReady(void);
 
-/* P305ag：native **内部**调用口，不是给 JVM 的（JVM 不要绑这个符号）。
- *
- * 为什么需要它：逐帧 tag 原来只有 `srEvaluateFrame` 成功后一个触发点，而 `d3d12_dlss.cpp`
- * 是普通翻译单元（故意不 import 设备模块，保持 DLSS 那条路的隔离），DLSS 超分路径因此
- * 交不出本帧输入 —— `sr.backend = DLSS` 时 XeSS-FG 一帧都拿不到（实机：4561 帧 tagCalls=0）。
- *
- * 参数全是 POD（命令列表 + 三个资源 + 各自**当前**状态），实现见 `abi_framegen.cpp`；
- * 状态值就是 `D3D12_RESOURCE_STATES` 的整数形式。 */
-MCDR_API void MCDR_CALL mcdr_fgTagDlssInputs(void* cmdList, void* color, int32_t colorState,
-                                             void* depth, int32_t depthState,
-                                             void* motionVectors, int32_t motionVectorState);
-
 // ---------------------------------------------------------------------------
 // P112：DLSS 的每帧相机常量（Streamline 的 sl::Constants 逐字段对应；
 //       ProgrammingGuide.md §2.11.1 / ProgrammingGuideDLSS.md §6.0）
@@ -958,10 +926,10 @@ MCDR_API void MCDR_CALL mcdr_fgTagDlssInputs(void* cmdList, void* color, int32_t
 // P112/P118/P119/P120：Streamline `sl::Constants` 的数据源（每帧由 JVM 经 `mcdr_dx12SetDlssConstants` 推来）。
 //
 // 矩阵约定（三条都是踩过的坑）：
-//   1. 三张矩阵都是**列主序**（JOML `Matrix4f.get(float[])` 的原生布局）；native 在喂给
-//      `sl::Constants`（其 float4x4 要求行主序）之前必须逐元素转置一次。
-//   2. `viewProjection`/`prevViewProjection` 是 world->clip，且**已经烘进相机平移**
-//      （`V_world = V_rot * T(-camPos)`）。凭这两张派生的 `clipToPrevClip` 才含相机走动。
+//   1. 三张矩阵都是 JOML 列主序、列向量表示。Streamline 的行向量矩阵直接复制这16个元素，
+//      其行主序存储得到数学转置；不得再按行列下标重排。
+//   2. `viewProjection`/`prevViewProjection` 在同一个相对原点上表示 world->clip，包含实际相机
+//      平移；原点差在 double 中计算后再写入 float 矩阵。
 //   3. `projection` 是 view->clip 的投影矩阵本身，`sl::Constants::cameraViewToClip` 要的是它，
 //      不是 world->clip 的 VP —— 塞 VP 会让 SL 的反投影多带一层世界平移。
 //
@@ -1003,7 +971,6 @@ typedef struct mcdr_dlss_constants {
 } mcdr_dlss_constants;
 
 // 每帧一次、DLSS 评价之前调用；返回 1 已缓存，0 参数无效。幂等，设备创建前也可调用。
-MCDR_API int32_t MCDR_CALL mcdr_dx12SetDlssConstants(const mcdr_dlss_constants* constants);
 
 // P117：PCL stats —— 帧开始（建本帧 token + eSimulationStart）与通用标记（eSimulationEnd=1 /
 // eRenderSubmitStart=2 等，取值见 sl::PCLMarker）。
@@ -1098,6 +1065,13 @@ MCDR_API int64_t MCDR_CALL MCDR_D3D12_get_timestamp_frequency(void);
 
 MCDR_API mcdr_command_ctx* MCDR_CALL MCDR_D3D12_create_command_encoder(void);
 MCDR_API void MCDR_CALL mcdr_dx12DestroyCommandEncoder(mcdr_command_ctx* ctx);
+typedef enum mcdr_command_destroy_result_v1 {
+    MCDR_COMMAND_DESTROY_INVALID = -1,
+    MCDR_COMMAND_DESTROY_DESTROYED = 1,
+    MCDR_COMMAND_DESTROY_OWNERSHIP_PENDING = 2,
+    MCDR_COMMAND_DESTROY_SUBMISSION_UNKNOWN = 3
+} mcdr_command_destroy_result_v1;
+MCDR_API int32_t MCDR_CALL mcdr_dx12DestroyCommandEncoderCheckedV1(mcdr_command_ctx* ctx);
 MCDR_API void MCDR_CALL mcdr_dx12BeginCommandList(mcdr_command_ctx* ctx);
 MCDR_API void MCDR_CALL mcdr_dx12BeginCommandListWithWait(mcdr_command_ctx* ctx, uint64_t waitForValue);
 MCDR_API void MCDR_CALL mcdr_dx12EndCommandList(mcdr_command_ctx* ctx);
@@ -1106,6 +1080,18 @@ MCDR_API void MCDR_CALL mcdr_dx12EndCommandList(mcdr_command_ctx* ctx);
 // mcdr_dx12Submit 返回的也是同一条时间线上的序号。因此帧 encoder 的 fence token
 // 不会被一次性 encoder（createBuffer(data) 的临时上传）提前满足。
 MCDR_API uint64_t MCDR_CALL mcdr_dx12Submit(mcdr_command_ctx* ctx);
+typedef enum mcdr_command_outcome_v1 {
+    MCDR_COMMAND_OUTCOME_INVALID = -1,
+    MCDR_COMMAND_OUTCOME_READY = 0,
+    MCDR_COMMAND_OUTCOME_SUBMITTED = 1,
+    MCDR_COMMAND_OUTCOME_RECORDING_REJECTED = 2,
+    MCDR_COMMAND_OUTCOME_OWNERSHIP_PENDING = 3,
+    MCDR_COMMAND_OUTCOME_SUBMISSION_UNKNOWN = 4
+} mcdr_command_outcome_v1;
+MCDR_API int32_t MCDR_CALL mcdr_dx12CommandRecordingStatusV1(mcdr_command_ctx* ctx);
+MCDR_API int32_t MCDR_CALL mcdr_dx12SubmitV1(mcdr_command_ctx* ctx, uint64_t* submittedFence);
+MCDR_API int32_t MCDR_CALL mcdr_dx12SettleCommandSubmissionV1(mcdr_command_ctx* ctx,
+    uint64_t timeoutMs, uint64_t* submittedFence);
 MCDR_API int32_t MCDR_CALL mcdr_dx12WaitForFence(mcdr_command_ctx* ctx, uint64_t value, int64_t timeoutNs);
 MCDR_API uint64_t MCDR_CALL mcdr_dx12GetFenceValue(mcdr_command_ctx* ctx);
 MCDR_API int64_t MCDR_CALL mcdr_dx12GetTimestampNow(mcdr_command_ctx* ctx);
@@ -1113,17 +1099,25 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12IsListOpen(mcdr_command_ctx* ctx);
 
 MCDR_API void MCDR_CALL mcdr_dx12CopyBuffer(mcdr_command_ctx* ctx, mcdr_object* src, int64_t srcOffset,
                                             mcdr_object* dst, int64_t dstOffset, int64_t size);
+MCDR_API int32_t MCDR_CALL mcdr_dx12CopyBufferChecked(mcdr_command_ctx* ctx, mcdr_object* src,
+    int64_t srcOffset, mcdr_object* dst, int64_t dstOffset, int64_t size);
 
 MCDR_API void MCDR_CALL mcdr_dx12WriteToTexture(mcdr_command_ctx* ctx, mcdr_object* stagingBuffer,
                                                 int64_t stagingOffset, int32_t width, int32_t height,
                                                 mcdr_object* dstTexture, int32_t mip, int32_t layer,
                                                 int32_t dstX, int32_t dstY);
+MCDR_API int32_t MCDR_CALL mcdr_dx12WriteToTextureChecked(mcdr_command_ctx* ctx, mcdr_object* stagingBuffer,
+    int64_t stagingOffset, int32_t width, int32_t height, mcdr_object* dstTexture,
+    int32_t mip, int32_t layer, int32_t dstX, int32_t dstY);
 
 MCDR_API void MCDR_CALL mcdr_dx12CopyBufferToTexture(mcdr_command_ctx* ctx, mcdr_object* srcBuffer,
                                                      int64_t srcOffset, int32_t srcWidth, int32_t srcHeight,
                                                      mcdr_object* dstTexture, int32_t mip, int32_t layer,
                                                      int32_t dstX, int32_t dstY, int32_t width,
                                                      int32_t height);
+MCDR_API int32_t MCDR_CALL mcdr_dx12CopyBufferToTextureChecked(mcdr_command_ctx* ctx, mcdr_object* srcBuffer,
+    int64_t srcOffset, int32_t srcWidth, int32_t srcHeight, mcdr_object* dstTexture,
+    int32_t mip, int32_t layer, int32_t dstX, int32_t dstY, int32_t width, int32_t height);
 
 MCDR_API void MCDR_CALL mcdr_dx12CopyTextureToBuffer(mcdr_command_ctx* ctx, mcdr_object* srcTexture,
                                                      int32_t mip, int32_t layer, int32_t srcX, int32_t srcY,
@@ -1134,6 +1128,9 @@ MCDR_API void MCDR_CALL mcdr_dx12CopyTextureToTexture(mcdr_command_ctx* ctx, mcd
                                                       mcdr_object* dstTexture, int32_t mip, int32_t layer,
                                                       int32_t srcX, int32_t srcY, int32_t dstX, int32_t dstY,
                                                       int32_t width, int32_t height);
+MCDR_API int32_t MCDR_CALL mcdr_dx12CopyTextureToTextureChecked(mcdr_command_ctx* ctx, mcdr_object* srcTexture,
+    mcdr_object* dstTexture, int32_t mip, int32_t layer, int32_t srcX, int32_t srcY,
+    int32_t dstX, int32_t dstY, int32_t width, int32_t height);
 
 MCDR_API void MCDR_CALL mcdr_dx12ClearColorTexture(mcdr_command_ctx* ctx, mcdr_object* texture, float r,
                                                    float g, float b, float a);
@@ -1172,27 +1169,6 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12BlitTextureToTexture(mcdr_command_ctx* ctx, 
 MCDR_API int32_t MCDR_CALL mcdr_dx12SharpenTextureToTexture(mcdr_command_ctx* ctx, mcdr_object* src,
                                                         mcdr_object* dst, float amount);
 
-// P152: TAA resolve, native side. Same call point as mcdr_dx12ApplySmaaToTexture (world drawn,
-// GUI not yet), but the cross-frame state lives here: two RGBA16F history textures (ping-pong),
-// the resolve pipeline and the jitter/history bookkeeping are owned by the device context, so
-// the JVM only pushes per-frame values. Two passes: scene + history[read] + motion ->
-// history[write], then a blit (or a 5-tap sharpen when sharpenAmount > 0) back into `scene`,
-// which is left in RENDER_TARGET so the GUI pass can keep using it as an attachment.
-//
-// `motion` may be a texture view (the velocity target is handed over as one) — the native side
-// unwraps it. The jitter values are in pixels and are expected to be already applied to the
-// projection matrix; `reset` != 0 (first frame, teleport, resize, history-generation change)
-// makes this frame bypass the blend. `blend` is the weight of the current frame (1/16 is the
-// usual value); `sharpenAmount` <= 0 selects the plain blit.
-//
-// Returns 1 when TAA really ran this frame, 0 when it was skipped (mode is not TAA, the textures
-// are unsuitable, or an earlier failure disabled it) and -1 when it failed — a failure disables
-// TAA and logs one ERROR. A no-op when the anti-aliasing mode is not TAA.
-MCDR_API int32_t MCDR_CALL mcdr_dx12ApplyTaaToTexture(mcdr_command_ctx* ctx, mcdr_object* scene,
-                                                     mcdr_object* motion, float jitterX, float jitterY,
-                                                     float prevJitterX, float prevJitterY, float blend,
-                                                     int32_t reset, float sharpenAmount);
-
 // `colorTextures` may contain NULL entries (unused attachments); they are
 // skipped. `colorMips` is the per-attachment RTV mip slice. `colorClearFlags`
 // is 0 = load, 1 = clear. `clearColors` holds 4 floats per attachment.
@@ -1215,7 +1191,7 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12ReadQueryValues(mcdr_query_pool* pool, int32
 
 // Async renderer control channel.
 MCDR_API void MCDR_CALL mcdr_dx12InitAsyncRenderer(int32_t workerCount);
-MCDR_API void MCDR_CALL mcdr_dx12DestroyAsyncRenderer(void);
+MCDR_API int32_t MCDR_CALL mcdr_dx12DestroyAsyncRenderer(void);
 MCDR_API int32_t MCDR_CALL mcdr_dx12AsyncRenderBeginFrame(mcdr_command_ctx* ctx);
 MCDR_API int32_t MCDR_CALL mcdr_dx12AsyncRenderWaitComplete(mcdr_command_ctx* ctx, int64_t timeoutMs);
 MCDR_API int32_t MCDR_CALL mcdr_dx12AsyncRenderIsRecordingReady(mcdr_command_ctx* ctx);
@@ -1228,6 +1204,9 @@ MCDR_API void MCDR_CALL mcdr_dx12ClearAsyncRenderCtx(void);
 // ---------------------------------------------------------------------------
 
 MCDR_API mcdr_pipeline* MCDR_CALL mcdr_dx12CreateGraphicsPipeline(const mcdr_pipeline_desc* desc);
+MCDR_API mcdr_pipeline* MCDR_CALL mcdr_dx12CreateGraphicsPipelineWithConstants(const mcdr_pipeline_desc* desc, int32_t byteSize);
+MCDR_API int32_t MCDR_CALL mcdr_dx12PushGraphicsConstants(mcdr_command_ctx* context, const void* data, int32_t byteSize);
+MCDR_API int32_t MCDR_CALL mcdr_dx12EnsureGraphicsState(mcdr_command_ctx* context);
 MCDR_API void MCDR_CALL mcdr_dx12DestroyPipeline(mcdr_pipeline* pipeline);
 
 // ---------------------------------------------------------------------------
@@ -1251,6 +1230,12 @@ MCDR_API void MCDR_CALL mcdr_dx12DestroyPipeline(mcdr_pipeline* pipeline);
 // 从 DXIL 建 compute PSO。DXIL 由 mcdr_dx12CompileShaderDxc(..., "cs_6_x", ...) 产出
 // （cs_6_8 起支持 Wave 内在函数；本机实测 6.9 可用）。失败返回 NULL，原因见 mcdrLastError()。
 MCDR_API mcdr_object* MCDR_CALL mcdr_dx12CreateComputePipeline(const void* dxil, int32_t dxilSize);
+
+// Terrain tile binning compute PSO. Root parameters are fixed to space3:
+// b0 draw constants, b1 batch constants, b2 binning constants, t8 envelopes,
+// and u0..u3 masks/prefixes/commands/control.
+MCDR_API mcdr_object* MCDR_CALL mcdr_dx12CreateTerrainTileBinningPipeline(const void* dxil,
+                                                                          int32_t dxilSize);
 
 // 在已打开的命令列表上派发一次。内部把目标纹理 COMMON → UNORDERED_ACCESS、
 // Dispatch、再转回 COMMON（跨列表的后续拷贝因此仍按 COMMON 处理）。
@@ -1283,6 +1268,9 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12QueryMeshSupport(char* outReason, int32_t ca
 // Creates an amplification/mesh pipeline from DXIL bytecode. Returns NULL and
 // sets the last error when the device does not support mesh shaders (tier 0).
 MCDR_API mcdr_pipeline* MCDR_CALL mcdr_dx12CreateMeshPipeline(const mcdr_mesh_pipeline_desc* desc);
+MCDR_API mcdr_pipeline* MCDR_CALL mcdr_dx12CreateMeshPipelineWithConstants(const mcdr_mesh_pipeline_desc* desc, int32_t byteSize);
+MCDR_API uint64_t MCDR_CALL mcdr_dx12CreateMeshRootSignatureWithConstants(const mcdr_pipeline_binding_desc* bindings, int32_t count, int32_t meshExtras, int32_t byteSize);
+MCDR_API mcdr_pipeline* MCDR_CALL mcdr_dx12CreateMeshPipelineWithRootConstants(const mcdr_mesh_pipeline_desc* desc, uint64_t rootSignature, int32_t byteSize);
 
 // 与 mcdr_dx12CreateMeshPipeline 相同，但复用调用方提供的根签名
 // （ID3D12RootSignature* 的地址值，0 = 退回内部按 bindings 新建）。
@@ -1359,6 +1347,9 @@ MCDR_API void MCDR_CALL mcdr_dx12SetRaytracingMode(int32_t mode);
 MCDR_API void MCDR_CALL mcdr_dx12SetSwapchainOptions(int32_t allowTearing, int32_t forcePresentChild);
 
 MCDR_API void MCDR_CALL mcdr_dx12DestroySurface(mcdr_surface* surface);
+MCDR_API int32_t MCDR_CALL mcdr_dx12DestroySurfaceChecked(mcdr_surface* surface);
+MCDR_API int32_t MCDR_CALL mcdr_dx12DestroyDeviceChecked(void);
+MCDR_API int32_t MCDR_CALL mcdr_dx12InvalidateReconstructionInputs(mcdr_command_ctx* ctx);
 MCDR_API mcdr_surface* MCDR_CALL mcdr_dx12GetActiveSurfaceHandle(void);
 
 // Both readback entry points write 36 int32s (9 pixels x RGBA) into `out` and
@@ -1374,6 +1365,10 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12ReadbackTexturePixels(mcdr_object* texture, 
  * 读回结束后纹理被恢复成 fromState，对 native 的状态跟踪没有净影响。 */
 MCDR_API int32_t MCDR_CALL mcdr_dx12ReadbackTexturePixelsIn(mcdr_object* texture, int32_t fromState,
                                                             int32_t* out);
+MCDR_API int32_t MCDR_CALL mcdr_dx12CaptureSampledTextureContentV1(
+    mcdr_command_ctx* context, mcdr_object* view, uint64_t totalBudgetBytes,
+    uint64_t* ownerIdentity, uint64_t* ownerGeneration, uint64_t* contentVersion,
+    uint32_t* firstMip, uint32_t* mipCount, uint32_t* firstLayer, uint32_t* layerCount);
 
 /* P291e：DLSS 输出纹理上一帧结束时停在哪个状态（D3D12_RESOURCE_STATES 数值）。
  * 0 (COMMON) = 这一帧没有输出纹理/未知 —— 调用方不要据此采样。 */
@@ -1385,6 +1380,9 @@ MCDR_API void MCDR_CALL mcdr_dx12DumpTextureToFile(mcdr_object* texture, const c
 // Draw  (was jni_bridge_p6.cpp — 9 exports, +1 for MC 26.2 setViewport)
 // ---------------------------------------------------------------------------
 
+MCDR_API int32_t MCDR_CALL mcdr_dx12SetRasterMotionTarget(
+    mcdr_command_ctx* ctx, mcdr_object* worldColor, mcdr_object* worldDepth, mcdr_object* motion);
+MCDR_API int32_t MCDR_CALL mcdr_dx12SetAdditionalColorTarget(mcdr_command_ctx* ctx, mcdr_object* target);
 MCDR_API int32_t MCDR_CALL mcdr_dx12SetPipeline(mcdr_command_ctx* ctx, mcdr_pipeline* pipeline,
                                                 int32_t hasDepth);
 MCDR_API int32_t MCDR_CALL mcdr_dx12SetScissor(mcdr_command_ctx* ctx, int32_t x, int32_t y, int32_t width,
@@ -1578,6 +1576,571 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12DispatchComputeTexture3(
 // SHADING_RATE_SOURCE；返回 1=已绑定 0=列表不是 ID3D12GraphicsCommandList5 -1=不是纹理
 // -2=没有打开的命令列表。
 MCDR_API int32_t MCDR_CALL mcdr_dx12SetShadingRateImage(mcdr_command_ctx* ctx, mcdr_object* image);
+
+MCDR_API int32_t MCDR_CALL mcdr_dx12MultiDrawIndexedPacked(mcdr_command_ctx* ctx,
+    const int32_t* drawParameters, int32_t instanceCount, int32_t firstInstance, int32_t drawCount);
+MCDR_API int32_t MCDR_CALL mcdr_dx12MultiDrawIndexedSeparate(mcdr_command_ctx* ctx,
+    const int32_t* firstIndices, const int32_t* indexCounts, const int32_t* baseVertices,
+    int32_t instanceCount, int32_t firstInstance, int32_t drawCount);
+MCDR_API int32_t MCDR_CALL mcdr_dx12MultiDrawPacked(mcdr_command_ctx* ctx,
+    const int32_t* drawParameters, int32_t instanceCount, int32_t firstInstance, int32_t drawCount);
+MCDR_API int32_t MCDR_CALL mcdr_dx12MultiDrawSeparate(mcdr_command_ctx* ctx,
+    const int32_t* firstVertices, const int32_t* vertexCounts, int32_t drawCount);
+MCDR_API int32_t MCDR_CALL mcdr_dx12MultiDrawBound(mcdr_command_ctx* ctx, int32_t indexed,
+    const int32_t* drawParameters, int32_t instanceCount, int32_t firstInstance, int32_t drawCount,
+    const mcdr_binding_slot* sharedBindings, int32_t bindingCount, const int32_t* overrideIndices,
+    int32_t overrideCount, const mcdr_binding_slot* drawBindings);
+
+MCDR_API void* MCDR_CALL mcdr_dx12CreateWorkGraph(
+    uint32_t schemaVersion, const void* dxil, int32_t dxilSize, const char* programName,
+    const char* entryName, uint32_t recordSize, const uint32_t* bindingTriples,
+    uint32_t bindingCount, uint64_t backingBudget);
+MCDR_API void MCDR_CALL mcdr_dx12DestroyWorkGraph(void* program);
+#define MCDR_VANILLA_FRAME_SCHEMA_VERSION 2u
+typedef struct mcdr_frame_identity {
+    uint64_t worldEpoch;
+    uint64_t realFrameId;
+    uint64_t configVersion;
+    uint64_t resourceVersion;
+} mcdr_frame_identity;
+
+typedef struct mcdr_prepared_binding {
+    mcdr_object* object;
+    uint32_t firstSubresource;
+    uint32_t subresourceCount;
+} mcdr_prepared_binding;
+
+#include "mcdr_oit_execution.h"
+#include "mcdr_terrain_tile_adapter.h"
+
+#define MCDR_PRESENT_RECEIPT_SCHEMA_VERSION 1u
+enum {
+    MCDR_DISPLAY_SETTLE_EMPTY = 0,
+    MCDR_DISPLAY_SETTLE_COMPLETE = 1,
+    MCDR_DISPLAY_SETTLE_TIMEOUT = -1,
+    MCDR_DISPLAY_SETTLE_SUBMISSION_UNKNOWN = -2,
+    MCDR_DISPLAY_SETTLE_INVALID_REQUEST = -3
+};
+enum {
+    MCDR_SUBMISSION_NONE = 0,
+    MCDR_SUBMISSION_QUEUED = 1,
+    MCDR_SUBMISSION_SUBMITTED = 2,
+    MCDR_SUBMISSION_FAILED = 3,
+    MCDR_SUBMISSION_UNKNOWN = 4
+};
+enum {
+    MCDR_PRESENT_PENDING = 0,
+    MCDR_PRESENT_SUCCEEDED = 1,
+    MCDR_PRESENT_OCCLUDED = 2,
+    MCDR_PRESENT_MODE_CHANGED = 3,
+    MCDR_PRESENT_FAILED = 4,
+    MCDR_PRESENT_NOT_CALLED = 5,
+    MCDR_PRESENT_CANCELLED = 6,
+    MCDR_PRESENT_UNKNOWN = 7
+};
+enum {
+    MCDR_PRESENT_RETIREMENT_PENDING = 0,
+    MCDR_PRESENT_RETIREMENT_SIGNALLED = 1,
+    MCDR_PRESENT_RETIREMENT_NOT_REQUIRED = 2,
+    MCDR_PRESENT_RETIREMENT_UNKNOWN = 3
+};
+enum {
+    MCDR_PRESENT_OIT_HISTORY_PUBLISHED = 1u,
+    MCDR_PRESENT_FG_CAMERA_PUBLISHED = 2u,
+    MCDR_PRESENT_DXGI_STATUS_VALID = 4u
+};
+typedef struct mcdr_present_receipt_v1 {
+    uint32_t schemaVersion, structSize;
+    uint64_t serial;
+    mcdr_frame_identity identity;
+    uint64_t providerGeneration, historyGeneration;
+    uint64_t commandFenceValue, submitQueueFenceValue, presentQueueFenceValue;
+    uint32_t submissionState, presentOutcome;
+    int32_t dxgiStatus;
+    uint32_t flags, outputFrameCount;
+    uint32_t retirementState;
+} mcdr_present_receipt_v1;
+MCDR_API int32_t MCDR_CALL mcdr_dx12SettleDisplayFrameV1(
+    mcdr_command_ctx* context, uint64_t timeoutMs, mcdr_present_receipt_v1* receipt);
+typedef struct mcdr_raster_camera {
+    double origin[3];
+    double jitterX;
+    double jitterY;
+    float projection[16];
+    float rasterProjection[16];
+    float viewRotation[16];
+    float nearPlane;
+    float farPlane;
+    float verticalFovRadians;
+    uint32_t flags;
+    float yaw;
+    float pitch;
+} mcdr_raster_camera;
+typedef struct mcdr_frame_settings {
+    uint32_t antiAliasing;
+    uint32_t reconstructionBackend;
+    uint32_t renderScalePercent;
+    uint32_t jitterEnabled;
+    uint32_t jitterSamples;
+    float providerSharpness;
+    uint32_t providerMasks;
+    uint32_t dlssQuality;
+    uint32_t dlssPreset;
+    uint32_t frameGenerationBackend;
+    uint32_t frameGenerationMode;
+    uint32_t frameGenerationFrames;
+    float taaBlend;
+    float taaSharpness;
+} mcdr_frame_settings;
+typedef struct mcdr_vanilla_frame_input {
+    uint32_t schemaVersion;
+    uint32_t structSize;
+    mcdr_frame_identity identity;
+    uint64_t historyGeneration;
+    uint64_t frameTimeNanos;
+    uint64_t jitterPhaseIndex;
+    uint32_t renderWidth;
+    uint32_t renderHeight;
+    uint32_t displayWidth;
+    uint32_t displayHeight;
+    uint32_t flags;
+    uint32_t colorEncoding;
+    uint32_t depthConvention;
+    uint32_t motionConvention;
+    float frameDeltaMs;
+    float preExposure;
+    float motionScaleX;
+    float motionScaleY;
+    float viewSpaceToMeters;
+    uint32_t reserved;
+    uint64_t previousRealFrameId;
+    mcdr_frame_settings settings;
+    mcdr_raster_camera current;
+    mcdr_raster_camera previous;
+} mcdr_vanilla_frame_input;
+#define MCDR_OIT_SCHEMA_VERSION 1u
+#define MCDR_OIT_CAPTURE_CERTIFIED_RGB_V1 1u
+#define MCDR_OIT_CURRENT_MATERIAL_VALID 1u
+#define MCDR_OIT_GEOMETRY_PREVIOUS_VALID 2u
+#define MCDR_OIT_MATERIAL_PREVIOUS_VALID 4u
+#define MCDR_OIT_COVERAGE_VALID 8u
+#define MCDR_OIT_STATUS_OVERFLOW 1u
+#define MCDR_OIT_STATUS_UNKNOWN_RANGE 2u
+#define MCDR_OIT_STATUS_INVALID_MATERIAL 4u
+#define MCDR_OIT_STATUS_CORRUPT_CHAIN 8u
+#define MCDR_OIT_STATUS_INVALID_CURRENT 16u
+#define MCDR_OIT_STATUS_EMPTY 32u
+#define MCDR_OIT_STATUS_NO_PREVIOUS 64u
+#define MCDR_OIT_STATUS_HISTORY_REJECTED 128u
+#define MCDR_OIT_STATUS_HISTORY_USED 256u
+#define MCDR_OIT_MAX_RECORDS_PER_PIXEL 32u
+#define MCDR_OIT_RESULT_METADATA_CAPACITY_EXCEEDED -7
+#define MCDR_OIT_TOTAL_BUDGET_LIMIT 536870912ull
+#define MCDR_OIT_SOURCE_TERRAIN 0u
+#define MCDR_OIT_SOURCE_FEATURE 1u
+#define MCDR_OIT_SOURCE_BORDER 2u
+#define MCDR_OIT_SOURCE_WEATHER 3u
+#define MCDR_OIT_SOURCE_CLOUD 4u
+#define MCDR_OIT_SOURCE_CUSTOM_WEATHER 5u
+#define MCDR_OIT_SOURCE_CUSTOM_CLOUD 6u
+#define MCDR_OIT_SOURCE_CUSTOM_TRANSLUCENT 7u
+#define MCDR_OIT_RESULT_SUCCESS 1
+#define MCDR_OIT_RESULT_INVALID_REQUEST (-1)
+#define MCDR_OIT_RESULT_UNSUPPORTED (-2)
+#define MCDR_OIT_RESULT_BUDGET_EXCEEDED (-3)
+#define MCDR_OIT_RESULT_BUSY (-4)
+#define MCDR_OIT_RESULT_STALE (-5)
+#define MCDR_OIT_RESULT_SUBMISSION_UNKNOWN (-6)
+typedef struct mcdr_oit_capture_pipeline_v1 {
+    uint32_t schemaVersion, structSize, shaderAbiVersion, flags;
+    uint64_t shaderContractHash, programGeneration;
+} mcdr_oit_capture_pipeline_v1;
+typedef struct mcdr_oit_begin_v1 {
+    uint32_t schemaVersion, structSize;
+    mcdr_frame_identity identity;
+    uint64_t historyGeneration, previousRealFrameId, programGeneration;
+    uint64_t totalBudgetBytes;
+    uint32_t maxRecords, maxRecordsPerPixel;
+    uint32_t width, height, colorEncoding, flags;
+    float preExposure;
+    uint32_t reserved;
+    uint32_t maxSourceRows, maxPrimitiveRows, maxPreviousRows, reservedMetadata;
+    mcdr_prepared_binding opaqueColor, opaqueDepth, opaqueMotion;
+} mcdr_oit_begin_v1;
+typedef struct mcdr_oit_begin_v2 {
+    mcdr_oit_begin_v1 base;
+    uint32_t maxTerrainSectionRows, maxTerrainPrimitives;
+    float previousViewProjection[16];
+    double previousOrigin[3];
+    uint32_t previousCameraValid, reserved;
+} mcdr_oit_begin_v2;
+typedef struct mcdr_oit_source_v1 {
+    uint64_t producerId, producerGeneration, shaderGeneration;
+    uint32_t producerKind, validity;
+} mcdr_oit_source_v1;
+typedef struct mcdr_oit_primitive_v1 {
+    uint64_t surfaceId, geometryGeneration, materialId, materialGeneration, textureGeneration;
+    uint32_t sourceIndex, previousIndex, flags, reserved;
+} mcdr_oit_primitive_v1;
+typedef struct mcdr_oit_previous_triangle_v1 {
+    float clip[12], materialUv[6];
+    uint32_t flags, reserved;
+} mcdr_oit_previous_triangle_v1;
+typedef struct mcdr_oit_metadata_v1 {
+    uint32_t schemaVersion, structSize;
+    uint32_t sourceCount, primitiveCount, previousCount, sectionCount;
+    const mcdr_oit_source_v1* sources;
+    const mcdr_oit_primitive_v1* primitives;
+    const mcdr_oit_previous_triangle_v1* previous;
+    const uint32_t* sectionPrimitiveBases;
+} mcdr_oit_metadata_v1;
+typedef struct mcdr_oit_draw_v1 {
+    uint32_t schemaVersion, structSize;
+    uint32_t sourceIndex, primitiveBase, primitiveCount, flags;
+    uint64_t producerScopeSerial;
+    uint32_t primitivesPerInstance, instanceCount, firstInstance, reserved;
+} mcdr_oit_draw_v1;
+typedef struct mcdr_oit_terrain_section_v2 {
+    uint64_t surfaceId, geometryGeneration;
+    uint64_t materialId, materialGeneration, textureGeneration;
+    uint32_t primitiveBase, primitiveCount;
+    int32_t sectionX, sectionY, sectionZ;
+    uint32_t flags;
+    uint32_t vertexBase, vertexCount;
+} mcdr_oit_terrain_section_v2;
+typedef struct mcdr_oit_terrain_metadata_v2 {
+    uint32_t schemaVersion, structSize;
+    mcdr_oit_source_v1 source;
+    uint32_t sectionCount, primitiveCount;
+    const mcdr_oit_terrain_section_v2* sections;
+    mcdr_object* vertexBuffer;
+    uint64_t vertexOffset, vertexBytes;
+} mcdr_oit_terrain_metadata_v2;
+typedef struct mcdr_oit_terrain_draw_v2 {
+    uint32_t schemaVersion, structSize;
+    uint64_t producerScopeSerial;
+} mcdr_oit_terrain_draw_v2;
+#define MCDR_OIT_RESOLVE_UNRECORDED_COVERAGE_UNAVAILABLE 1u
+typedef struct mcdr_oit_resolve_v3 {
+    uint32_t schemaVersion, structSize;
+    mcdr_frame_identity identity;
+    void* frame;
+    mcdr_prepared_binding currentTransparency, unrecordedCoverage, correctedTransparency, statusOutput;
+    uint32_t flags, reserved;
+} mcdr_oit_resolve_v3;
+// Resolve V4 adds the sealed terrain tile packets. `terrainBatches` points to
+// a contiguous array of mcdr::terrain_tile::BatchV3 payloads owned by the
+// caller for the duration of this call. Native copies and validates every
+// payload before recording GPU work; it never retains this pointer.
+typedef struct mcdr_oit_resolve_v4 {
+    mcdr_oit_resolve_v3 base;
+    const void* terrainBatches;
+    uint32_t terrainBatchCount;
+    uint32_t reservedV4;
+} mcdr_oit_resolve_v4;
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitShaderPreludeV1(char* destination, uint32_t capacity, uint32_t* required, uint32_t* shaderAbiVersion, uint64_t* contractHash);
+MCDR_API mcdr_pipeline* MCDR_CALL mcdr_dx12CreateGraphicsCapturePipelineV1(const mcdr_pipeline_desc* descriptor, uint32_t pushBytes, const mcdr_oit_capture_pipeline_v1* capture);
+MCDR_API uint64_t MCDR_CALL mcdr_dx12CreateMeshCaptureRootV1(const mcdr_pipeline_binding_desc* bindings, int32_t count, uint32_t meshLayout, uint32_t pushBytes, const mcdr_oit_capture_pipeline_v1* capture);
+MCDR_API mcdr_pipeline* MCDR_CALL mcdr_dx12CreateMeshCapturePipelineV1(const mcdr_mesh_pipeline_desc* descriptor, uint64_t root, uint32_t pushBytes, const mcdr_oit_capture_pipeline_v1* capture);
+// Terrain tile route (schema 1): creates a mesh-visible root extension in
+// register space 3 and its DispatchMesh indirect signature. The route is
+// attached to the capture pipeline separately so the vanilla draw pipeline
+// remains unchanged. The route is only valid for the matching capture hash
+// and generation; all handles are opaque and must be destroyed explicitly.
+MCDR_API uint64_t MCDR_CALL mcdr_dx12CreateTerrainTileRootV1(
+    const mcdr_pipeline_binding_desc* bindings, int32_t count, uint32_t pushBytes,
+    const mcdr_oit_capture_pipeline_v1* capture);
+MCDR_API void* MCDR_CALL mcdr_dx12CreateTerrainTileRouteV1(
+    uint64_t rootSignature, const mcdr_oit_capture_pipeline_v1* capture);
+MCDR_API int32_t MCDR_CALL mcdr_dx12BindTerrainTileRouteV1(
+    mcdr_pipeline* capturePipeline, void* route);
+MCDR_API int32_t MCDR_CALL mcdr_dx12BindTerrainTilePipelineV1(
+    void* route, mcdr_pipeline* tilePipeline);
+MCDR_API int32_t MCDR_CALL mcdr_dx12BindTerrainTileStageV2(
+    mcdr_pipeline* source, void* route, const mcdr_terrain_tile_stage_v2* contract);
+MCDR_API void MCDR_CALL mcdr_dx12DestroyTerrainTileRouteV1(void* route);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitBeginFrameV1(mcdr_command_ctx* context, const mcdr_oit_begin_v1* input, void** frame);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitBeginFrameV2(mcdr_command_ctx* context, const mcdr_oit_begin_v2* input, void** frame);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitPublishMetadataV1(mcdr_command_ctx* context, void* frame, const mcdr_oit_metadata_v1* input, void** metadata);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitPublishTerrainMetadataV2(mcdr_command_ctx* context, void* frame, const mcdr_oit_terrain_metadata_v2* input, void** metadata);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitBindDrawV1(mcdr_command_ctx* context, void* frame, void* metadata, const mcdr_oit_draw_v1* input);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitBindTerrainDrawV2(mcdr_command_ctx* context, void* frame, void* metadata, const mcdr_oit_terrain_draw_v2* input);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitUnbindDrawV1(mcdr_command_ctx* context, void* frame);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitSealFrameV1(mcdr_command_ctx* context, void* frame);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitAbortFrameV1(mcdr_command_ctx* context, void* frame);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitResolveRecordsV3(mcdr_command_ctx* context, const mcdr_oit_resolve_v3* input);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitResolveRecordsV4(mcdr_command_ctx* context, const mcdr_oit_resolve_v4* input);
+// V2 terrain tile preparation. V1 Batch remains a compatibility contract and
+// is never consumed by the GPU tile executor.
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitPrepareTerrainTilesV2(
+    mcdr_command_ctx* context, void* frame, const void* batch);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitPrepareTerrainTilesV3(
+    mcdr_command_ctx* context, void* frame, const void* batch);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitBeginExecutionStreamV1(
+    mcdr_command_ctx* context, void* frame, const mcdr_oit_execution_begin_v1* input, void** stream);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitQueryExecutionStreamV1(
+    mcdr_command_ctx* context, void* stream, mcdr_oit_execution_info_v1* output);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitQueryTerrainDrawReceiptV1(
+    mcdr_command_ctx* context, void* frame, const mcdr_oit_draw_receipt_query_v1* query,
+    mcdr_oit_draw_receipt_v1* output);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitQueryTerrainDrawFrontierV1(
+    mcdr_command_ctx* context, void* frame, uint64_t* afterSequence);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitBeginExecutionOperationV1(
+    mcdr_command_ctx* context, void* frame, const mcdr_oit_execution_operation_begin_v1* input, void** operation);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitFinishExecutionOperationV1(
+    mcdr_command_ctx* context, void* frame, void* operation, uint64_t* receiptCount);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitCancelExecutionOperationV1(
+    mcdr_command_ctx* context, void* frame, void* operation);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitQueryExecutionOperationReceiptV1(
+    mcdr_command_ctx* context, void* frame, void* operation, uint64_t afterSequence,
+    mcdr_oit_execution_operation_receipt_v1* output);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitAppendExecutionOperationEventV1(
+    mcdr_command_ctx* context, void* stream, const mcdr_oit_execution_event_v2* event,
+    const mcdr_oit_execution_operation_receipt_v1* receipt, uint64_t* eventId);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitBeginTerrainStageDrawV2(
+    mcdr_command_ctx* context, void* frame, const mcdr_oit_terrain_stage_begin_v2* input, void** token);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitFinishTerrainStageDrawV2(
+    mcdr_command_ctx* context, void* frame, void* token, mcdr_oit_terrain_stage_receipt_v2* output);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitAbortTerrainStageDrawV2(
+    mcdr_command_ctx* context, void* frame, void* token);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitQueryTerrainStageReceiptV2(
+    mcdr_command_ctx* context, void* frame, uint64_t receiptId, mcdr_oit_terrain_stage_receipt_v2* output);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitRegisterTerrainReplayReadSetV2(
+    mcdr_command_ctx* context, void* frame, void* token, void* terrainBatch, mcdr_object* vertex,
+    uint64_t vertexOffset, const mcdr_oit_terrain_replay_read_set_v2* input);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitCancelTerrainReplayReadSetV2(
+    mcdr_command_ctx* context, void* frame, void* token);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitAppendExecutionEventV1(
+    mcdr_command_ctx* context, void* stream, const mcdr_oit_execution_event_v1* event, uint64_t* eventId);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitSealExecutionStreamV1(
+    mcdr_command_ctx* context, void* stream, const mcdr_oit_execution_manifest_v1* manifest,
+    void** sealedStream, mcdr_oit_execution_seal_result_v1* result);
+#include "mcdr_oit_normalization.h"
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitCreateNormalizationProgramsV1(
+    mcdr_command_ctx* context, const mcdr_oit_normalization_program_v1* input, void** programs);
+MCDR_API void MCDR_CALL mcdr_dx12OitDestroyNormalizationProgramsV1(void* programs);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitCreateNormalizationBatchV1(
+    mcdr_command_ctx* context, void* programs, const mcdr_oit_normalization_batch_v1* input, void** batch);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitRecordNormalizationLaneV1(
+    mcdr_command_ctx* context, void* batch, const mcdr_oit_normalization_lane_v1* input);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitRecordNormalizationAverageV1(mcdr_command_ctx* context, void* batch);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitQueryNormalizationBatchV1(
+    mcdr_command_ctx* context, void* batch, mcdr_oit_normalization_info_v1* output);
+MCDR_API void MCDR_CALL mcdr_dx12OitDestroyNormalizationBatchV1(void* batch);
+#define MCDR_PREPARED_FRAME_SCHEMA_VERSION 2u
+typedef struct mcdr_prepared_frame {
+    uint32_t schemaVersion;
+    uint32_t structSize;
+    mcdr_frame_identity identity;
+    uint64_t historyGeneration;
+    uint32_t availability;
+    uint32_t required;
+    uint32_t consumer;
+    uint32_t motionCoverage;
+    uint32_t motionGuideCoverage;
+    uint32_t resetReasons;
+    mcdr_prepared_binding color;
+    mcdr_prepared_binding depth;
+    mcdr_prepared_binding motion;
+    mcdr_prepared_binding exposure;
+    mcdr_prepared_binding reactive;
+    mcdr_prepared_binding composition;
+    mcdr_prepared_binding responsive;
+} mcdr_prepared_frame;
+typedef struct mcdr_reconstruction_request {
+    uint32_t schemaVersion;
+    uint32_t structSize;
+    mcdr_frame_identity identity;
+    uint32_t consumer;
+    uint32_t flags;
+    mcdr_prepared_binding output;
+} mcdr_reconstruction_request;
+#define MCDR_DISPLAY_FRAME_SCHEMA_VERSION 2u
+typedef struct mcdr_display_layer_input {
+    uint32_t structSize;
+    uint32_t kind;
+    uint32_t flags;
+    uint32_t composition;
+    uint32_t width;
+    uint32_t height;
+    mcdr_prepared_binding depth;
+    mcdr_prepared_binding motion;
+    mcdr_prepared_binding coverage;
+    mcdr_raster_camera current;
+    mcdr_raster_camera previous;
+} mcdr_display_layer_input;
+typedef struct mcdr_display_post_input {
+    uint32_t structSize;
+    uint32_t kind;
+    uint32_t flags;
+    uint32_t reserved;
+    float current[16];
+    float previous[16];
+} mcdr_display_post_input;
+typedef struct mcdr_display_frame_input {
+    uint32_t schemaVersion;
+    uint32_t structSize;
+    mcdr_frame_identity identity;
+    uint64_t historyGeneration;
+    uint64_t previousRealFrameId;
+    uint32_t width;
+    uint32_t height;
+    uint32_t flags;
+    uint32_t resetReasons;
+    float frameDeltaMs;
+    float viewSpaceToMeters;
+    uint32_t frameGenerationBackend;
+    uint32_t frameGenerationMode;
+    uint32_t frameGenerationFrames;
+    uint32_t colorEncoding;
+    mcdr_prepared_binding scene;
+    mcdr_prepared_binding ui;
+    mcdr_raster_camera current;
+    mcdr_raster_camera previous;
+    uint32_t layerCount;
+    uint32_t layerStride;
+    const mcdr_display_layer_input* layers;
+    uint32_t postCount;
+    uint32_t postStride;
+    const mcdr_display_post_input* posts;
+} mcdr_display_frame_input;
+typedef struct mcdr_vanilla_resource_use {
+    void* object;
+    uint64_t version;
+    uint32_t firstSubresource;
+    uint32_t subresourceCount;
+    uint32_t access;
+    uint32_t requiredState;
+    uint32_t finalState;
+    uint32_t externalState;
+} mcdr_vanilla_resource_use;
+MCDR_API int32_t MCDR_CALL mcdr_dx12VanillaBeginFrame(mcdr_command_ctx* context, const mcdr_vanilla_frame_input* input);
+MCDR_API int32_t MCDR_CALL mcdr_dx12VanillaWorldReady(mcdr_command_ctx* context, const mcdr_frame_identity* input);
+MCDR_API int32_t MCDR_CALL mcdr_dx12VanillaGuiReady(mcdr_command_ctx* context, const mcdr_frame_identity* input);
+MCDR_API int32_t MCDR_CALL mcdr_dx12VanillaPublishPreparedFrame(mcdr_command_ctx* context, const mcdr_prepared_frame* input);
+MCDR_API int32_t MCDR_CALL mcdr_dx12VanillaEvaluateReconstruction(mcdr_command_ctx* context, const mcdr_reconstruction_request* input);
+MCDR_API int32_t MCDR_CALL mcdr_dx12BeginDisplayFrame(mcdr_command_ctx* context);
+MCDR_API int32_t MCDR_CALL mcdr_dx12AbortDisplayFrame(mcdr_command_ctx* context);
+MCDR_API int32_t MCDR_CALL mcdr_dx12PrepareDisplayFrame(mcdr_command_ctx* context,
+    const mcdr_display_frame_input* input);
+MCDR_API int32_t MCDR_CALL mcdr_dx12SubmitDisplayFrame(mcdr_command_ctx* context, const mcdr_display_frame_input* input);
+MCDR_API int32_t MCDR_CALL mcdr_dx12PrewarmDisplayFrame(mcdr_command_ctx* context, uint64_t generation);
+enum {
+    MCDR_FRAME_PROGRAMS_SUCCESS = 1,
+    MCDR_FRAME_PROGRAMS_INVALID_REQUEST = 0,
+    MCDR_FRAME_PROGRAMS_COMPILATION_FAILED = -1,
+    MCDR_FRAME_PROGRAMS_BUSY = -2,
+    MCDR_FRAME_PROGRAMS_STALE = -3,
+    MCDR_FRAME_PROGRAMS_INVALID_CONTEXT = -4,
+    MCDR_FRAME_PROGRAMS_SUBMISSION_UNKNOWN = -5
+};
+/**
+ * Single control caller per context; no recording between prepare and commit.
+ * Prepare leaves active programs unchanged and clears the output on failure.
+ * Commit consumes the candidate on success and retains it on failure.
+ * Abort accepts null; each nonnull candidate must be consumed exactly once.
+ * Abort does not access the context and remains valid after context destruction.
+ */
+MCDR_API int32_t MCDR_CALL mcdr_dx12PrepareFramePrograms(mcdr_command_ctx* context,
+    uint64_t generation, uint32_t flags, void** candidate);
+MCDR_API int32_t MCDR_CALL mcdr_dx12CommitFramePrograms(mcdr_command_ctx* context, void* candidate);
+MCDR_API void MCDR_CALL mcdr_dx12AbortFramePrograms(void* candidate);
+MCDR_API int32_t MCDR_CALL mcdr_dx12VanillaResetFrame(mcdr_command_ctx* context);
+MCDR_API int32_t MCDR_CALL mcdr_dx12VanillaBeginRasterPass(mcdr_command_ctx* context, void** token);
+MCDR_API int32_t MCDR_CALL mcdr_dx12VanillaBeginDeclaredPass(
+    mcdr_command_ctx* context, uint32_t pass, const mcdr_vanilla_resource_use* uses,
+    uint32_t useCount, uint32_t graphicsEffects, void** token);
+MCDR_API int32_t MCDR_CALL mcdr_dx12VanillaFinishDeclaredPass(
+    mcdr_command_ctx* context, void* token);
+MCDR_API int32_t MCDR_CALL mcdr_dx12PrewarmFrameprep(
+    mcdr_command_ctx* context, uint64_t generation, uint32_t flags);
+MCDR_API int32_t MCDR_CALL mcdr_dx12ProduceReactiveMask(
+    mcdr_command_ctx* context, mcdr_object* source0, mcdr_object* source1, mcdr_object* output,
+    int32_t width, int32_t height, uint64_t worldEpoch, uint64_t realFrameId,
+    uint64_t sourceVersion, uint64_t viewportVersion);
+MCDR_API int32_t MCDR_CALL mcdr_dx12ProduceProviderMasks(
+    mcdr_command_ctx* context, mcdr_object* source0, mcdr_object* source1, mcdr_object* output,
+    mcdr_object* compositionOutput, int32_t width, int32_t height, uint32_t outputFlags,
+    uint64_t worldEpoch, uint64_t realFrameId, uint64_t sourceVersion, uint64_t viewportVersion);
+enum {
+    MCDR_PROVIDER_MASK_SCHEMA_VERSION = 2,
+    MCDR_PROVIDER_MASK_FRAME_INPUTS = 1,
+    MCDR_PROVIDER_MASK_OIT_INPUTS = 2,
+    MCDR_PROVIDER_MASK_HISTORY_COMPATIBLE = 4
+};
+typedef struct mcdr_provider_mask_input {
+    uint32_t schemaVersion;
+    uint32_t structSize;
+    mcdr_frame_identity identity;
+    uint64_t historyGeneration;
+    uint64_t previousRealFrameId;
+    mcdr_object* color;
+    mcdr_object* depth;
+    mcdr_object* motion;
+    mcdr_object* source0;
+    mcdr_object* source1;
+    mcdr_object* output;
+    mcdr_object* compositionOutput;
+    uint32_t width;
+    uint32_t height;
+    uint32_t outputFlags;
+    uint32_t inputFlags;
+    float historyJitterX;
+    float historyJitterY;
+    float currentToPrevious[16];
+} mcdr_provider_mask_input;
+#define MCDR_WORLD_OUTPUT_SCHEMA_VERSION 3u
+#define MCDR_WORLD_SOURCE_COMPLETE_WORLD 0u
+#define MCDR_WORLD_SOURCE_OPAQUE_BEFORE_COMPOSITE 1u
+typedef struct mcdr_world_output_input {
+    uint32_t schemaVersion;
+    uint32_t structSize;
+    mcdr_frame_identity identity;
+    uint32_t motionCoverage;
+    uint32_t motionGuideCoverage;
+    mcdr_prepared_binding color;
+    mcdr_prepared_binding depth;
+    mcdr_prepared_binding motion;
+    mcdr_prepared_binding exposure;
+    mcdr_prepared_binding reconstructionOutput;
+    mcdr_prepared_binding scene;
+    mcdr_provider_mask_input masks;
+    float dlssPostSharpness;
+    uint32_t reserved;
+    uint32_t sourceStage;
+    uint32_t reservedStage;
+} mcdr_world_output_input;
+MCDR_API int32_t MCDR_CALL mcdr_dx12VanillaPrepareWorldOutput(mcdr_command_ctx* context, const mcdr_world_output_input* input);
+MCDR_API int32_t MCDR_CALL mcdr_dx12ProduceProviderMasksV2(
+    mcdr_command_ctx* context, const mcdr_provider_mask_input* input);
+MCDR_API int32_t MCDR_CALL mcdr_dx12ProduceVrs(
+    mcdr_command_ctx* context, mcdr_object* depth, mcdr_object* motion, mcdr_object* previous,
+    mcdr_object* output, int32_t width, int32_t height, uint32_t tileSize, uint32_t edgePermille,
+    uint32_t motionPixels, uint32_t flags, uint64_t worldEpoch, uint64_t realFrameId,
+    uint64_t sourceVersion, uint64_t viewportVersion, mcdr_object* candidates,
+    const float* previousToCurrent, const float* currentToPrevious);
+MCDR_API int32_t MCDR_CALL mcdr_dx12ProduceExposure(
+    mcdr_command_ctx* context, mcdr_object* color, mcdr_object* output,
+    int32_t width, int32_t height, uint32_t colorEncoding, float preExposure);
+MCDR_API void MCDR_CALL mcdr_dx12ResetFrameprep(mcdr_command_ctx* context);
+MCDR_API void* MCDR_CALL mcdr_dx12CreateTerrainWorkGraph(const void* nodes, int32_t nodesBytes,
+    const void* initialize, int32_t initializeBytes, const void* finalize, int32_t finalizeBytes,
+    const uint32_t* uniformRegisters, int32_t uniformCount, uint64_t budget);
+MCDR_API void MCDR_CALL mcdr_dx12DestroyTerrainWorkGraph(void* program);
+MCDR_API void* MCDR_CALL mcdr_dx12PrepareTerrainWorkGraph(void* context, void* program,
+    void* const* buffers, const uint64_t* offsets, const uint64_t* lengths,
+    int32_t bindingCount, uint32_t sectionCount, uint32_t meshletCapacity);
+MCDR_API int32_t MCDR_CALL mcdr_dx12DrawTerrainWorkGraph(void* context, void* batch,
+    void* vertexBuffer, uint64_t vertexOffset);
+MCDR_API void MCDR_CALL mcdr_dx12DestroyTerrainBatch(void* batch);
+MCDR_API int32_t MCDR_CALL mcdr_dx12DispatchWorkGraph(
+    mcdr_command_ctx* ctx, void* program, const void* records, uint32_t recordCount,
+    uint32_t recordStride, mcdr_object* const* buffers, const uint64_t* offsets,
+    const uint64_t* lengths, uint32_t bindingCount);
+MCDR_API int32_t MCDR_CALL mcdr_dx12DispatchWorkGraphGpuBuffers(
+    mcdr_command_ctx* ctx, void* program, uint32_t inputSchema, mcdr_object* inputBuffer,
+    uint64_t inputOffset, uint64_t inputBytes, mcdr_object* const* buffers,
+    const uint64_t* offsets, const uint64_t* lengths, uint32_t bindingCount);
 
 #ifdef __cplusplus
 } // extern "C"

@@ -39,6 +39,10 @@ void mcdr_host_resize(MCDR_WindowHost* host, int32_t width, int32_t height);
 // 第一帧 Present 成功后调用：显示子窗口（SW_SHOWNA，不抢焦点）。幂等。
 void mcdr_host_reveal(MCDR_WindowHost* host);
 
+// 释放前调用：只有最后一个引用才隐藏子窗口，返回 1；仍有其他 surface 使用时返回 0。
+// 不减少引用计数，真正的销毁仍由 mcdr_host_release() 完成。
+int32_t mcdr_host_prepare_release(MCDR_WindowHost* host);
+
 // 父窗口是否处于最小化/隐藏状态（Present 应跳过，避免 DXGI 丢弃帧）。
 int32_t mcdr_host_minimized(MCDR_WindowHost* host);
 

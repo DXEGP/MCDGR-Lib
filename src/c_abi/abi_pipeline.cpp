@@ -6,6 +6,7 @@
 module;
 
 #include "_d3d12_module_prelude.h"
+#include "mcdr_graphics_capture.h"
 
 module mcdr.abi.common;
 
@@ -17,6 +18,7 @@ import mcdr.d3d12.async_bundle;
 import mcdr.d3d12.async_descriptor;
 import mcdr.d3d12.async_executor;
 import mcdr.d3d12.async_fence;
+import mcdr.render.oit;
 
 using namespace d3d12_mc;
 
@@ -61,6 +63,11 @@ using PipelinePtr = d3d12_mc::Dx12Pipeline;
 extern "C" {
 
 PipelinePtr* MCDR_CALL mcdr_dx12CreateGraphicsPipeline(const mcdr_pipeline_desc* desc) {
+    return mcdr_dx12CreateGraphicsPipelineWithConstants(desc, 0);
+}
+
+static PipelinePtr* createGraphicsPipelineErased(const mcdr_pipeline_desc* desc, int32_t byteSize,
+    const mcdr_oit_capture_pipeline_v1* capture, std::shared_ptr<const void> normalizationProvenance = {}) {
     using mcdr::abi::failWithPtr;
     using mcdr::abi::setLastErrorf;
 
@@ -69,6 +76,21 @@ PipelinePtr* MCDR_CALL mcdr_dx12CreateGraphicsPipeline(const mcdr_pipeline_desc*
     }
 
     d3d12_mc::PipelineDesc d;
+    d.normalizationProvenance = std::move(normalizationProvenance);
+    if (byteSize < 0 || byteSize > 128 || byteSize % 4 != 0) {
+        return failWithPtr<PipelinePtr>(kCreate, "invalid root constant size");
+    }
+    d.pushConstantBytes = static_cast<uint32_t>(byteSize);
+    if (capture) {
+        if (!mcdr::graphics_capture::valid(capture))
+            return failWithPtr<PipelinePtr>(kCreate, "Invalid capture shader contract");
+        d.captureHash = capture->shaderContractHash;
+        d.captureGeneration = capture->programGeneration;
+    }
+    if ((desc->pipelineFlags & ~1u) != 0u) {
+        return failWithPtr<PipelinePtr>(kCreate, "unsupported pipeline flags");
+    }
+    d.rasterMotion = (desc->pipelineFlags & 1u) != 0u;
 
     // --- shader bytecode ---------------------------------------------------
     // The old path went through NewDirectByteBuffer + GetDirectBufferAddress,
@@ -175,6 +197,55 @@ PipelinePtr* MCDR_CALL mcdr_dx12CreateGraphicsPipeline(const mcdr_pipeline_desc*
     return static_cast<PipelinePtr*>(*r);
 }
 
+PipelinePtr* MCDR_CALL mcdr_dx12CreateGraphicsPipelineWithConstants(const mcdr_pipeline_desc* desc, int32_t byteSize) {
+    return createGraphicsPipelineErased(desc, byteSize, nullptr);
+}
+
+PipelinePtr* MCDR_CALL mcdr_dx12CreateOitNormalizationPipelineV1(const mcdr_pipeline_desc* descriptor,
+    const mcdr_oit_normalization_pipeline_v1* certification) {
+    constexpr const char* operation = "mcdr_dx12CreateOitNormalizationPipelineV1";
+    if (!descriptor || !certification)
+        return mcdr::abi::failWithPtr<PipelinePtr>(operation, "Missing normalization descriptor or certification");
+    try {
+        std::shared_ptr<const void> provenance;
+        const int result = d3d12_mc::oit::createNormalizationPipelineCertification(*descriptor, *certification, &provenance);
+        if (result != 1 || !provenance) {
+            mcdr::abi::setLastErrorf(operation, "Normalization certification failed (%d)", result);
+            return nullptr;
+        }
+        return createGraphicsPipelineErased(descriptor, 0, nullptr, std::move(provenance));
+    } catch (const std::bad_alloc&) {
+        return mcdr::abi::failWithPtr<PipelinePtr>(operation, "Normalization pipeline allocation failed");
+    } catch (const std::exception& failure) {
+        return mcdr::abi::failWithPtr<PipelinePtr>(operation, failure.what());
+    } catch (...) {
+        return mcdr::abi::failWithPtr<PipelinePtr>(operation, "Normalization pipeline creation failed");
+    }
+}
+
+PipelinePtr* MCDR_CALL mcdr_dx12CreateGraphicsCapturePipelineV1(const mcdr_pipeline_desc* desc, uint32_t byteSize,
+    const mcdr_oit_capture_pipeline_v1* capture) {
+    if (!mcdr::graphics_capture::valid(capture) || byteSize > 128) return nullptr;
+    return createGraphicsPipelineErased(desc, static_cast<int32_t>(byteSize), capture);
+}
+
 void MCDR_CALL mcdr_dx12DestroyPipeline(PipelinePtr* pipeline) { d3d12_mc::destroyPipeline(pipeline); }
+
+int32_t MCDR_CALL mcdr_dx12PushGraphicsConstants(mcdr_command_ctx* context, const void* data, int32_t byteSize) {
+    if (byteSize < 0 || byteSize > 128 || byteSize % 4 != 0) return -1;
+    auto result = d3d12_mc::pushGraphicsConstants(context, data, static_cast<uint32_t>(byteSize));
+    if (!result) return mcdr::abi::failResult("mcdr_dx12PushGraphicsConstants", result.error());
+    return 1;
+}
+
+int32_t MCDR_CALL mcdr_dx12EnsureGraphicsState(mcdr_command_ctx* rawContext) {
+    auto* context = static_cast<d3d12_mc::CommandContext*>(rawContext);
+    if (!context || !context->listOpen || !context->currentPipeline) return -1;
+    if (context->cachedPso) return 1;
+    d3d12_mc::restoreDrawHeap(context);
+    auto result = d3d12_mc::setPipeline(context, context->currentPipeline, context->graphicsHasDepth);
+    if (!result) return mcdr::abi::failResult("mcdr_dx12EnsureGraphicsState", result.error());
+    return 2;
+}
 
 }  // extern "C"

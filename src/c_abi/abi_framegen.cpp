@@ -10,21 +10,44 @@
 module;
 
 #include "_d3d12_module_prelude.h"
+#include "mcdr_abi.h"
+#include <exception>
 
 module mcdr.abi.common;
 
-#include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
-
 import mcdr.d3d12.device;
+import mcdr.render.vanilla;
+import mcdr.render.display;
 // mcdr.error 是叶子模块，不 import 就取不到 mcdr::Error（import 不传递）。
 import mcdr.error;
 
 using namespace d3d12_mc;
 
 extern "C" {
-void MCDR_CALL mcdr_dx12FgSetConstants(const mcdr_fg_constants* constants)
-{
-    fgSetFrameConstants(constants);
+int32_t MCDR_CALL mcdr_dx12BeginDisplayFrame(mcdr_command_ctx* context) {
+    return context ? beginDisplayFrameRecording(context) : -1;
+}
+
+int32_t MCDR_CALL mcdr_dx12AbortDisplayFrame(mcdr_command_ctx* context) {
+    try {
+        const auto result = abortDisplayFrame(context);
+        if (!result) {
+            mcdr::abi::setLastError("mcdr_dx12AbortDisplayFrame", result.error().message);
+            return -1;
+        }
+        if (display::retire(context) != 1) {
+            mcdr::abi::setLastError("mcdr_dx12AbortDisplayFrame", display::lastFailureText());
+            return -1;
+        }
+        vanilla::reset(context);
+        return 1;
+    } catch (const std::exception& failure) {
+        mcdr::abi::setLastError("mcdr_dx12AbortDisplayFrame", failure.what());
+        return -1;
+    } catch (...) {
+        mcdr::abi::setLastError("mcdr_dx12AbortDisplayFrame", "Display cancellation threw an unknown exception");
+        return -1;
+    }
 }
 
 // P293：记录期望后端。不建也不销毁 —— 重建在下一帧的 fgEnsureProvider 里，与 P280 同构。
@@ -53,6 +76,26 @@ int32_t MCDR_CALL mcdr_dx12FgSetMode(const mcdr_fg_dispatch* desc) {
         return -1;
     }
     return fgSetMode(*desc);
+}
+
+int32_t MCDR_CALL mcdr_dx12FgPrepare(const mcdr_fg_dispatch* description, uint64_t* token) {
+    if (description == nullptr || token == nullptr) {
+        if (token != nullptr) *token = 0;
+        mcdr::abi::setLastError("mcdr_dx12FgPrepare", "FG preparation requires a description and token output");
+        return MCDR_FG_PREPARE_INVALID_ARGUMENT;
+    }
+    const int32_t result = fgPrepareMode(*description, token);
+    if (result < 0) mcdr::abi::setLastError("mcdr_dx12FgPrepare", fgStatusText());
+    return result;
+}
+
+int32_t MCDR_CALL mcdr_dx12CommitPreparedConfiguration(uint64_t srToken,
+    uint64_t fgToken, int32_t antiAliasing) {
+    return fgCommitPreparedConfiguration(fgToken, srToken, antiAliasing);
+}
+
+int32_t MCDR_CALL mcdr_dx12FgAbort(uint64_t token) {
+    return fgAbortPreparedMode(token);
 }
 
 // P293c：上一次 Present 真正提交的帧数（1 = 没插帧）。老入口
@@ -90,20 +133,4 @@ void MCDR_CALL mcdr_dx12FgSetUiTexture(void* object) { fgSetUiTexture(object); }
 void MCDR_CALL mcdr_dx12FgSetUiComposition(int32_t enabled) { fgSetUiComposition(enabled); }
 int32_t MCDR_CALL mcdr_dx12FgUiCompositionReady(void) { return fgUiCompositionReady(); }
 
-// P305ag：DLSS 超分路径的逐帧 tag 桥（**内部**，JVM 不调）。
-// 为什么要在 C ABI 里绕一下：`d3d12_dlss.cpp` 是普通翻译单元、不 import 设备模块，直接声明
-// 模块函数会踩 `d3d12_mesh_base.cpp` 记录过的"模块私有名 vs 公共名"链接坑。这里只过 POD，
-// 类型全都落在 C ABI 上，两侧修饰名一致。
-void MCDR_CALL mcdr_fgTagDlssInputs(void* cmdList, void* color, int32_t colorState, void* depth,
-                                    int32_t depthState, void* motionVectors, int32_t motionVectorState) {
-    FgFrameInputs in{};
-    in.cmdList = static_cast<ID3D12GraphicsCommandList*>(cmdList);
-    in.pColorOutput = color;
-    in.colorState = static_cast<D3D12_RESOURCE_STATES>(colorState);
-    in.pDepth = depth;
-    in.depthState = static_cast<D3D12_RESOURCE_STATES>(depthState);
-    in.pMotionVectors = motionVectors;
-    in.motionVectorState = static_cast<D3D12_RESOURCE_STATES>(motionVectorState);
-    fgTagFrameInputs(in);
-}
 }  // extern "C"
