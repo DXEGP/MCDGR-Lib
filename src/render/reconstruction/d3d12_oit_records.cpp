@@ -4,20 +4,24 @@ module;
 #include "mcdr_abi.h"
 #include "mcdr_oit_shader.h"
 #include "mcdr_oit_resolve_shader.h"
+#include "mcdr_oit_lane_cull_shader.h"
 #include "mcdr_oit_budget.h"
 #include "mcdr_terrain_tile.h"
 #include "mcdr_graphics_recording.h"
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <map>
+#include <span>
 #include <tuple>
 
 module mcdr.render.oit;
 
 import mcdr.d3d12.device;
+import mcdr.d3d12.mesh;
 import mcdr.render.vanilla;
 import mcdr.error;
 
@@ -41,6 +45,9 @@ struct Programs {
     std::shared_ptr<mcdr::oit_budget::Reservation> budget;
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> initialize, compact, resolve;
+    ComPtr<ID3D12RootSignature> laneCullRoot;
+    ComPtr<ID3D12PipelineState> laneCullPipeline;
+    std::shared_ptr<void> normalizationPrograms;
 };
 struct PreparedPrograms {
     void* context = nullptr;
@@ -57,6 +64,10 @@ struct ConstantsPage {
     std::shared_ptr<mcdr::oit_budget::Reservation> budget;
     Buffer buffer;
     uint32_t usedBytes = 0;
+};
+struct ConstantUpload {
+    Dx12Object* buffer;
+    D3D12_GPU_VIRTUAL_ADDRESS address;
 };
 struct Metadata {
     uint32_t sourceBase = 0, primitiveBase = 0, previousBase = 0, sectionByteBase = 0;
@@ -158,11 +169,24 @@ struct ExecutionPassV2 {
     mcdr_oit_execution_pass_v2 value{};
     bool open = false;
 };
+struct LaneCopyCommand {
+    uint32_t sourceRole = 0;
+    uint32_t destinationRole = 0;
+};
+struct LaneGeometry {
+    uint32_t depthRole = 0;
+    uint32_t outputRole = 0;
+    uint32_t coefficientCount = 0;
+};
 struct ExecutionOperationEvent {
     mcdr_oit_execution_operation_receipt_v1 receipt{};
     std::shared_ptr<const void> packet;
     mcdr::graphics_recording::AdapterFacts adapter;
     uint64_t eventId = 0;
+    LaneCopyCommand laneCopy{};
+    std::shared_ptr<const void> laneCullProjection{};
+    bool laneWaterMask = false;
+    LaneGeometry geometry{};
 };
 enum class ExecutionCommandSource { Terrain, Operation };
 struct ExecutionCommand {
@@ -172,14 +196,38 @@ struct ExecutionCommand {
     ExecutionCommandSource source = ExecutionCommandSource::Terrain;
     uint32_t packetIndex = 0;
 };
+struct LaneTexture {
+    const void* object = nullptr;
+    uint32_t subresource = 0;
+    bool operator==(const LaneTexture&) const = default;
+};
+using LaneOperationTextures = std::array<LaneTexture, MCDR_OIT_EXECUTION_V2_RESOURCE_CULLED_BOUNDS + 1>;
+struct TerrainExecutionSelection {
+    uint64_t nativeSequence = 0;
+    uint64_t eventId = 0;
+    uint64_t receiptId = 0;
+    uint64_t sourcePassId = 0;
+    uint64_t sourceDrawId = 0;
+    uint64_t parentSourceDrawId = 0;
+    uint32_t stage = 0;
+    uint32_t packetIndex = UINT32_MAX;
+    LaneGeometry geometry{};
+};
+struct SeedDepthViews {
+    Dx12Object* depth;
+    uint32_t slices;
+    UINT descriptorStride;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    std::shared_ptr<void> depthLease;
+    std::shared_ptr<mcdr::oit_budget::Reservation> budget;
+};
 struct ExecutionStreamV2 {
     uintptr_t token = 0;
     mcdr_oit_execution_begin_v2 input{};
     std::shared_ptr<const void> recordingIdentity;
     std::shared_ptr<mcdr::oit_budget::Reservation> budget;
     uint32_t state = MCDR_OIT_EXECUTION_V2_STATE_RECORDING;
-    uint32_t missingMask = MCDR_OIT_EXECUTION_V2_GAP_OPAQUE_SEED |
-        MCDR_OIT_EXECUTION_V2_GAP_NORMALIZATION | MCDR_OIT_EXECUTION_V2_GAP_ADAPTER;
+    uint32_t missingMask = MCDR_OIT_EXECUTION_V2_GAP_OPAQUE_SEED;
     uint64_t lastReceiptSequence = 0, firstIssueSequence = 0;
     std::vector<mcdr_oit_execution_event_v2> events;
     std::vector<ExecutionScopeV2> scopes;
@@ -191,11 +239,16 @@ struct ExecutionStreamV2 {
     std::vector<uint64_t> receipts;
     std::vector<ExecutionOperationEvent> operations;
     std::unique_ptr<const std::vector<ExecutionCommand>> commands;
+    LaneOperationTextures laneOperationTextures{};
+    std::unique_ptr<const std::vector<TerrainExecutionSelection>> terrainSelections;
     std::optional<mcdr_oit_execution_normalization_v2> normalizationPayload;
     std::optional<mcdr_oit_execution_normalization_v1> legacyNormalizationPayload;
     std::array<std::shared_ptr<const void>, 8> normalizationInputs;
     std::array<uint64_t, 3> opaqueSeedIssueSequences{};
-    std::vector<std::shared_ptr<const void>> opaqueSeedPackets;
+    std::vector<SeedDepthViews> seedDepthViews;
+    bool laneDepthCommandsReady = false;
+    bool tileExecutionStarted = false;
+    bool normalizedPublished = false;
 };
 struct TerrainTileReplayBatch {
     uint32_t laneIndex = 0;
@@ -205,10 +258,10 @@ struct TerrainPacketLease {
     TerrainDrawContent content;
     std::shared_ptr<const void> packet;
     mcdr::terrain_tile::PacketPreparation prepare = nullptr;
-    mcdr::terrain_tile::PacketPreparationV2 prepareV2 = nullptr;
     std::vector<TerrainTileReplayBatch> replayedBatches;
     uint64_t receiptId = 0;
     uint64_t nativeSequence = 0;
+    uint32_t stagePacketIndex = UINT32_MAX;
     bool confirmed = false;
 };
 struct DrawReceipt {
@@ -218,6 +271,8 @@ struct DrawReceipt {
 struct TerrainStagePacket {
     void* batch = nullptr;
     void* vertex = nullptr;
+    std::shared_ptr<const void> replayPacket;
+    mcdr::terrain_tile::PacketPreparationV2 prepareReplay = nullptr;
     uint64_t vertexOffset = 0;
     std::vector<mcdr_oit_terrain_replay_range_v2> geometry;
     std::vector<mcdr_oit_terrain_upload_read_v2> uploads;
@@ -227,10 +282,15 @@ struct TerrainStagePacket {
     bool validated = false;
     uint64_t programGeneration = 0, resourceVersion = 0, shaderGeneration = 0;
     uint32_t executionV2Ordinal = UINT32_MAX;
+    LaneTexture depth;
+    std::array<LaneTexture, 4> colors{};
+    std::array<LaneTexture, 5> laneReads{};
+    std::array<std::shared_ptr<const void>, mcdr::terrain_tile::laneCount> replayPlans;
 };
 struct TerrainStageDraw {
     uintptr_t token = 0;
     mcdr_oit_terrain_stage_begin_v2 input{};
+    uint32_t terrainReceiptCountAtBegin = 0;
     bool prepared = false;
     uint64_t receiptId = 0;
     TerrainStagePacket packet;
@@ -331,6 +391,7 @@ struct Frame {
     std::array<double,3> previousOrigin{};
     bool previousCameraValid = false;
     std::vector<std::unique_ptr<ConstantsPage>> drawConstantPages;
+    D3D12_GPU_VIRTUAL_ADDRESS tileDrawConstants = 0;
     ComPtr<ID3D12DescriptorHeap> descriptors;
     std::vector<mcdr_oit_primitive_v1> primitiveRows;
     uint32_t previousCount = 0, sectionCount = 0;
@@ -350,9 +411,6 @@ struct HistoryState {
     std::unordered_map<uint64_t,Pending> pending;
 };
 std::mutex historyMutex;
-struct DrawLease {
-    std::shared_ptr<Frame> frame;
-};
 
 int reject(int code, const char* reason) { dbgLogDebug("oit: %s", reason); return code; }
 uint64_t aligned(uint64_t bytes) { return (bytes + allocationAlignment - 1) & ~(allocationAlignment - 1); }
@@ -379,8 +437,15 @@ std::shared_ptr<Frame> findFrame(void* opaqueContext, void* opaqueFrame, FrameAc
     return frame;
 }
 void cancelExecutionTextureCaptures(Frame& frame) {
+    if (const auto& seed = frame.opaqueDepthSeed)
+        for (const auto& event : seed->events) cancelOpaqueSeedPacketCapture(event.packet);
     frame.executionTextures.reset();
     if (frame.executionStreamV2) frame.executionStreamV2->normalizationInputs = {};
+    for (auto* operation = frame.executionOperations.get(); operation; operation = operation->previous.get())
+        if (operation->input.kind == MCDR_OIT_EXECUTION_V2_WATER_MASK ||
+            operation->input.kind == MCDR_OIT_EXECUTION_V2_DRAW)
+            for (auto* packet = operation->packets.get(); packet; packet = packet->next.get())
+                cancelOpaqueSeedPacketCapture(packet->packet);
 }
 bool sameIdentity(const mcdr_frame_identity& first, const mcdr_frame_identity& second) {
     return first.worldEpoch == second.worldEpoch && first.realFrameId == second.realFrameId &&
@@ -556,6 +621,18 @@ int beginExecutionOperation(void* opaqueContext, void* opaqueFrame,
         mcdr::graphics_recording::Observer observer;
         observer.owner = frame;
         observer.totalBudgetBytes = frame->input.totalBudgetBytes;
+        observer.tileDrawScope = [](void* owner) noexcept {
+            using mcdr::graphics_recording::TileDrawScope;
+            const auto* operation = static_cast<const Frame*>(owner)->activeExecutionOperation;
+            if (!operation) return TileDrawScope::None;
+            const auto& input = operation->input;
+            if (input.kind == MCDR_OIT_EXECUTION_V2_WATER_MASK) return TileDrawScope::Seed;
+            if (input.kind == MCDR_OIT_EXECUTION_V2_DRAW &&
+                input.key.stage >= MCDR_OIT_EXECUTION_STAGE_DEPTH_BOUNDS &&
+                input.key.stage <= MCDR_OIT_EXECUTION_STAGE_ACCUMULATE)
+                return static_cast<TileDrawScope>(input.key.stage - MCDR_OIT_EXECUTION_STAGE_DEPTH_BOUNDS);
+            return TileDrawScope::None;
+        };
         observer.prepare = &prepareExecutionOperationPacket;
         observer.confirm = &confirmExecutionOperationPacket;
         observer.complete = &completeExecutionOperationPackets;
@@ -678,14 +755,19 @@ std::shared_ptr<Frame> findExecutionFrameV2(void* opaqueContext, void* opaqueStr
     return frame;
 }
 bool validExecutionResourceV2(const mcdr_oit_execution_resource_v2& value, uint64_t resourceVersion) {
+    const bool objectOnly = value.contentRequirement == MCDR_OIT_EXECUTION_V2_CONTENT_OBJECT_ONLY &&
+        !value.ownerIdentity && !value.ownerGeneration && !value.contentVersion;
     if (value.schemaVersion != 2 || value.structSize != sizeof(value) || value.role < 1 || value.role > 11 ||
         (value.role == 7 ? value.roleIndex >= 4 : value.roleIndex != 0) || value.access < 1 || value.access > 3 ||
-        value.contentRequirement > 4 || !value.object || !value.resourceIdentity || !value.ownerIdentity ||
-        !value.ownerGeneration || !value.contentVersion || value.resourceVersion != resourceVersion ||
+        value.contentRequirement > 4 || !value.object || !value.resourceIdentity ||
+        (!objectOnly && (!value.ownerIdentity || !value.ownerGeneration || !value.contentVersion)) ||
+        value.resourceVersion != resourceVersion ||
         value.reserved[0] || value.reserved[1] || value.byteOffset > UINT64_MAX - value.byteLength ||
         value.firstSubresource > UINT32_MAX - value.subresourceCount) return false;
     const auto* object = static_cast<const Dx12Object*>(value.object);
     if (!object->resource || (object->sourceTexture && object->sourceTexture->sourceTexture)) return false;
+    if (objectOnly && (object->kind != Dx12Object::Kind::Texture ||
+        value.resourceIdentity != reinterpret_cast<uintptr_t>(object))) return false;
     if (object->kind == Dx12Object::Kind::Buffer)
         return value.role == MCDR_OIT_EXECUTION_V2_RESOURCE_EXTERNAL &&
             object->size >= 0 && value.firstSubresource == 0 && value.subresourceCount == 1 &&
@@ -700,6 +782,35 @@ bool validExecutionResourceV2(const mcdr_oit_execution_resource_v2& value, uint6
     const uint64_t slices = description.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : description.DepthOrArraySize;
     const uint64_t count = slices * description.MipLevels * format.PlaneCount;
     return value.firstSubresource < count && value.subresourceCount <= count - value.firstSubresource;
+}
+
+bool coversOriginalLaneExtent(const GraphicsPacketInspection& inspection, const LaneTexture& texture,
+    uint32_t width, uint32_t height) {
+    const auto* object = static_cast<const Dx12Object*>(texture.object);
+    if (!object || texture.subresource != 0 || !inspection.fullScreenTriangle) return false;
+    const auto description = object->resource->GetDesc();
+    const auto& viewport = inspection.viewport;
+    const auto& scissor = inspection.scissor;
+    return description.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        description.Width == width && description.Height == height &&
+        description.DepthOrArraySize == 1 && description.MipLevels == 1 &&
+        description.SampleDesc.Count == 1 &&
+        viewport.TopLeftX == 0.f && viewport.TopLeftY == 0.f && viewport.MinDepth == 0.f &&
+        viewport.MaxDepth == 1.f && viewport.Width == float(width) && viewport.Height == float(height) &&
+        scissor.left == 0 && scissor.top == 0 && scissor.right == static_cast<LONG>(width) &&
+        scissor.bottom == static_cast<LONG>(height);
+}
+
+bool validLaneScratch(const Dx12Object* texture, uint32_t residentCount, DXGI_FORMAT format) {
+    if (!texture || !texture->resource || texture->kind != Dx12Object::Kind::Texture ||
+        texture->dxgiFormat != format || !residentCount || residentCount > mcdr::terrain_tile::maximumResidentTiles)
+        return false;
+    const auto description = texture->resource->GetDesc();
+    const auto backingFormat = format == DXGI_FORMAT_D32_FLOAT ? DXGI_FORMAT_R32_TYPELESS : format;
+    return description.Format == backingFormat && description.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        description.Width == mcdr::terrain_tile::scratchSize && description.Height == mcdr::terrain_tile::scratchSize &&
+        description.DepthOrArraySize == residentCount && description.MipLevels == 1 &&
+        description.SampleDesc.Count == 1 && description.SampleDesc.Quality == 0;
 }
 int sampledContentResult(SampledTextureContentStatus status) {
     switch (status) {
@@ -800,14 +911,27 @@ int validateNormalizationPayload(const mcdr_oit_execution_event_v2& event, const
     constexpr std::array<DXGI_FORMAT, 4> inputFormats{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_D32_FLOAT,
         DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT};
     for (uint32_t index = 0; index < inputCount; ++index) {
-        const auto* capture = findExecutionTexture(frame, payload.inputContentIds[index]);
-        if (!capture || !capture->content.lease || !capture->content.ownerIdentity) return stale;
         const auto& resource = event.resources[index];
-        const auto& expected = capture->value;
         const auto expectedRole = index < inputRoles.size() ? inputRoles[index] : MCDR_OIT_EXECUTION_V2_RESOURCE_COEFFICIENT;
         const auto expectedFormat = index < inputFormats.size() ? inputFormats[index] : DXGI_FORMAT_R16G16B16A16_FLOAT;
         if (resource.role != expectedRole || resource.roleIndex != (index < 4 ? 0 : index - 4) ||
-            resource.access != MCDR_OIT_EXECUTION_V2_ACCESS_READ ||
+            resource.access != MCDR_OIT_EXECUTION_V2_ACCESS_READ) return invalid;
+        if (!payload.inputContentIds[index]) {
+            const auto* texture = static_cast<const Dx12Object*>(resource.object);
+            if (!texture || texture->kind != Dx12Object::Kind::Texture || !texture->resource ||
+                texture->dxgiFormat != expectedFormat || resource.firstSubresource != 0 || resource.subresourceCount != 1 ||
+                resource.contentRequirement != MCDR_OIT_EXECUTION_V2_CONTENT_OBJECT_ONLY ||
+                (index == 1 && !vanilla::matchesWorldDepthRegistrationV1(frame.context, resource.object))) return invalid;
+            const auto desc = texture->resource->GetDesc();
+            if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Width != payload.outputWidth ||
+                desc.Height != payload.outputHeight || desc.DepthOrArraySize != 1 || desc.MipLevels != 1 ||
+                desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0) return invalid;
+            continue;
+        }
+        const auto* capture = findExecutionTexture(frame, payload.inputContentIds[index]);
+        if (!capture || !capture->content.lease || !capture->content.ownerIdentity) return stale;
+        const auto& expected = capture->value;
+        if (
             resource.contentRequirement != MCDR_OIT_EXECUTION_V2_CONTENT_GPU_COPY ||
             resource.object != expected.texture || resource.resourceIdentity != expected.captureId ||
             resource.ownerIdentity != expected.ownerIdentity || resource.ownerGeneration != expected.ownerGeneration ||
@@ -854,6 +978,7 @@ int retainNormalizationPayload(const mcdr_oit_execution_event_v2& event, Frame& 
             }
         } else {
             for (uint32_t index = 0; index < payload->targetCount + 4; ++index) {
+                if (!payload->inputContentIds[index]) continue;
                 const auto* capture = findExecutionTexture(frame, payload->inputContentIds[index]);
                 if (!capture) return stale;
                 stream.normalizationInputs[index] = capture->content.lease;
@@ -967,6 +1092,38 @@ bool createBuffer(Buffer& buffer, uint64_t bytes, D3D12_HEAP_TYPE heapType) {
     }
     buffer.object = std::move(object);
     return true;
+}
+std::expected<ConstantUpload, int> uploadFrameConstants(Frame& frame, std::span<const std::byte> data) {
+    if (data.empty() || data.size() > allocationAlignment) return std::unexpected(invalid);
+    const auto bytes = static_cast<uint32_t>((data.size() + drawConstantStride - 1) & ~size_t(drawConstantStride - 1));
+    auto& pages = frame.drawConstantPages;
+    if (pages.empty() || pages.back()->usedBytes > allocationAlignment - bytes) {
+        auto budget = mcdr::oit_budget::reserve(allocationAlignment, frame.input.totalBudgetBytes);
+        if (!budget) return std::unexpected(overBudget);
+        auto page = std::make_unique<ConstantsPage>();
+        page->budget = std::move(budget);
+        if (!createBuffer(page->buffer, allocationAlignment, D3D12_HEAP_TYPE_UPLOAD))
+            return std::unexpected(overBudget);
+        pages.push_back(std::move(page));
+    }
+    auto& page = *pages.back();
+    const auto offset = page.usedBytes;
+    std::memcpy(page.buffer.mapped + offset, data.data(), data.size());
+    page.usedBytes += bytes;
+    return ConstantUpload{page.buffer.object.get(), page.buffer.object->resource->GetGPUVirtualAddress() + offset};
+}
+std::expected<mcdr::terrain_tile::ConstantAddresses, int> uploadTileConstants(
+    Frame& frame, const mcdr::terrain_tile::BatchV2& batch) {
+    if (!frame.tileDrawConstants) {
+        constexpr std::array<std::byte, 16> draw{};
+        const auto upload = uploadFrameConstants(frame, draw);
+        if (!upload) return std::unexpected(upload.error());
+        frame.tileDrawConstants = upload->address;
+    }
+    const mcdr::terrain_tile::BatchConstants constants(batch);
+    const auto upload = uploadFrameConstants(frame, std::as_bytes(std::span(&constants, 1)));
+    if (!upload) return std::unexpected(upload.error());
+    return mcdr::terrain_tile::ConstantAddresses{frame.tileDrawConstants, upload->address};
 }
 Constants constantsFor(const Frame& frame) {
     Constants constants;
@@ -1240,7 +1397,8 @@ int createNormalizationPipelineCertification(const mcdr_pipeline_desc& descripto
         descriptor.depth.depthFormat != 51 || descriptor.depth.depthWrite != 1 || descriptor.depth.depthCompareOp != 0 ||
         descriptor.topology != 4 || descriptor.polygonMode != 0 || descriptor.cullEnabled != 1 ||
         descriptor.inputElementCount != 0 || descriptor.pipelineFlags || !descriptor.bindings ||
-        descriptor.bindingCount != static_cast<int32_t>(certification.targetCount + 4)) return unsupported;
+        descriptor.bindingCount < static_cast<int32_t>(certification.targetCount + 3) ||
+        descriptor.bindingCount > static_cast<int32_t>(certification.targetCount + 4)) return unsupported;
     const auto& target = descriptor.colorTargets[0];
     if (target.format != 6 || target.writeMask != 15 || target.blendEnabled != 1 ||
         target.srcColor != 4 || target.dstColor != 9 || target.colorOp != 0 ||
@@ -1252,7 +1410,7 @@ int createNormalizationPipelineCertification(const mcdr_pipeline_desc& descripto
         if (binding.type == 0) ++uniformCount;
         else ++sampledCount;
     }
-    if (uniformCount != 2 || sampledCount != certification.targetCount + 2) return unsupported;
+    if ((uniformCount != 1 && uniformCount != 2) || sampledCount != certification.targetCount + 2) return unsupported;
     *output = std::make_shared<const NormalizationPipelineCertification>(
         NormalizationPipelineCertification{certification});
     return success;
@@ -1268,7 +1426,8 @@ int shaderPrelude(char* destination, uint32_t capacity, uint32_t* required, uint
     return success;
 }
 
-int preparePrograms(void* opaqueContext, uint64_t generation, void** output) {
+int preparePrograms(void* opaqueContext, uint64_t generation, void** output,
+    const mcdr_oit_normalization_program_v1 (*normalization)[3]) {
     if (output) *output = nullptr;
     if (!opaqueContext || !output || !generation) return MCDR_FRAME_PROGRAMS_INVALID_REQUEST;
     auto* context = static_cast<CommandContext*>(opaqueContext);
@@ -1276,6 +1435,9 @@ int preparePrograms(void* opaqueContext, uint64_t generation, void** output) {
     auto programs = std::make_shared<Programs>(); programs->context = context; programs->generation = generation;
     programs->budget = mcdr::oit_budget::reserve(4 * 1024 * 1024);
     if (!programs->budget) return MCDR_FRAME_PROGRAMS_COMPILATION_FAILED;
+    if (normalization && prepareNormalizationPrograms(opaqueContext, generation, *normalization,
+            &programs->normalizationPrograms) != MCDR_OIT_NORMALIZATION_SUCCESS)
+        return MCDR_FRAME_PROGRAMS_COMPILATION_FAILED;
     D3D12_DESCRIPTOR_RANGE ranges[3]{};
     D3D12_ROOT_PARAMETER roots[5]{};
     roots[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; roots[0].Descriptor = {0,2};
@@ -1311,6 +1473,49 @@ int preparePrograms(void* opaqueContext, uint64_t generation, void** output) {
         D3D12_COMPUTE_PIPELINE_STATE_DESC description{}; description.pRootSignature = programs->root.Get();
         description.CS = {dxil.data(),dxil.size()};
         if (FAILED(device->CreateComputePipelineState(&description,IID_PPV_ARGS(pipelines[index]->GetAddressOf()))))
+            return MCDR_FRAME_PROGRAMS_COMPILATION_FAILED;
+    }
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) &&
+        options.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation) {
+        const D3D12_DESCRIPTOR_RANGE textureRange{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+        D3D12_ROOT_PARAMETER laneRoots[2]{};
+        laneRoots[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        laneRoots[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        laneRoots[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        laneRoots[1].DescriptorTable = {1, &textureRange};
+        laneRoots[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_SIGNATURE_DESC laneRoot{};
+        laneRoot.NumParameters = static_cast<UINT>(std::size(laneRoots));
+        laneRoot.pParameters = laneRoots;
+        serialized.Reset();
+        diagnostic.Reset();
+        if (FAILED(D3D12SerializeRootSignature(&laneRoot, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &diagnostic)) ||
+            FAILED(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                IID_PPV_ARGS(&programs->laneCullRoot)))) return MCDR_FRAME_PROGRAMS_COMPILATION_FAILED;
+        const std::string cullShader(mcdr::oit_shader::laneCull);
+        std::vector<uint8_t> vertex, fragment;
+        if (!compileHlslToDxil(cullShader, "CullBoundsVertex", "vs_6_9", vertex) ||
+            !compileHlslToDxil(cullShader, "CullBoundsPixel", "ps_6_9", fragment))
+            return MCDR_FRAME_PROGRAMS_COMPILATION_FAILED;
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC cull{};
+        cull.pRootSignature = programs->laneCullRoot.Get();
+        cull.VS = {vertex.data(), vertex.size()};
+        cull.PS = {fragment.data(), fragment.size()};
+        cull.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        cull.SampleMask = UINT_MAX;
+        cull.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        cull.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        cull.RasterizerState.DepthClipEnable = TRUE;
+        cull.DepthStencilState.DepthEnable = TRUE;
+        cull.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        cull.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+        cull.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        cull.NumRenderTargets = 1;
+        cull.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        cull.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+        cull.SampleDesc.Count = 1;
+        if (FAILED(device->CreateGraphicsPipelineState(&cull, IID_PPV_ARGS(&programs->laneCullPipeline))))
             return MCDR_FRAME_PROGRAMS_COMPILATION_FAILED;
     }
     auto candidate = std::make_unique<PreparedPrograms>(); candidate->context = context;
@@ -1372,6 +1577,13 @@ int beginFrame(void* opaqueContext, const mcdr_oit_begin_v1& input, void** outpu
             if (history->pending.contains(input.identity.realFrameId)) return stale;
         }
     }
+    // GPU work can finish while the opaque pass for the new size is being recorded.
+    const auto completed = context->fence->GetCompletedValue();
+    if (completed == UINT64_MAX) return unknownSubmission;
+    for (UINT slot = 0; slot < std::size(context->recordingLeases); ++slot) {
+        if (slot != context->currentListSlot && context->slotFence[slot] && context->slotFence[slot] <= completed)
+            context->recordingLeases[slot].clear();
+    }
     const uint64_t pixels = static_cast<uint64_t>(input.width) * input.height;
     const uint64_t sourceBytes = static_cast<uint64_t>(input.maxSourceRows)*32;
     const uint64_t primitiveBytes = static_cast<uint64_t>(input.maxPrimitiveRows)*56;
@@ -1384,7 +1596,12 @@ int beginFrame(void* opaqueContext, const mcdr_oit_begin_v1& input, void** outpu
     auto historyBudget = mcdr::oit_budget::reserve(historyBytes,input.totalBudgetBytes);
     if (!historyBudget) return reject(overBudget,"History and inflight resources exceed the shared budget");
     auto budget = mcdr::oit_budget::reserve(temporaryBytes,input.totalBudgetBytes);
-    if (!budget) return reject(overBudget,"Frame and inflight resources exceed the shared budget");
+    if (!budget) {
+        dbgLogDebug("OIT budget: %llu committed, %llu requested",
+            static_cast<unsigned long long>(mcdr::oit_budget::committedBytes.load()),
+            static_cast<unsigned long long>(temporaryBytes));
+        return reject(overBudget,"Frame and inflight resources exceed the shared budget");
+    }
     std::vector<std::shared_ptr<TextureAllocation>> textureBudgets;
     if (const auto result = reserveTextureAllocations({input.opaqueColor.object,input.opaqueDepth.object,input.opaqueMotion.object},
         input.totalBudgetBytes,textureBudgets); result != success) return result;
@@ -1407,10 +1624,15 @@ int beginFrame(void* opaqueContext, const mcdr_oit_begin_v1& input, void** outpu
     std::memcpy(frame->constants.mapped,&constants,sizeof(constants));
     for (const auto* binding : {&input.opaqueColor,&input.opaqueDepth,&input.opaqueMotion})
         frame->frozenResources.push_back(retainObjectLease(binding->object));
-    const auto seedStatus = vanilla::sealWorldDepthSeedCaptureV1(context, &frame->opaqueDepthSeed);
-    if (seedStatus != vanilla::WorldDepthSeedStatus::Ready && seedStatus != vanilla::WorldDepthSeedStatus::NotArmed)
-        return reject(seedStatus == vanilla::WorldDepthSeedStatus::StaleRecording ? stale :
-            seedStatus == vanilla::WorldDepthSeedStatus::BudgetExceeded ? overBudget : recordingFailed,
+    auto seedStatus = vanilla::readWorldDepthSeedCaptureV1(context, &frame->opaqueDepthSeed);
+    if (seedStatus == vanilla::WorldDepthSeedStatus::Busy)
+        seedStatus = vanilla::sealWorldDepthSeedCaptureV1(context, &frame->opaqueDepthSeed);
+    if (seedStatus == vanilla::WorldDepthSeedStatus::NotArmed)
+        seedStatus = vanilla::sealWorldDepthSeedCaptureV1(context, nullptr);
+    if (seedStatus != vanilla::WorldDepthSeedStatus::Ready && seedStatus != vanilla::WorldDepthSeedStatus::NotArmed &&
+        seedStatus != vanilla::WorldDepthSeedStatus::BudgetExceeded && seedStatus != vanilla::WorldDepthSeedStatus::Incomplete &&
+        seedStatus != vanilla::WorldDepthSeedStatus::Cancelled)
+        return reject(seedStatus == vanilla::WorldDepthSeedStatus::StaleRecording ? stale : recordingFailed,
             "Opaque depth seed could not seal at OIT begin");
     if (const auto& seed = frame->opaqueDepthSeed) {
         const auto& identity = seed->frame;
@@ -1420,7 +1642,7 @@ int beginFrame(void* opaqueContext, const mcdr_oit_begin_v1& input, void** outpu
             identity.realFrameId != input.identity.realFrameId || identity.configVersion != input.identity.configVersion ||
             identity.resourceVersion != input.identity.resourceVersion || seed->recordingIdentity != frame->recordingIdentity ||
             seed->fence.Get() != context->fence.Get() || seed->submission != frame->serial ||
-            !seed->worldDepth || seed->worldDepth != context->rasterMotionWorldDepth || !seed->depthOwner ||
+            !vanilla::matchesWorldDepthRegistrationV1(context, seed->worldDepth) || !seed->depthOwner ||
             seed->programGeneration != input.programGeneration || !seed->depthDescriptors || !seed->retainedDsv.ptr ||
             seed->events.empty()) return reject(stale,"Opaque depth seed identity differs from the OIT frame");
         uint64_t sequence = 0;
@@ -1653,17 +1875,9 @@ int bindDraw(void* opaqueContext, void* opaqueFrame, void* opaqueMetadata, const
         for (uint32_t index=0; index<input.primitiveCount; ++index)
             if (frame->primitiveRows[metadata.primitiveBase+input.primitiveBase+index].sourceIndex!=metadata.sourceBase+input.sourceIndex) return invalid;
     }
-    if (frame->drawConstantPages.empty() ||
-        frame->drawConstantPages.back()->usedBytes > allocationAlignment-drawConstantStride) {
-        auto budget=mcdr::oit_budget::reserve(allocationAlignment,frame->input.totalBudgetBytes);
-        if (!budget) return overBudget;
-        auto page=std::make_unique<ConstantsPage>(); page->budget=std::move(budget);
-        if (!createBuffer(page->buffer,allocationAlignment,D3D12_HEAP_TYPE_UPLOAD)) return unsupported;
-        frame->drawConstantPages.push_back(std::move(page));
-    }
-    auto& page=*frame->drawConstantPages.back();
-    const uint32_t constantOffset=page.usedBytes;
-    auto draw=std::make_shared<DrawLease>(); draw->frame=frame;
+    // The recording already retains Frame. Captured packets can retain its buffers
+    // independently without extending Frame through a cycle in its replay packets.
+    const auto& draw = frame->resources;
     auto constants=constantsFor(*frame);
     constants.values[4]=metadata.sourceCount; constants.values[5]=metadata.primitiveCount; constants.values[6]=metadata.previousCount;
     constants.values[7]=metadata.sectionCount; constants.values[8]=metadata.sourceBase; constants.values[9]=metadata.primitiveBase;
@@ -1676,14 +1890,16 @@ int bindDraw(void* opaqueContext, void* opaqueFrame, void* opaqueMetadata, const
         constants.values[5]=static_cast<uint32_t>(frame->primitiveRows.size());
         constants.values[34]=metadata.sectionByteBase; constants.values[35]=metadata.sectionCount;
     }
-    std::memcpy(page.buffer.mapped+constantOffset,&constants,sizeof(constants));
+    const auto upload = uploadFrameConstants(*frame, std::as_bytes(std::span(&constants, 1)));
+    if (!upload) return upload.error();
     auto* context=static_cast<CommandContext*>(opaqueContext);
     GraphicsCaptureBinding binding;
     binding.contractHash=mcdr::oit_shader::contractHash; binding.generation=frame->input.programGeneration;
-    binding.constants=page.buffer.object->resource->GetGPUVirtualAddress()+constantOffset;
+    binding.constants=upload->address;
     binding.descriptors=frame->descriptors->GetCPUDescriptorHandleForHeapStart(); binding.lease=draw;
-    for (auto* buffer : {&frame->resources->sources,&frame->resources->primitives,&frame->previous,&page.buffer})
-        binding.resources.push_back({buffer->object.get(),0,1,D3D12_RESOURCE_STATE_GENERIC_READ,1,draw});
+    for (auto* buffer : {frame->resources->sources.object.get(), frame->resources->primitives.object.get(),
+                        frame->previous.object.get(), upload->buffer})
+        binding.resources.push_back({buffer,0,1,D3D12_RESOURCE_STATE_GENERIC_READ,1,draw});
     if (metadata.terrain) {
         binding.resources.push_back({frame->resources->terrain.object.get(),0,1,D3D12_RESOURCE_STATE_GENERIC_READ,1,draw});
         const auto state=metadata.vertex->heapType==D3D12_HEAP_TYPE_UPLOAD ? D3D12_RESOURCE_STATE_GENERIC_READ :
@@ -1711,8 +1927,6 @@ int bindDraw(void* opaqueContext, void* opaqueFrame, void* opaqueMetadata, const
     }
     for (auto* buffer : {&frame->resources->records,&frame->resources->pixels,&frame->allocator})
         binding.resources.push_back({buffer->object.get(),0,1,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,4,draw});
-    context->recordingLeases[context->currentListSlot].push_back(draw);
-    page.usedBytes+=drawConstantStride;
     context->graphicsCapture=std::move(binding); frame->bound=true; ++frame->drawCount;
     return success;
 }
@@ -1745,8 +1959,7 @@ int validateTerrainDraw(void* opaqueContext, void* vertex, uint64_t offset, Terr
 }
 int retainTerrainDrawPacket(void* opaqueContext, const TerrainDrawIdentity& identity,
     TerrainDrawContent content, std::shared_ptr<const void> packet,
-    mcdr::terrain_tile::PacketPreparation prepare,
-    mcdr::terrain_tile::PacketPreparationV2 prepareV2) {
+    mcdr::terrain_tile::PacketPreparation prepare) {
     auto* context=static_cast<CommandContext*>(opaqueContext);
     if (!context || !context->oitFrameState || !packet ||
         (content == TerrainDrawContent::OriginalDrawOnly && !prepare) ||
@@ -1764,7 +1977,7 @@ int retainTerrainDrawPacket(void* opaqueContext, const TerrainDrawIdentity& iden
         !context->graphicsCapture.lease || context->graphicsCapture.remainingDraws!=0) return invalid;
     if (frame->terrainDrawPackets.size() >= INT32_MAX || frame->nextTerrainSequence == UINT64_MAX) return overBudget;
     frame->terrainDrawReceipts.reserve(frame->terrainDrawReceipts.size() + 1);
-    frame->terrainDrawPackets.push_back({content,std::move(packet),prepare,prepareV2,{}});
+    frame->terrainDrawPackets.push_back({content, std::move(packet), prepare});
     frame->pendingTerrainPacket = static_cast<int32_t>(frame->terrainDrawPackets.size() - 1);
     return success;
 }
@@ -1990,8 +2203,12 @@ int appendExecutionStreamEvent(void* opaqueContext, void* opaqueStream, const mc
             if (existing.value.producerScopeSerial == key.producerScopeSerial ||
                 (existing.value.producerId == key.producerId && existing.value.producerKind != key.producerKind)) return stale;
     } else if (!frameOwned) {
+        // CloudRenderer initializes its private depth during the depth-bounds producer scope.
+        const bool cloudDepthCopy = operationPacket && input.kind == MCDR_OIT_EXECUTION_V2_CLOUD_DEPTH &&
+            key.producerKind == MCDR_OIT_SOURCE_CLOUD && key.stage == MCDR_OIT_EXECUTION_STAGE_CLOUD_DEPTH &&
+            scope && scope->value.stage == MCDR_OIT_EXECUTION_STAGE_DEPTH_BOUNDS;
         if (!scope || !scope->open || scope->value.producerKind != key.producerKind ||
-            scope->value.stage != key.stage) return stale;
+            (scope->value.stage != key.stage && !cloudDepthCopy)) return stale;
     }
     if (scopeEnd && (frameOwned || ((input.flags & MCDR_OIT_EXECUTION_V2_SCOPE_EMPTY) &&
         (scope->drawCount || scope->value.receiptCount)))) return invalid;
@@ -2128,17 +2345,11 @@ int appendExecutionStreamEvent(void* opaqueContext, void* opaqueStream, const mc
     }
     if (terrain) {
         stream.lastReceiptSequence = lastReceiptSequence;
-        stream.missingMask |= terrainGaps | MCDR_OIT_EXECUTION_V2_GAP_CONTENT | MCDR_OIT_EXECUTION_V2_GAP_SELECTION;
+        stream.missingMask |= terrainGaps;
     }
-    if (!control && !terrain) stream.missingMask |= MCDR_OIT_EXECUTION_V2_GAP_ADAPTER | MCDR_OIT_EXECUTION_V2_GAP_CONTENT;
-    if (normalization) {
-        stream.missingMask |= MCDR_OIT_EXECUTION_V2_GAP_NORMALIZATION;
-    }
+    if (!control && !terrain && !operationPacket)
+        stream.missingMask |= MCDR_OIT_EXECUTION_V2_GAP_ADAPTER | MCDR_OIT_EXECUTION_V2_GAP_CONTENT;
     if (input.flags == MCDR_OIT_EXECUTION_V2_BOUNDARY_FAILED) stream.missingMask |= MCDR_OIT_EXECUTION_V2_GAP_FAILED;
-    if (input.kind == MCDR_OIT_EXECUTION_V2_WATER_MASK || key.stage == MCDR_OIT_EXECUTION_STAGE_WATER_DEPTH)
-        stream.missingMask |= MCDR_OIT_EXECUTION_V2_GAP_WATER;
-    if (input.kind == MCDR_OIT_EXECUTION_V2_CLOUD_DEPTH || key.stage == MCDR_OIT_EXECUTION_STAGE_CLOUD_DEPTH ||
-        (!frameOwned && key.producerKind == MCDR_OIT_SOURCE_CLOUD)) stream.missingMask |= MCDR_OIT_EXECUTION_V2_GAP_CLOUD;
     if (!stream.firstIssueSequence && (!control || input.flags == MCDR_OIT_EXECUTION_V2_BOUNDARY_FAILED))
         stream.firstIssueSequence = input.sequence;
     stream.events.push_back(stored);
@@ -2299,12 +2510,423 @@ int sealExecutionCommands(Frame& frame, ExecutionStreamV2& stream, uint64_t& mis
     }
 }
 
+template<class MatchesBinding>
+LaneGeometry matchLaneGeometry(const mcdr_oit_execution_event_v2& event, const LaneOperationTextures& textures,
+    MatchesBinding&& matchesBinding) {
+    using Binding = GraphicsCommandTextureBinding;
+    constexpr auto mainDepth = MCDR_OIT_EXECUTION_V2_RESOURCE_MAIN_DEPTH;
+    constexpr auto cloudDepth = MCDR_OIT_EXECUTION_V2_RESOURCE_CLOUD_DEPTH;
+    constexpr auto bounds = MCDR_OIT_EXECUTION_V2_RESOURCE_BOUNDS;
+    constexpr auto coefficients = MCDR_OIT_EXECUTION_V2_RESOURCE_COEFFICIENT;
+    constexpr auto q = MCDR_OIT_EXECUTION_V2_RESOURCE_Q;
+    constexpr auto culled = MCDR_OIT_EXECUTION_V2_RESOURCE_CULLED_BOUNDS;
+    const auto stage = event.key.stage;
+    if (stage < MCDR_OIT_EXECUTION_STAGE_DEPTH_BOUNDS || stage > MCDR_OIT_EXECUTION_STAGE_ACCUMULATE) return {};
+    LaneGeometry geometry;
+    uint32_t coefficientMask = 0;
+    bool boundsRead = false;
+    for (uint32_t index = 0; index < event.resourceCount; ++index) {
+        const auto& resource = event.resources[index];
+        if (resource.subresourceCount != 1 ||
+            resource.contentRequirement != MCDR_OIT_EXECUTION_V2_CONTENT_OBJECT_ONLY) return {};
+        const LaneTexture claimed{resource.object, resource.firstSubresource};
+        if (resource.role >= mainDepth && resource.role <= cloudDepth &&
+            resource.access == MCDR_OIT_EXECUTION_V2_ACCESS_READ && !geometry.depthRole &&
+            textures[resource.role] == claimed && matchesBinding(claimed, Binding::DepthAttachment, 0))
+            geometry.depthRole = resource.role;
+        else if (resource.role == culled && stage != MCDR_OIT_EXECUTION_STAGE_DEPTH_BOUNDS &&
+            resource.access == MCDR_OIT_EXECUTION_V2_ACCESS_READ && !boundsRead &&
+            textures[culled] == claimed && matchesBinding(claimed, Binding::Sampled, 0))
+            boundsRead = true;
+        else if (resource.role == coefficients && stage != MCDR_OIT_EXECUTION_STAGE_DEPTH_BOUNDS &&
+            !(coefficientMask & (1u << resource.roleIndex)) &&
+            (stage == MCDR_OIT_EXECUTION_STAGE_TRANSMITTANCE
+                ? resource.access == MCDR_OIT_EXECUTION_V2_ACCESS_READ_WRITE &&
+                  matchesBinding(claimed, Binding::ColorTarget, resource.roleIndex)
+                : resource.access == MCDR_OIT_EXECUTION_V2_ACCESS_READ &&
+                  matchesBinding(claimed, Binding::Sampled, resource.roleIndex + 1)))
+            coefficientMask |= 1u << resource.roleIndex;
+        else if (((stage == MCDR_OIT_EXECUTION_STAGE_DEPTH_BOUNDS &&
+                    (resource.role == bounds || resource.role == culled) && textures[resource.role] == claimed) ||
+                  (stage == MCDR_OIT_EXECUTION_STAGE_ACCUMULATE && resource.role == q)) &&
+            resource.access == MCDR_OIT_EXECUTION_V2_ACCESS_READ_WRITE && !geometry.outputRole &&
+            matchesBinding(claimed, Binding::ColorTarget, 0))
+            geometry.outputRole = resource.role;
+        else return {};
+    }
+    if (!geometry.depthRole) return {};
+    if (stage == MCDR_OIT_EXECUTION_STAGE_DEPTH_BOUNDS) return geometry.outputRole ? geometry : LaneGeometry{};
+    if (!boundsRead || (coefficientMask != 1 && coefficientMask != 3 && coefficientMask != 15)) return {};
+    geometry.coefficientCount = std::popcount(coefficientMask);
+    if (stage == MCDR_OIT_EXECUTION_STAGE_TRANSMITTANCE) geometry.outputRole = coefficients;
+    return geometry.outputRole ? geometry : LaneGeometry{};
+}
+
+int validateLaneOperationResources(Frame& frame, ExecutionStreamV2& stream, uint64_t& missingReceipt) {
+    constexpr auto mainDepth = MCDR_OIT_EXECUTION_V2_RESOURCE_MAIN_DEPTH;
+    constexpr auto terrainDepth = MCDR_OIT_EXECUTION_V2_RESOURCE_TERRAIN_DEPTH;
+    constexpr auto cloudDepth = MCDR_OIT_EXECUTION_V2_RESOURCE_CLOUD_DEPTH;
+    constexpr auto bounds = MCDR_OIT_EXECUTION_V2_RESOURCE_BOUNDS;
+    constexpr auto culled = MCDR_OIT_EXECUTION_V2_RESOURCE_CULLED_BOUNDS;
+    LaneOperationTextures textures{};
+    if (frame.opaqueDepthSeed) textures[mainDepth].object = frame.opaqueDepthSeed->worldDepth;
+    uint64_t boundsPass = 0, waterPass = 0;
+    bool cullRecorded = false, cloudCopied = false;
+    bool boundsCopyReady = false;
+    for (const auto& command : *stream.commands) {
+        if (command.source != ExecutionCommandSource::Operation) continue;
+        auto& operation = stream.operations[command.packetIndex];
+        if (operation.receipt.recordState == MCDR_OIT_OPERATION_EMPTY) continue;
+        const auto& event = stream.events[command.eventId - 1];
+        if (event.kind == MCDR_OIT_EXECUTION_V2_DRAW) continue;
+        uint32_t sourceRole = 0, colorRole = 0, depthRole = 0;
+        switch (event.kind) {
+        case MCDR_OIT_EXECUTION_V2_COPY_DEPTH: sourceRole = mainDepth; depthRole = terrainDepth; break;
+        case MCDR_OIT_EXECUTION_V2_CLOUD_DEPTH: sourceRole = mainDepth; depthRole = cloudDepth; break;
+        case MCDR_OIT_EXECUTION_V2_COPY_BOUNDS: sourceRole = bounds; colorRole = culled; break;
+        case MCDR_OIT_EXECUTION_V2_CULL_BOUNDS: sourceRole = bounds; colorRole = culled; depthRole = mainDepth; break;
+        case MCDR_OIT_EXECUTION_V2_WATER_MASK: depthRole = terrainDepth; break;
+        default:
+            stream.missingMask |= MCDR_OIT_EXECUTION_V2_GAP_ADAPTER;
+            if (!missingReceipt) missingReceipt = command.receiptId;
+            continue;
+        }
+        const auto inspection = inspectGraphicsCommandPacket(frame.context, operation.packet);
+        if (inspection.status == GraphicsPacketInspectionStatus::StaleRecording) return stale;
+        if (inspection.status == GraphicsPacketInspectionStatus::RecordingFailed) return recordingFailed;
+        const auto roleBit = [](uint32_t role) { return role ? 1u << role : 0u; };
+        const uint32_t required = roleBit(sourceRole) | roleBit(colorRole) | roleBit(depthRole);
+        uint32_t found = 0;
+        auto matchedTextures = textures;
+        bool valid = inspection.status == GraphicsPacketInspectionStatus::Ready && inspection.confirmed;
+        for (uint32_t index = 0; valid && index < event.resourceCount; ++index) {
+            const auto& resource = event.resources[index];
+            if (resource.role >= textures.size() || resource.subresourceCount != 1 ||
+                resource.contentRequirement != MCDR_OIT_EXECUTION_V2_CONTENT_OBJECT_ONLY ||
+                resource.ownerIdentity || resource.ownerGeneration || resource.contentVersion) {
+                valid = false;
+                break;
+            }
+            const uint32_t bit = roleBit(resource.role);
+            if (!(required & bit) || (found & bit)) {
+                valid = false;
+                break;
+            }
+            const bool sampled = resource.role == sourceRole;
+            const auto binding = sampled ? GraphicsCommandTextureBinding::Sampled :
+                resource.role == depthRole ? GraphicsCommandTextureBinding::DepthTarget :
+                GraphicsCommandTextureBinding::ColorTarget;
+            const bool depthReadWrite = resource.role == depthRole &&
+                (event.kind == MCDR_OIT_EXECUTION_V2_WATER_MASK || event.kind == MCDR_OIT_EXECUTION_V2_CULL_BOUNDS);
+            const auto access = sampled ? MCDR_OIT_EXECUTION_V2_ACCESS_READ :
+                depthReadWrite ? MCDR_OIT_EXECUTION_V2_ACCESS_READ_WRITE : MCDR_OIT_EXECUTION_V2_ACCESS_WRITE;
+            auto& texture = matchedTextures[resource.role];
+            const LaneTexture claimed{resource.object, resource.firstSubresource};
+            const auto* object = static_cast<const Dx12Object*>(resource.object);
+            const bool depthFormat = object->dxgiFormat == DXGI_FORMAT_D32_FLOAT;
+            valid = resource.access == access &&
+                depthFormat == (resource.role == mainDepth || resource.role == terrainDepth || resource.role == cloudDepth) &&
+                (!texture.object || texture == claimed) &&
+                matchesGraphicsCommandTexture(operation.packet, resource.object, resource.firstSubresource, binding);
+            texture = claimed;
+            found |= bit;
+        }
+        if (valid) valid = found == required &&
+            (!sourceRole || !colorRole || matchedTextures[sourceRole] != matchedTextures[colorRole]) &&
+            (!sourceRole || !depthRole || matchedTextures[sourceRole] != matchedTextures[depthRole]) &&
+            (!colorRole || !depthRole || matchedTextures[colorRole] != matchedTextures[depthRole]);
+        if (valid) {
+            switch (event.kind) {
+            case MCDR_OIT_EXECUTION_V2_COPY_DEPTH:
+                valid = event.key.sourcePassId != waterPass && (!boundsPass || cullRecorded);
+                if (valid) waterPass = event.key.sourcePassId;
+                break;
+            case MCDR_OIT_EXECUTION_V2_WATER_MASK:
+                valid = waterPass != 0 && waterPass == event.key.sourcePassId;
+                break;
+            case MCDR_OIT_EXECUTION_V2_COPY_BOUNDS:
+                valid = !boundsPass;
+                if (valid) boundsPass = event.key.sourcePassId;
+                break;
+            case MCDR_OIT_EXECUTION_V2_CULL_BOUNDS:
+                valid = !cullRecorded && boundsPass && boundsPass == event.key.sourcePassId;
+                if (valid) cullRecorded = true;
+                break;
+            case MCDR_OIT_EXECUTION_V2_CLOUD_DEPTH:
+                valid = cullRecorded && !cloudCopied;
+                if (valid) cloudCopied = true;
+                break;
+            }
+        }
+        if (valid) {
+            textures = matchedTextures;
+            const bool depthCopy = event.kind == MCDR_OIT_EXECUTION_V2_COPY_DEPTH ||
+                event.kind == MCDR_OIT_EXECUTION_V2_CLOUD_DEPTH;
+            const bool boundsCopy = event.kind == MCDR_OIT_EXECUTION_V2_COPY_BOUNDS;
+            const auto& provenance = inspection.oitLaneOperation;
+            if (depthCopy || boundsCopy) {
+                const uint32_t destination = depthCopy ? depthRole : colorRole;
+                const auto& source = textures[sourceRole];
+                const auto& target = textures[destination];
+                const auto format = depthCopy ? DXGI_FORMAT_D32_FLOAT : DXGI_FORMAT_R32G32B32A32_FLOAT;
+                if (provenance.kind == (depthCopy ? MCDR_OIT_LANE_DEPTH_COPY : MCDR_OIT_LANE_BOUNDS_COPY) &&
+                    provenance.programGeneration == stream.input.programGeneration &&
+                    coversOriginalLaneExtent(inspection, source, frame.input.width, frame.input.height) &&
+                    coversOriginalLaneExtent(inspection, target, frame.input.width, frame.input.height) &&
+                    static_cast<const Dx12Object*>(source.object)->dxgiFormat == format &&
+                    static_cast<const Dx12Object*>(target.object)->dxgiFormat == format)
+                    operation.laneCopy = {sourceRole, destination};
+                if (boundsCopy) boundsCopyReady = operation.laneCopy.sourceRole != 0;
+            } else if (event.kind == MCDR_OIT_EXECUTION_V2_CULL_BOUNDS && boundsCopyReady &&
+                provenance.kind == MCDR_OIT_LANE_BOUNDS_CULL &&
+                provenance.programGeneration == stream.input.programGeneration &&
+                frame.programs->laneCullPipeline &&
+                coversOriginalLaneExtent(inspection, textures[sourceRole], frame.input.width, frame.input.height) &&
+                coversOriginalLaneExtent(inspection, textures[colorRole], frame.input.width, frame.input.height) &&
+                coversOriginalLaneExtent(inspection, textures[depthRole], frame.input.width, frame.input.height) &&
+                packetContentStatus(frame.context, inspection.laneProjection) == PacketContentStatus::Frozen) {
+                operation.laneCullProjection = inspection.laneProjection;
+            } else if (event.kind == MCDR_OIT_EXECUTION_V2_WATER_MASK &&
+                inspection.opaqueSeedProgramGeneration == stream.input.programGeneration &&
+                inspection.content == mcdr::graphics_recording::ContentState::Frozen) {
+                operation.laneWaterMask = true;
+            }
+            if (operation.laneCopy.sourceRole || operation.laneCullProjection || operation.laneWaterMask) continue;
+            stream.missingMask |= MCDR_OIT_EXECUTION_V2_GAP_ADAPTER;
+            if (event.kind == MCDR_OIT_EXECUTION_V2_WATER_MASK)
+                stream.missingMask |= MCDR_OIT_EXECUTION_V2_GAP_WATER;
+            if (event.kind == MCDR_OIT_EXECUTION_V2_CLOUD_DEPTH)
+                stream.missingMask |= MCDR_OIT_EXECUTION_V2_GAP_CLOUD;
+            continue;
+        }
+        stream.missingMask |= MCDR_OIT_EXECUTION_V2_GAP_READ_SET;
+        if (!missingReceipt) missingReceipt = command.receiptId;
+    }
+    stream.laneOperationTextures = textures;
+    return success;
+}
+
+void validateLaneGeometryOperations(Frame& frame, ExecutionStreamV2& stream) {
+    static thread_local std::unordered_set<uint64_t> reported;
+    for (const auto& command : *stream.commands) {
+        if (command.source != ExecutionCommandSource::Operation) continue;
+        const auto& event = stream.events[command.eventId - 1];
+        auto& operation = stream.operations[command.packetIndex];
+        if (event.kind != MCDR_OIT_EXECUTION_V2_DRAW || operation.receipt.recordState == MCDR_OIT_OPERATION_EMPTY)
+            continue;
+        const auto inspection = inspectGraphicsCommandPacket(frame.context, operation.packet);
+        if (inspection.opaqueSeedProgramGeneration != frame.input.programGeneration ||
+            inspection.tileStage > 2 ||
+            inspection.tileStage + MCDR_OIT_EXECUTION_STAGE_DEPTH_BOUNDS != event.key.stage ||
+            inspection.content != mcdr::graphics_recording::ContentState::Frozen) {
+            if (reported.insert(event.pipelineIdentity).second) {
+                dbgLogDebug("OIT IA content gap: producer=%u stage=%u content=%u route=%u",
+                    event.key.producerKind, event.key.stage,
+                    static_cast<unsigned>(inspection.content), inspection.tileStage);
+            }
+            stream.missingMask |= MCDR_OIT_EXECUTION_V2_GAP_CONTENT | MCDR_OIT_EXECUTION_V2_GAP_ADAPTER;
+            continue;
+        }
+        operation.geometry = matchLaneGeometry(event, stream.laneOperationTextures,
+            [&](const LaneTexture& texture, GraphicsCommandTextureBinding binding, uint32_t bindingIndex) {
+                return matchesGraphicsCommandTexture(operation.packet, texture.object, texture.subresource,
+                    binding, bindingIndex);
+            });
+        if (!operation.geometry.depthRole) {
+            if (reported.insert(event.pipelineIdentity).second)
+                dbgLogDebug("OIT IA bindings gap: producer=%u stage=%u rows=%u",
+                    event.key.producerKind, event.key.stage, event.resourceCount);
+            stream.missingMask |= MCDR_OIT_EXECUTION_V2_GAP_READ_SET;
+        }
+    }
+}
+
+int prepareTerrainExecutionSelections(Frame& frame, ExecutionStreamV2& stream) {
+    if (!stream.commands) {
+        stream.missingMask |= MCDR_OIT_EXECUTION_V2_GAP_SELECTION;
+        return success;
+    }
+    try {
+        std::vector<TerrainExecutionSelection> selections;
+        selections.reserve(stream.commands->size());
+        std::unordered_set<uint64_t> seenReceipts;
+        std::vector<uint8_t> seenTerrainReceipts(frame.terrainStageReceipts.size(), 0);
+        bool complete = true;
+        uint64_t lastNativeSequence = 0;
+        const auto issue = [&](uint32_t gap, uint64_t sequence) {
+            stream.missingMask |= gap | MCDR_OIT_EXECUTION_V2_GAP_SELECTION;
+            if (!stream.firstIssueSequence || sequence < stream.firstIssueSequence)
+                stream.firstIssueSequence = sequence;
+            complete = false;
+        };
+        static thread_local std::unordered_set<uint64_t> reported;
+        for (const auto& command : *stream.commands) {
+            if (command.source != ExecutionCommandSource::Terrain) continue;
+            if (command.packetIndex >= frame.terrainStageReceipts.size()) {
+                issue(MCDR_OIT_EXECUTION_V2_GAP_RECEIPT, command.nativeSequence);
+                continue;
+            }
+            const auto& receipt = frame.terrainStageReceipts[command.packetIndex];
+            if (receipt.receiptId != command.receiptId || receipt.nativeSequence != command.nativeSequence ||
+                !command.eventId || command.eventId > stream.events.size()) {
+                issue(MCDR_OIT_EXECUTION_V2_GAP_RECEIPT, command.nativeSequence);
+                continue;
+            }
+            if (!seenReceipts.insert(receipt.receiptId).second || seenTerrainReceipts[command.packetIndex]) {
+                issue(MCDR_OIT_EXECUTION_V2_GAP_RECEIPT, command.nativeSequence);
+                continue;
+            }
+            seenTerrainReceipts[command.packetIndex] = 1;
+            const auto& event = stream.events[command.eventId - 1];
+            if (event.sequence != command.eventId || event.kind != MCDR_OIT_EXECUTION_V2_DRAW ||
+                event.receiptCount == 0 || !event.receiptIds || event.key.producerKind != MCDR_OIT_SOURCE_TERRAIN ||
+                event.key.stage != receipt.stage || event.key.producerId != receipt.producerId ||
+                event.key.producerScopeSerial != receipt.producerScopeSerial ||
+                event.key.sourcePassId != receipt.sourcePassId || event.key.sourceDrawId != receipt.sourceDrawId ||
+                event.key.parentSourceDrawId != receipt.parentSourceDrawId ||
+                event.pipelineIdentity != receipt.pipelineIdentity ||
+                event.programGeneration != stream.input.programGeneration) {
+                issue(MCDR_OIT_EXECUTION_V2_GAP_RECEIPT, receipt.nativeSequence);
+                continue;
+            }
+            uint32_t receiptIndex = UINT32_MAX;
+            for (uint32_t index = 0; index < event.receiptCount; ++index) {
+                if (event.receiptIds[index] != receipt.receiptId) continue;
+                if (receiptIndex != UINT32_MAX) {
+                    receiptIndex = UINT32_MAX - 1;
+                    break;
+                }
+                receiptIndex = index;
+            }
+            if (receiptIndex >= event.receiptCount) {
+                issue(MCDR_OIT_EXECUTION_V2_GAP_RECEIPT, receipt.nativeSequence);
+                continue;
+            }
+            if (command.nativeSequence <= lastNativeSequence) {
+                issue(MCDR_OIT_EXECUTION_V2_GAP_RECEIPT, command.nativeSequence);
+                continue;
+            }
+            lastNativeSequence = command.nativeSequence;
+            if (command.packetIndex >= frame.terrainStagePackets.size()) {
+                issue(MCDR_OIT_EXECUTION_V2_GAP_CONTENT, receipt.nativeSequence);
+                continue;
+            }
+            const auto& packet = frame.terrainStagePackets[command.packetIndex];
+            if (packet.executionV2Ordinal == UINT32_MAX ||
+                packet.executionV2Ordinal != event.key.commandOrdinal + receiptIndex) {
+                issue(MCDR_OIT_EXECUTION_V2_GAP_SELECTION, receipt.nativeSequence);
+                continue;
+            }
+            if (receipt.contentState != MCDR_OIT_EXECUTION_CONTENT_ORIGINAL ||
+                !packet.replayPacket || !packet.prepareReplay) {
+                if (reported.insert(receipt.pipelineIdentity).second)
+                    dbgLogDebug("OIT terrain content gap: stage=%u registered=%d", receipt.stage, packet.validated);
+                issue(MCDR_OIT_EXECUTION_V2_GAP_CONTENT, receipt.nativeSequence);
+            }
+            if (!packet.validated || !packet.batchLease)
+                issue(MCDR_OIT_EXECUTION_V2_GAP_READ_SET, receipt.nativeSequence);
+            TerrainExecutionSelection selection;
+            selection.nativeSequence = receipt.nativeSequence;
+            selection.eventId = command.eventId;
+            selection.receiptId = receipt.receiptId;
+            selection.sourcePassId = receipt.sourcePassId;
+            selection.sourceDrawId = receipt.sourceDrawId;
+            selection.parentSourceDrawId = receipt.parentSourceDrawId;
+            selection.stage = receipt.stage;
+            selection.packetIndex = command.packetIndex;
+            selection.geometry = matchLaneGeometry(event, stream.laneOperationTextures,
+                [&](const LaneTexture& texture, GraphicsCommandTextureBinding binding, uint32_t bindingIndex) {
+                    using Binding = GraphicsCommandTextureBinding;
+                    if (binding == Binding::DepthAttachment) return texture == packet.depth;
+                    if (binding == Binding::ColorTarget)
+                        return bindingIndex < packet.colors.size() && texture == packet.colors[bindingIndex];
+                    return bindingIndex < packet.laneReads.size() && texture == packet.laneReads[bindingIndex];
+                });
+            if (!selection.geometry.depthRole) {
+                if (complete)
+                    dbgLogDebug("OIT terrain binding gap: stage=%u rows=%u", receipt.stage, event.resourceCount);
+                issue(MCDR_OIT_EXECUTION_V2_GAP_READ_SET, receipt.nativeSequence);
+            }
+            selections.push_back(std::move(selection));
+        }
+        for (const auto seen : seenTerrainReceipts)
+            if (!seen) issue(MCDR_OIT_EXECUTION_V2_GAP_RECEIPT, frame.serial);
+        if (complete)
+            stream.terrainSelections = std::make_unique<const std::vector<TerrainExecutionSelection>>(std::move(selections));
+        else
+            stream.terrainSelections.reset();
+        return success;
+    } catch (const std::bad_alloc&) {
+        stream.missingMask |= MCDR_OIT_EXECUTION_V2_GAP_SELECTION;
+        return overBudget;
+    }
+}
+
+void validateLaneExecutionOrder(ExecutionStreamV2& stream) {
+    if (!stream.normalizationPayload || !stream.terrainSelections) return;
+    const auto& terminal = stream.events.back();
+    if (terminal.kind != MCDR_OIT_EXECUTION_V2_NORMALIZATION) return;
+    const auto coefficientCount = stream.normalizationPayload->targetCount;
+    const auto matchesTerminal = [&](const mcdr_oit_execution_resource_v2& resource, uint32_t index) {
+        const auto& expected = terminal.resources[index];
+        return resource.object == expected.object && resource.firstSubresource == expected.firstSubresource;
+    };
+    constexpr auto main = MCDR_OIT_EXECUTION_V2_RESOURCE_MAIN_DEPTH;
+    constexpr auto terrain = MCDR_OIT_EXECUTION_V2_RESOURCE_TERRAIN_DEPTH;
+    constexpr auto cloud = MCDR_OIT_EXECUTION_V2_RESOURCE_CLOUD_DEPTH;
+    constexpr auto culled = MCDR_OIT_EXECUTION_V2_RESOURCE_CULLED_BOUNDS;
+    bool terrainReady = false, cloudReady = false, boundsCopied = false, boundsCulled = false;
+    bool accumulateStarted = false;
+    size_t terrainIndex = 0;
+    for (const auto& command : *stream.commands) {
+        const auto& event = stream.events[command.eventId - 1];
+        LaneGeometry geometry;
+        if (command.source == ExecutionCommandSource::Terrain) {
+            geometry = (*stream.terrainSelections)[terrainIndex++].geometry;
+        } else {
+            const auto& operation = stream.operations[command.packetIndex];
+            if (operation.receipt.recordState == MCDR_OIT_OPERATION_EMPTY) continue;
+            geometry = operation.geometry;
+            if (!geometry.depthRole) {
+                terrainReady |= operation.laneCopy.destinationRole == terrain;
+                cloudReady |= operation.laneCopy.destinationRole == cloud;
+                boundsCopied |= operation.laneCopy.destinationRole == culled;
+                boundsCulled |= bool(operation.laneCullProjection);
+                continue;
+            }
+        }
+        const auto stage = event.key.stage;
+        bool valid = geometry.depthRole == main || (geometry.depthRole == terrain && terrainReady) ||
+            (geometry.depthRole == cloud && cloudReady);
+        if (stage == MCDR_OIT_EXECUTION_STAGE_DEPTH_BOUNDS)
+            valid &= geometry.outputRole == culled ? boundsCulled : !boundsCopied;
+        else
+            valid &= boundsCulled && geometry.coefficientCount == coefficientCount &&
+                (stage != MCDR_OIT_EXECUTION_STAGE_TRANSMITTANCE || !accumulateStarted);
+        accumulateStarted |= stage == MCDR_OIT_EXECUTION_STAGE_ACCUMULATE;
+        for (uint32_t index = 0; valid && index < event.resourceCount; ++index) {
+            const auto& resource = event.resources[index];
+            if (resource.role == MCDR_OIT_EXECUTION_V2_RESOURCE_Q)
+                valid = matchesTerminal(resource, 2);
+            if (resource.role == MCDR_OIT_EXECUTION_V2_RESOURCE_COEFFICIENT)
+                valid = matchesTerminal(resource, 4 + resource.roleIndex);
+        }
+        if (!valid) {
+            stream.missingMask |= MCDR_OIT_EXECUTION_V2_GAP_READ_SET;
+            if (!stream.firstIssueSequence || command.nativeSequence < stream.firstIssueSequence)
+                stream.firstIssueSequence = command.nativeSequence;
+        }
+    }
+}
+
 
 }
 int validateOpaqueDepthSeed(Frame& frame, ExecutionStreamV2& stream) {
     const auto& seed = frame.opaqueDepthSeed;
+    stream.opaqueSeedIssueSequences.fill(0);
+    stream.missingMask &= ~MCDR_OIT_EXECUTION_V2_GAP_OPAQUE_SEED;
     const auto issue = [&](uint32_t gap, size_t category, uint64_t sequence) {
-        stream.missingMask |= gap | MCDR_OIT_EXECUTION_V2_GAP_OPAQUE_SEED;
+        stream.missingMask |= gap;
         auto& first = stream.opaqueSeedIssueSequences[category];
         if (!first || sequence < first) first = sequence;
         if (!stream.firstIssueSequence || sequence < stream.firstIssueSequence) stream.firstIssueSequence = sequence;
@@ -2318,14 +2940,12 @@ int validateOpaqueDepthSeed(Frame& frame, ExecutionStreamV2& stream) {
         seed->frame.configVersion != frame.input.identity.configVersion ||
         seed->frame.resourceVersion != frame.input.identity.resourceVersion ||
         seed->programGeneration != frame.input.programGeneration || seed->programGeneration != context->frameProgramGeneration ||
-        !seed->worldDepth || seed->worldDepth != context->rasterMotionWorldDepth || !seed->depthOwner ||
+        !vanilla::matchesWorldDepthRegistrationV1(frame.context, seed->worldDepth) || !seed->depthOwner ||
         !seed->depthDescriptors || !seed->retainedDsv.ptr || seed->events.empty()) {
         issue(MCDR_OIT_EXECUTION_V2_GAP_OPAQUE_SEED, 0, 1);
         return success;
     }
     bool initialized = false;
-    stream.opaqueSeedPackets.clear();
-    stream.opaqueSeedPackets.reserve(seed->events.size());
     for (size_t index = 0; index < seed->events.size(); ++index) {
         const auto& event = seed->events[index];
         const auto sequence = static_cast<uint64_t>(index) + 1;
@@ -2367,13 +2987,19 @@ int validateOpaqueDepthSeed(Frame& frame, ExecutionStreamV2& stream) {
             issue(MCDR_OIT_EXECUTION_V2_GAP_OPAQUE_SEED, 0, sequence);
             continue;
         }
+        if (inspection.commandFamily == static_cast<uint32_t>(mcdr::graphics_recording::CommandFamily::Mesh)) {
+            const auto& adapter = inspection.adapter;
+            if (adapter.state != mcdr::graphics_recording::AdapterState::Ready ||
+                adapter.registration != mcdr::graphics_recording::AdapterRegistration::Registered ||
+                adapter.stage != terrainOpaqueSeedStage || adapter.programGeneration != seed->programGeneration ||
+                !adapter.replayContent)
+                issue(MCDR_OIT_EXECUTION_V2_GAP_ADAPTER, 2, sequence);
+            continue;
+        }
         if (inspection.content != mcdr::graphics_recording::ContentState::Frozen)
             issue(MCDR_OIT_EXECUTION_V2_GAP_CONTENT, 1, sequence);
-        if (inspection.adapter.state != mcdr::graphics_recording::AdapterState::Ready ||
-            inspection.adapter.registration != mcdr::graphics_recording::AdapterRegistration::Registered ||
-            !inspection.routeBound)
+        if (inspection.opaqueSeedProgramGeneration != seed->programGeneration)
             issue(MCDR_OIT_EXECUTION_V2_GAP_ADAPTER, 2, sequence);
-        stream.opaqueSeedPackets.push_back(event.packet);
     }
     if (!initialized) issue(MCDR_OIT_EXECUTION_V2_GAP_OPAQUE_SEED, 0, 1);
     return success;
@@ -2421,7 +3047,15 @@ int sealExecutionStreamV2(void* opaqueContext, void* opaqueStream, const mcdr_oi
     uint64_t missingOperationReceipt = 0;
     if (const auto status = sealExecutionCommands(*frame, stream, missingOperationReceipt); status != success)
         return status;
+    if (const auto status = validateLaneOperationResources(*frame, stream, missingOperationReceipt); status != success)
+        return status;
+    validateLaneGeometryOperations(*frame, stream);
+    if (const auto status = prepareTerrainExecutionSelections(*frame, stream); status != success)
+        return status;
+    validateLaneExecutionOrder(stream);
     if (const auto status = validateOpaqueDepthSeed(*frame, stream); status != success) return status;
+    stream.laneDepthCommandsReady = std::ranges::none_of(stream.opaqueSeedIssueSequences,
+        [](uint64_t sequence) { return sequence != 0; });
     stream.missingMask |= input.missingMask;
     if (!completeManifest) stream.missingMask |= MCDR_OIT_EXECUTION_V2_GAP_MANIFEST;
     if (input.flags & MCDR_OIT_EXECUTION_V2_MANIFEST_FAILED) stream.missingMask |= MCDR_OIT_EXECUTION_V2_GAP_FAILED;
@@ -2431,8 +3065,11 @@ int sealExecutionStreamV2(void* opaqueContext, void* opaqueStream, const mcdr_oi
     for (const auto& pass : stream.passes)
         if (pass.open) stream.missingMask |= MCDR_OIT_EXECUTION_V2_GAP_OPEN_PASS;
     if (stream.receipts.size() != frame->terrainStageReceipts.size()) stream.missingMask |= MCDR_OIT_EXECUTION_V2_GAP_RECEIPT;
-    stream.state = MCDR_OIT_EXECUTION_V2_STATE_UNAVAILABLE;
-    cancelExecutionTextureCaptures(*frame);
+    if (!stream.normalizationPayload || !frame->programs->normalizationPrograms)
+        stream.missingMask |= MCDR_OIT_EXECUTION_V2_GAP_NORMALIZATION;
+    stream.state = stream.missingMask ? MCDR_OIT_EXECUTION_V2_STATE_UNAVAILABLE : MCDR_OIT_EXECUTION_V2_STATE_SEALED;
+    if (stream.missingMask) cancelExecutionTextureCaptures(*frame);
+    else *output = opaqueStream;
     result->schemaVersion = 2;
     result->structSize = sizeof(*result);
     result->state = stream.state;
@@ -2450,8 +3087,345 @@ int sealExecutionStreamV2(void* opaqueContext, void* opaqueStream, const mcdr_oi
         }
         ++consumedIndex;
     }
-    return unsupported;
+    return stream.missingMask ? unsupported : success;
 }
+int recordLaneDepthEvents(Frame& frame, Dx12Object* depth, const mcdr::terrain_tile::BatchV2& batch,
+    std::span<const vanilla::WorldDepthSeedEventV1> events, D3D12_GPU_VIRTUAL_ADDRESS constantsAddress) {
+    using namespace mcdr::terrain_tile;
+    auto* context = static_cast<CommandContext*>(frame.context);
+    const auto count = batch.residentTileCount;
+    if (context->inRenderPass || context->graphicsCommandObserver.prepare ||
+        batch.schemaVersion != 2 || batch.structSize != sizeof(batch) || batch.flags || batch.reserved0 ||
+        batch.laneIndex >= laneCount || batch.frameSerial != frame.serial ||
+        batch.worldEpoch != frame.input.identity.worldEpoch ||
+        batch.resourceVersion != frame.input.identity.resourceVersion ||
+        batch.programGeneration != frame.input.programGeneration ||
+        !validLaneScratch(depth, count, DXGI_FORMAT_D32_FLOAT) ||
+        !(depth->resource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+        return invalid;
+    for (uint32_t index = 0; index < count; ++index) {
+        const auto& tile = batch.tiles[index];
+        if (!tile.effectiveWidth || tile.effectiveWidth > tileSize ||
+            !tile.effectiveHeight || tile.effectiveHeight > tileSize ||
+            uint64_t(tile.originX) + tile.effectiveWidth > frame.input.width ||
+            uint64_t(tile.originY) + tile.effectiveHeight > frame.input.height)
+            return invalid;
+    }
+    for (const auto& event : events) {
+        if (event.kind != vanilla::WorldDepthSeedEventKind::Draw) continue;
+        const auto inputs = resolveGraphicsCommandContent(context, event.packet);
+        if (!inputs || inputs->status != PacketContentStatus::Frozen) return unsupported;
+    }
+    auto& views = frame.executionStreamV2->seedDepthViews;
+    auto found = std::ranges::find(views, depth, &SeedDepthViews::depth);
+    if (found == views.end()) {
+        auto budget = mcdr::oit_budget::reserve(allocationAlignment, frame.input.totalBudgetBytes);
+        if (!budget) return overBudget;
+        auto* device = deviceContext().device.Get();
+        D3D12_DESCRIPTOR_HEAP_DESC heap{};
+        heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        heap.NumDescriptors = count + 1;
+        SeedDepthViews entry{depth, count, device->GetDescriptorHandleIncrementSize(heap.Type), {},
+            retainObjectLease(depth), std::move(budget)};
+        const HRESULT result = device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&entry.heap));
+        if (FAILED(result)) return result == E_OUTOFMEMORY ? overBudget : recordingFailed;
+        const auto dsv = entry.heap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_DEPTH_STENCIL_VIEW_DESC desc{};
+        desc.Format = DXGI_FORMAT_D32_FLOAT;
+        desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+        desc.Texture2DArray.ArraySize = count;
+        device->CreateDepthStencilView(depth->resource.Get(), &desc, dsv);
+        desc.Texture2DArray.ArraySize = 1;
+        for (uint32_t index = 0; index < count; ++index) {
+            desc.Texture2DArray.FirstArraySlice = index;
+            device->CreateDepthStencilView(depth->resource.Get(), &desc, {dsv.ptr + (index + 1) * entry.descriptorStride});
+        }
+        views.push_back(std::move(entry));
+        found = std::prev(views.end());
+    }
+    if (found->slices != count) return invalid;
+    const auto dsv = found->heap->GetCPUDescriptorHandleForHeapStart();
+    const auto increment = found->descriptorStride;
+    auto* list = context->commandList;
+    const auto& caps = deviceContext().caps;
+    ComPtr<ID3D12GraphicsCommandList5> shadingRateList;
+    if (caps.shadingRateSupported() && FAILED(list->QueryInterface(IID_PPV_ARGS(&shadingRateList))))
+        return unsupported;
+    const vanilla::PassResourceUse use{depth, batch.resourceVersion, 0, count, vanilla::ResourceAccess::ReadWrite,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE};
+    vanilla::DeclaredPassToken* pass{};
+    if (prepareSampledTextureWrite(context, depth, 0, count) != SampledTextureContentStatus::Ready ||
+        vanilla::beginDeclaredPass(context, 0x227, &use, 1, 3, &pass) != success) {
+        markExecutionOperationFailure(frame);
+        return recordingFailed;
+    }
+    if (shadingRateList) {
+        if (caps.shadingRateImageSupported()) shadingRateList->RSSetShadingRateImage(nullptr);
+        const D3D12_SHADING_RATE_COMBINER combiners[]{D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+            D3D12_SHADING_RATE_COMBINER_PASSTHROUGH};
+        shadingRateList->RSSetShadingRate(D3D12_SHADING_RATE_1X1, combiners);
+    }
+    list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+    restoreDrawHeap(context);
+    const auto& lane = laneOffsets[batch.laneIndex];
+    const auto shiftRect = [](D3D12_RECT rect, const Tile& tile) {
+        constexpr auto guard = static_cast<int64_t>(guardPixels);
+        const auto x = guard - tile.originX, y = guard - tile.originY;
+        const auto width = tile.effectiveWidth + 2 * guard, height = tile.effectiveHeight + 2 * guard;
+        return D3D12_RECT{static_cast<LONG>(std::clamp(rect.left + x, int64_t{0}, width)),
+            static_cast<LONG>(std::clamp(rect.top + y, int64_t{0}, height)),
+            static_cast<LONG>(std::clamp(rect.right + x, int64_t{0}, width)),
+            static_cast<LONG>(std::clamp(rect.bottom + y, int64_t{0}, height))};
+    };
+    bool failed = false;
+    for (const auto& event : events) {
+        if (event.kind == vanilla::WorldDepthSeedEventKind::Clear) {
+            const auto clear = static_cast<float>(event.clearDepth);
+            if (!event.hasClearRect) list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, clear, 0, 0, nullptr);
+            else for (uint32_t index = 0; index < count; ++index) {
+                const auto rect = shiftRect(event.clearRect, batch.tiles[index]);
+                if (rect.left >= rect.right || rect.top >= rect.bottom) continue;
+                list->ClearDepthStencilView({dsv.ptr + (index + 1) * increment}, D3D12_CLEAR_FLAG_DEPTH,
+                    clear, 0, 1, &rect);
+            }
+            continue;
+        }
+        const auto input = inspectGraphicsCommandPacket(context, event.packet);
+        std::array<D3D12_VIEWPORT, maximumResidentTiles> viewports{};
+        std::array<D3D12_RECT, maximumResidentTiles> scissors{};
+        for (uint32_t index = 0; index < count; ++index) {
+            const auto& tile = batch.tiles[index];
+            viewports[index] = input.viewport;
+            viewports[index].TopLeftX += static_cast<float>(guardPixels) - static_cast<float>(tile.originX) - lane[0];
+            viewports[index].TopLeftY += static_cast<float>(guardPixels) - static_cast<float>(tile.originY) - lane[1];
+            scissors[index] = shiftRect(input.scissor, tile);
+        }
+        if (const auto draw = recordTileGraphicsPacket(context, event.packet,
+                std::span(viewports).first(count), std::span(scissors).first(count), constantsAddress); !draw) {
+            dbgLogError("OIT lane depth draw: %s", draw.error().message.c_str());
+            failed = true;
+            break;
+        }
+    }
+    list->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
+    if (shadingRateList) {
+        if (caps.shadingRateImageSupported()) {
+            auto* image = context->shadingRateImageBound;
+            shadingRateList->RSSetShadingRateImage(image ? image->resource.Get() : nullptr);
+        }
+        shadingRateList->RSSetShadingRate(context->recordedShadingRate, context->recordedShadingCombiners);
+    }
+    invalidateGraphicsInputBindings(context, false);
+    if (failed || vanilla::finishDeclaredPass(context, pass) != success) {
+        vanilla::failRasterInputPass(context);
+        markExecutionOperationFailure(frame);
+        return recordingFailed;
+    }
+    return success;
+}
+
+int recordExecutionOpaqueSeed(void* opaqueContext, void* streamHandle, void* mainDepth,
+    const mcdr::terrain_tile::BatchV2& batch, mcdr::terrain_tile::ConstantAddresses constants) {
+    if (const auto status = recordingStatus(opaqueContext); status != success) return status;
+    auto frame = findExecutionFrameV2(opaqueContext, streamHandle);
+    if (!frame || !frame->opaqueDepthSeed || !frame->executionStreamV2->laneDepthCommandsReady) return stale;
+    auto* depth = static_cast<Dx12Object*>(mainDepth);
+    const auto events = std::span(frame->opaqueDepthSeed->events);
+    using mcdr::graphics_recording::CommandFamily;
+    using mcdr::terrain_tile::Result;
+    std::vector<std::pair<size_t, std::shared_ptr<const void>>> terrainPlans;
+    for (size_t index = 0; index < events.size(); ++index) {
+        const auto& event = events[index];
+        if (event.kind == vanilla::WorldDepthSeedEventKind::Clear) continue;
+        if (event.commandFamily == static_cast<uint32_t>(CommandFamily::Mesh)) {
+            const auto input = inspectGraphicsCommandPacket(opaqueContext, event.packet);
+            std::shared_ptr<const void> plan;
+            const auto prepared = prepareTerrainTilePacketV2(opaqueContext,
+                input.adapter.replayContent, batch, {depth, 0, 0}, constants, &plan);
+            if (prepared != Result::Prepared || !plan) {
+                dbgLogError("OIT terrain seed: prepare failed (%d)", static_cast<int>(prepared));
+                return unsupported;
+            }
+            terrainPlans.emplace_back(index, std::move(plan));
+        } else {
+            const auto inputs = resolveGraphicsCommandContent(opaqueContext, event.packet);
+            if (!inputs || inputs->status != PacketContentStatus::Frozen) return unsupported;
+        }
+    }
+    size_t next = 0;
+    for (const auto& [index, plan] : terrainPlans) {
+        if (index > next) {
+            const auto result = recordLaneDepthEvents(*frame, depth, batch, events.subspan(next, index - next), constants.batch);
+            if (result != success) return result;
+        }
+        if (const auto replay = recordTerrainTileReplayPlan(opaqueContext, plan, terrainOpaqueSeedStage,
+                TerrainTileAttachmentMode::Load); !replay) {
+            dbgLogError("OIT terrain seed: %s", replay.error().message.c_str());
+            markExecutionOperationFailure(*frame);
+            return recordingFailed;
+        }
+        next = index + 1;
+    }
+    if (next == events.size()) return success;
+    return recordLaneDepthEvents(*frame, depth, batch, events.subspan(next), constants.batch);
+}
+
+int recordExecutionLaneBoundsCull(Frame& frame, const ExecutionOperationEvent& operation,
+    const ExecutionLaneTargets& targets) {
+    auto* context = static_cast<CommandContext*>(frame.context);
+    auto* bounds = static_cast<Dx12Object*>(targets.bounds);
+    auto* culled = static_cast<Dx12Object*>(targets.culledBounds);
+    auto* depth = static_cast<Dx12Object*>(targets.mainDepth);
+    constexpr auto boundsFormat = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    const auto count = targets.residentTileCount;
+    if (context->inRenderPass || context->graphicsCommandObserver.prepare ||
+        !validLaneScratch(bounds, count, boundsFormat) || !validLaneScratch(culled, count, boundsFormat) ||
+        !validLaneScratch(depth, count, DXGI_FORMAT_D32_FLOAT) || bounds->resource == culled->resource ||
+        !(culled->resource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
+        !(depth->resource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) return invalid;
+    const auto& lease = operation.laneCullProjection;
+    if (packetContentStatus(context, lease) != PacketContentStatus::Frozen) return stale;
+    const auto content = std::static_pointer_cast<const PacketContentLease>(lease);
+    if (content->frozenReads.size() != 1) return invalid;
+    const auto& projection = content->frozenReads.front();
+    if (!projection.resource || !projection.object || projection.byteLength != 64 ||
+        projection.byteOffset % D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT) return invalid;
+    const auto& programs = frame.programs;
+    const auto& caps = deviceContext().caps;
+    ComPtr<ID3D12GraphicsCommandList5> shadingRateList;
+    if (caps.shadingRateSupported() && FAILED(context->commandList->QueryInterface(IID_PPV_ARGS(&shadingRateList))))
+        return unsupported;
+    auto descriptors = allocateDrawDescriptors(context, 1);
+    if (!descriptors) return overBudget;
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Format = boundsFormat;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Texture2DArray.MipLevels = 1;
+    view.Texture2DArray.ArraySize = count;
+    deviceContext().device->CreateShaderResourceView(bounds->resource.Get(), &view, descriptors->cpu);
+    const uint32_t projectionState = projection.initialState == D3D12_RESOURCE_STATE_GENERIC_READ
+        ? D3D12_RESOURCE_STATE_GENERIC_READ : D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+    const auto version = frame.input.identity.resourceVersion;
+    const vanilla::PassResourceUse uses[] = {
+        {projection.object, version, 0, 1, vanilla::ResourceAccess::Read, projectionState},
+        {bounds, version, 0, count, vanilla::ResourceAccess::Read, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE},
+        {culled, version, 0, count, vanilla::ResourceAccess::ReadWrite, D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_COMMON},
+        {depth, version, 0, count, vanilla::ResourceAccess::ReadWrite, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+            D3D12_RESOURCE_STATE_COMMON},
+    };
+    vanilla::DeclaredPassToken* pass{};
+    constexpr int extent = static_cast<int>(mcdr::terrain_tile::scratchSize);
+    constexpr uint32_t descriptorEffects = 1u << 1;
+    if (prepareSampledTextureWrite(context, culled, 0, count) != SampledTextureContentStatus::Ready ||
+        prepareSampledTextureWrite(context, depth, 0, count) != SampledTextureContentStatus::Ready ||
+        vanilla::beginDeclaredPass(context, 0x226, uses, static_cast<uint32_t>(std::size(uses)), descriptorEffects, &pass) != success ||
+        !beginRenderPass(context, &culled, 1, nullptr, nullptr, nullptr, depth, 0, 0, 0.0, 0, 0, extent, extent)) {
+        markExecutionOperationFailure(frame);
+        return recordingFailed;
+    }
+    if (shadingRateList) {
+        if (caps.shadingRateImageSupported()) shadingRateList->RSSetShadingRateImage(nullptr);
+        const D3D12_SHADING_RATE_COMBINER combiners[]{D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+            D3D12_SHADING_RATE_COMBINER_PASSTHROUGH};
+        shadingRateList->RSSetShadingRate(D3D12_SHADING_RATE_1X1, combiners);
+    }
+    auto* commands = context->commandList;
+    commands->SetGraphicsRootSignature(programs->laneCullRoot.Get());
+    restoreDrawHeap(context);
+    commands->SetGraphicsRootConstantBufferView(0, projection.resource->GetGPUVirtualAddress() + projection.byteOffset);
+    commands->SetGraphicsRootDescriptorTable(1, descriptors->gpu);
+    commands->SetPipelineState(programs->laneCullPipeline.Get());
+    commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    commands->DrawInstanced(3, count, 0, 0);
+    if (shadingRateList) {
+        if (caps.shadingRateImageSupported()) {
+            auto* image = context->shadingRateImageBound;
+            shadingRateList->RSSetShadingRateImage(image ? image->resource.Get() : nullptr);
+        }
+        shadingRateList->RSSetShadingRate(context->recordedShadingRate, context->recordedShadingCombiners);
+    }
+    context->currentPipeline = nullptr;
+    std::ranges::fill(context->activeColorTargetsTouched, true);
+    context->colorTargetsWritten = true;
+    if (!endRenderPass(context) || vanilla::finishDeclaredPass(context, pass) != success) {
+        markExecutionOperationFailure(frame);
+        return recordingFailed;
+    }
+    return success;
+}
+
+int recordExecutionLaneOperation(void* opaqueContext, void* opaqueStream, uint64_t receiptId,
+    const ExecutionLaneTargets& targets) {
+    if (const auto status = recordingStatus(opaqueContext); status != success) return status;
+    auto frame = findExecutionFrameV2(opaqueContext, opaqueStream);
+    if (!frame || !frame->executionStreamV2->commands) return stale;
+    const auto& stream = *frame->executionStreamV2;
+    const auto found = frame->executionOperationReceipts.find(receiptId);
+    if (found == frame->executionOperationReceipts.end() || !found->second.packet ||
+        !found->second.packet->executionV2EventId) return stale;
+    const auto& receipt = found->second.packet->receipt;
+    const auto& commands = *stream.commands;
+    const auto command = std::ranges::lower_bound(commands, receipt.nativeSequence, {}, &ExecutionCommand::nativeSequence);
+    if (command == commands.end() || command->source != ExecutionCommandSource::Operation ||
+        command->receiptId != receiptId) return stale;
+    const auto& operation = stream.operations[command->packetIndex];
+    if (operation.receipt.recordState == MCDR_OIT_OPERATION_EMPTY) return success;
+    if (operation.laneWaterMask) {
+        if (!targets.batch || targets.batch->residentTileCount != targets.residentTileCount) return invalid;
+        vanilla::WorldDepthSeedEventV1 event;
+        event.kind = vanilla::WorldDepthSeedEventKind::Draw;
+        event.packet = operation.packet;
+        return recordLaneDepthEvents(*frame, static_cast<Dx12Object*>(targets.terrainDepth),
+            *targets.batch, std::span(&event, 1), targets.batchConstants);
+    }
+    if (operation.laneCullProjection) return recordExecutionLaneBoundsCull(*frame, operation, targets);
+    const auto& copy = operation.laneCopy;
+    if (!copy.sourceRole || !copy.destinationRole) return unsupported;
+    const auto resolve = [&targets](uint32_t role) -> Dx12Object* {
+        switch (role) {
+        case MCDR_OIT_EXECUTION_V2_RESOURCE_MAIN_DEPTH: return static_cast<Dx12Object*>(targets.mainDepth);
+        case MCDR_OIT_EXECUTION_V2_RESOURCE_TERRAIN_DEPTH: return static_cast<Dx12Object*>(targets.terrainDepth);
+        case MCDR_OIT_EXECUTION_V2_RESOURCE_CLOUD_DEPTH: return static_cast<Dx12Object*>(targets.cloudDepth);
+        case MCDR_OIT_EXECUTION_V2_RESOURCE_BOUNDS: return static_cast<Dx12Object*>(targets.bounds);
+        case MCDR_OIT_EXECUTION_V2_RESOURCE_CULLED_BOUNDS: return static_cast<Dx12Object*>(targets.culledBounds);
+        default: return nullptr;
+        }
+    };
+    auto* source = resolve(copy.sourceRole);
+    auto* destination = resolve(copy.destinationRole);
+    const bool depth = copy.sourceRole == MCDR_OIT_EXECUTION_V2_RESOURCE_MAIN_DEPTH;
+    const auto format = depth ? DXGI_FORMAT_D32_FLOAT : DXGI_FORMAT_R32G32B32A32_FLOAT;
+    const auto* context = static_cast<CommandContext*>(opaqueContext);
+    if (context->inRenderPass || !validLaneScratch(source, targets.residentTileCount, format) ||
+        !validLaneScratch(destination, targets.residentTileCount, format) ||
+        source->resource == destination->resource) return invalid;
+    if (prepareSampledTextureWrite(opaqueContext, destination, 0, targets.residentTileCount) !=
+        SampledTextureContentStatus::Ready) {
+        markExecutionOperationFailure(*frame);
+        return recordingFailed;
+    }
+    const auto version = frame->input.identity.resourceVersion;
+    const vanilla::PassResourceUse uses[] = {
+        {source, version, 0, targets.residentTileCount, vanilla::ResourceAccess::Read,
+            D3D12_RESOURCE_STATE_COPY_SOURCE},
+        {destination, version, 0, targets.residentTileCount, vanilla::ResourceAccess::Write,
+            D3D12_RESOURCE_STATE_COPY_DEST},
+    };
+    vanilla::DeclaredPassToken* pass{};
+    if (vanilla::beginDeclaredPass(opaqueContext, 0x225, uses, static_cast<uint32_t>(std::size(uses)), 0, &pass) != success) {
+        markExecutionOperationFailure(*frame);
+        return recordingFailed;
+    }
+    context->commandList->CopyResource(destination->resource.Get(), source->resource.Get());
+    if (vanilla::finishDeclaredPass(opaqueContext, pass) != success) {
+        markExecutionOperationFailure(*frame);
+        return recordingFailed;
+    }
+    return success;
+}
+
 int abortExecutionStreamV2(void* opaqueContext, void* opaqueStream) {
     if (const auto status = recordingStatus(opaqueContext); status != success) return status;
     auto frame = findExecutionFrameV2(opaqueContext, opaqueStream);
@@ -2460,6 +3434,303 @@ int abortExecutionStreamV2(void* opaqueContext, void* opaqueStream) {
     frame->executionStreamV2->state = MCDR_OIT_EXECUTION_V2_STATE_ABORTED;
     cancelExecutionTextureCaptures(*frame);
     return operationFailed ? recordingFailed : success;
+}
+
+namespace {
+mcdr::terrain_tile::ResourceRef laneDepth(const mcdr::terrain_tile::BatchV2& batch, uint32_t role) {
+    switch (role) {
+    case MCDR_OIT_EXECUTION_V2_RESOURCE_MAIN_DEPTH: return batch.stages[0].depth;
+    case MCDR_OIT_EXECUTION_V2_RESOURCE_TERRAIN_DEPTH: return batch.depthTerrain;
+    case MCDR_OIT_EXECUTION_V2_RESOURCE_CLOUD_DEPTH: return batch.depthCloud;
+    default: return {};
+    }
+}
+
+mcdr::terrain_tile::StageBindingV2 laneStage(const mcdr::terrain_tile::BatchV2& batch, uint32_t stageIndex,
+    const LaneGeometry& geometry) {
+    auto stage = batch.stages[stageIndex];
+    stage.pipeline = nullptr;
+    stage.depth = laneDepth(batch, geometry.depthRole);
+    if (stageIndex == 0 && geometry.outputRole == MCDR_OIT_EXECUTION_V2_RESOURCE_CULLED_BOUNDS)
+        stage.renderTargets[0] = batch.culledBounds;
+    return stage;
+}
+
+int recordLaneGeometry(Frame& frame, const mcdr::terrain_tile::BatchV2& batch,
+    const ExecutionOperationEvent& operation, uint32_t stageIndex, D3D12_GPU_VIRTUAL_ADDRESS constants) {
+    using namespace mcdr::terrain_tile;
+    auto* context = static_cast<CommandContext*>(frame.context);
+    const auto stage = laneStage(batch, stageIndex, operation.geometry);
+    auto* depth = static_cast<Dx12Object*>(stage.depth.object);
+    const auto count = batch.residentTileCount;
+    std::array<Dx12Object*, 4> targets{};
+    std::array<Dx12Object*, 5> reads{};
+    std::vector<vanilla::PassResourceUse> uses;
+    uses.reserve(10);
+    const auto write = [&](Dx12Object* object, uint32_t state) {
+        uses.push_back({object, batch.resourceVersion, 0, count, vanilla::ResourceAccess::ReadWrite,
+            state, D3D12_RESOURCE_STATE_COMMON});
+    };
+    const auto read = [&](Dx12Object* object) {
+        uses.push_back({object, batch.resourceVersion, 0, count, vanilla::ResourceAccess::Read,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE});
+    };
+    for (uint32_t index = 0; index < stage.renderTargetCount; ++index) {
+        targets[index] = static_cast<Dx12Object*>(stage.renderTargets[index].object);
+        write(targets[index], D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
+    write(depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    if (stageIndex != 0) {
+        reads[0] = static_cast<Dx12Object*>(batch.culledBounds.object);
+        read(reads[0]);
+    }
+    if (stageIndex == 2)
+        for (uint32_t index = 0; index < operation.geometry.coefficientCount; ++index) {
+            reads[index + 1] = static_cast<Dx12Object*>(batch.coefficients[index].object);
+            read(reads[index + 1]);
+        }
+    const auto inspection = inspectGraphicsCommandPacket(context, operation.packet);
+    std::array<D3D12_VIEWPORT, maximumResidentTiles> viewports{};
+    std::array<D3D12_RECT, maximumResidentTiles> scissors{};
+    const auto& offset = laneOffsets[batch.laneIndex];
+    for (uint32_t index = 0; index < count; ++index) {
+        const auto& tile = batch.tiles[index];
+        const auto x = static_cast<int64_t>(guardPixels) - tile.originX;
+        const auto y = static_cast<int64_t>(guardPixels) - tile.originY;
+        const auto w = static_cast<int64_t>(tile.effectiveWidth + 2 * guardPixels);
+        const auto h = static_cast<int64_t>(tile.effectiveHeight + 2 * guardPixels);
+        viewports[index] = inspection.viewport;
+        viewports[index].TopLeftX += static_cast<float>(x) - offset[0];
+        viewports[index].TopLeftY += static_cast<float>(y) - offset[1];
+        scissors[index] = {
+            static_cast<LONG>(std::clamp(inspection.scissor.left + x, int64_t{0}, w)),
+            static_cast<LONG>(std::clamp(inspection.scissor.top + y, int64_t{0}, h)),
+            static_cast<LONG>(std::clamp(inspection.scissor.right + x, int64_t{0}, w)),
+            static_cast<LONG>(std::clamp(inspection.scissor.bottom + y, int64_t{0}, h)),
+        };
+    }
+    vanilla::DeclaredPassToken* pass{};
+    if (vanilla::beginDeclaredPass(context, 0x228u + stageIndex, uses.data(),
+            static_cast<uint32_t>(uses.size()), 3, &pass) != success ||
+        !beginRenderPass(context, targets.data(), static_cast<int>(stage.renderTargetCount), nullptr, nullptr,
+            nullptr, depth, 0, 0, 0.0, 0, 0, scratchSize, scratchSize))
+        return recordingFailed;
+    const auto& caps = deviceContext().caps;
+    ComPtr<ID3D12GraphicsCommandList5> shadingRateList;
+    if (caps.shadingRateSupported() && FAILED(context->commandList->QueryInterface(IID_PPV_ARGS(&shadingRateList))))
+        return recordingFailed;
+    if (shadingRateList) {
+        if (caps.shadingRateImageSupported()) shadingRateList->RSSetShadingRateImage(nullptr);
+        const D3D12_SHADING_RATE_COMBINER combiners[]{D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+            D3D12_SHADING_RATE_COMBINER_PASSTHROUGH};
+        shadingRateList->RSSetShadingRate(D3D12_SHADING_RATE_1X1, combiners);
+    }
+    const auto draw = recordTileGraphicsPacket(context, operation.packet,
+        std::span(viewports).first(count), std::span(scissors).first(count), constants, reads);
+    if (shadingRateList) {
+        if (caps.shadingRateImageSupported()) {
+            auto* image = context->shadingRateImageBound;
+            shadingRateList->RSSetShadingRateImage(image ? image->resource.Get() : nullptr);
+        }
+        shadingRateList->RSSetShadingRate(context->recordedShadingRate, context->recordedShadingCombiners);
+    }
+    if (draw) {
+        std::ranges::fill(context->activeColorTargetsTouched, true);
+        context->colorTargetsWritten = true;
+    }
+    context->currentPipeline = nullptr;
+    const auto ended = endRenderPass(context);
+    const auto finished = ended ? vanilla::finishDeclaredPass(context, pass) : recordingFailed;
+    return draw && finished == success ? success : recordingFailed;
+}
+}
+
+int executeTileStreamV2(void* opaqueContext, void* streamHandle,
+    const mcdr::terrain_tile::BatchV2* batches, void* correctedHandle) try {
+    using namespace mcdr::terrain_tile;
+    if (const int status = recordingStatus(opaqueContext); status != success) return status;
+    auto frame = findExecutionFrameV2(opaqueContext, streamHandle);
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    if (!frame) return stale;
+    auto& stream = *frame->executionStreamV2;
+    if (stream.state != MCDR_OIT_EXECUTION_V2_STATE_SEALED || !stream.commands ||
+        !stream.normalizationPayload || !stream.terrainSelections || stream.normalizedPublished) return stale;
+    const auto failed = [&](int status) {
+        if (status == overBudget && !context->recordingFailed.load() && !context->submissionFailed.load()) {
+            // Completed groups only wrote scratch. The caller can still use this frame's original Q.
+            stream.state = MCDR_OIT_EXECUTION_V2_STATE_UNAVAILABLE;
+            cancelExecutionTextureCaptures(*frame);
+            dbgLogDebug("OIT tile replay: budget exhausted");
+            return status;
+        }
+        if (!stream.tileExecutionStarted) return status;
+        vanilla::failRasterInputPass(context);
+        markExecutionOperationFailure(*frame);
+        return recordingFailed;
+    };
+    if (!batches || context->inRenderPass || context->graphicsCommandObserver.prepare) return failed(invalid);
+    const auto coefficientCount = stream.normalizationPayload->targetCount;
+    const auto count = batches[0].residentTileCount;
+    if (count == 0 || count > maximumResidentTiles) return failed(invalid);
+    auto* corrected = static_cast<Dx12Object*>(correctedHandle);
+    if (corrected) {
+        if (!corrected->resource || corrected->kind != Dx12Object::Kind::Texture ||
+            corrected->dxgiFormat != DXGI_FORMAT_R32G32B32A32_FLOAT) return failed(invalid);
+        const auto desc = corrected->resource->GetDesc();
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Width != frame->input.width ||
+            desc.Height != frame->input.height || desc.DepthOrArraySize != 1 || desc.MipLevels != 1 ||
+            desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0 ||
+            desc.Format != DXGI_FORMAT_R32G32B32A32_FLOAT) return failed(invalid);
+    }
+    for (uint32_t lane = 0; lane < laneCount; ++lane) {
+        const auto& batch = batches[lane];
+        if (batch.schemaVersion != 2 || batch.structSize != sizeof(batch) || batch.flags || batch.reserved0 ||
+            batch.laneIndex != lane || batch.residentTileCount != count ||
+            batch.frameSerial != frame->serial || batch.worldEpoch != frame->input.identity.worldEpoch ||
+            batch.resourceVersion != frame->input.identity.resourceVersion ||
+            batch.programGeneration != frame->input.programGeneration ||
+            std::memcmp(batches[0].tiles, batch.tiles, count * sizeof(Tile)) != 0 ||
+            batch.stages[0].renderTargetCount != 1 || batch.stages[1].renderTargetCount != coefficientCount ||
+            batch.stages[2].renderTargetCount != 1) return failed(invalid);
+        std::array<ID3D12Resource*, 10> used{};
+        size_t usedCount = 0;
+        const auto validScratch = [&](const ResourceRef& reference, DXGI_FORMAT format) {
+            const auto* texture = static_cast<Dx12Object*>(reference.object);
+            if (reference.offset || reference.bytes != 1 || !validLaneScratch(texture, count, format)) return false;
+            auto* backing = texture->resource.Get();
+            const auto prior = std::span(used).first(usedCount);
+            const auto usage = format == DXGI_FORMAT_D32_FLOAT ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL :
+                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            if (!(backing->GetDesc().Flags & usage) || std::ranges::contains(prior, backing)) return false;
+            used[usedCount++] = backing;
+            return true;
+        };
+        for (const auto& reference : {batch.stages[0].depth, batch.depthTerrain, batch.depthCloud})
+            if (!validScratch(reference, DXGI_FORMAT_D32_FLOAT)) return failed(invalid);
+        for (const auto& reference : {batch.bounds, batch.culledBounds})
+            if (!validScratch(reference, DXGI_FORMAT_R32G32B32A32_FLOAT)) return failed(invalid);
+        if (!validScratch(batch.q, DXGI_FORMAT_R16G16B16A16_FLOAT) ||
+            batch.stages[0].renderTargets[0].object != batch.bounds.object ||
+            batch.stages[2].renderTargets[0].object != batch.q.object) return failed(invalid);
+        for (uint32_t index = 0; index < coefficientCount; ++index)
+            if (!validScratch(batch.coefficients[index], DXGI_FORMAT_R16G16B16A16_FLOAT) ||
+                batch.stages[1].renderTargets[index].object != batch.coefficients[index].object) return failed(invalid);
+    }
+    mcdr_oit_normalization_batch_v1 normalization{};
+    normalization.schemaVersion = 1;
+    normalization.structSize = sizeof(normalization);
+    normalization.identity = frame->input.identity;
+    normalization.frameSerial = frame->serial;
+    normalization.historyGeneration = frame->input.historyGeneration;
+    normalization.programGeneration = frame->input.programGeneration;
+    normalization.totalBudgetBytes = frame->input.totalBudgetBytes;
+    normalization.outputWidth = frame->input.width;
+    normalization.outputHeight = frame->input.height;
+    normalization.residentCount = count;
+    for (uint32_t index = 0; index < count; ++index) {
+        const auto& tile = batches[0].tiles[index];
+        normalization.regions[index] = {tile.originX, tile.originY, tile.effectiveWidth, tile.effectiveHeight};
+    }
+    void* handle{};
+    const int prepared = createPreparedNormalizationBatch(context, frame->programs->normalizationPrograms, coefficientCount,
+        normalization, &handle);
+    if (prepared != MCDR_OIT_NORMALIZATION_SUCCESS) return failed(prepared);
+    const std::unique_ptr<void, decltype(&destroyNormalizationBatch)> batchLease(handle, &destroyNormalizationBatch);
+    std::array<ConstantAddresses, laneCount> uploads{};
+    for (uint32_t lane = 0; lane < laneCount; ++lane) {
+        const auto upload = uploadTileConstants(*frame, batches[lane]);
+        if (!upload) return failed(upload.error());
+        uploads[lane] = *upload;
+    }
+    stream.tileExecutionStarted = true;
+    for (uint32_t lane = 0; lane < laneCount; ++lane) {
+        const auto& batch = batches[lane];
+        const auto constants = uploads[lane];
+        if (const auto initialized = initializeTerrainTileLane(context, batch); !initialized) {
+            dbgLogError("OIT lane initialization: %s", initialized.error().message.c_str());
+            return failed(recordingFailed);
+        }
+        if (const int seed = recordExecutionOpaqueSeed(context, streamHandle, batch.stages[0].depth.object, batch, constants);
+            seed != success) {
+            if (seed == overBudget) return failed(seed);
+            dbgLogError("OIT lane seed: recording failed (%d)", seed);
+            return failed(seed);
+        }
+        const ExecutionLaneTargets targets{batch.stages[0].depth.object, batch.depthTerrain.object,
+            batch.depthCloud.object, batch.bounds.object, batch.culledBounds.object, count, &batch, constants.batch};
+        size_t terrainIndex = 0;
+        for (const auto& command : *stream.commands) {
+            const auto stage = stream.events[command.eventId - 1].key.stage;
+            if (command.source == ExecutionCommandSource::Operation) {
+                const auto& operation = stream.operations[command.packetIndex];
+                const int result = operation.geometry.depthRole
+                    ? recordLaneGeometry(*frame, batch, operation, stage - 1u, constants.batch)
+                    : recordExecutionLaneOperation(context, streamHandle, command.receiptId, targets);
+                if (result != success) {
+                    dbgLogError("OIT lane operation: kind=%u stage=%u (%d)",
+                        stream.events[command.eventId - 1].kind, stage, result);
+                    return failed(result);
+                }
+                continue;
+            }
+            const auto& selection = (*stream.terrainSelections)[terrainIndex++];
+            const auto& packet = frame->terrainStagePackets[selection.packetIndex];
+            auto packetBatch = batch;
+            packetBatch.stages[stage - 1u] = laneStage(batch, stage - 1u, selection.geometry);
+            std::shared_ptr<const void> plan;
+            if (const auto prepared = packet.prepareReplay(context, packet.replayPacket, packetBatch, constants, &plan);
+                prepared != Result::Prepared) {
+                dbgLogError("OIT terrain lane: stage=%u prepare failed (%d)", stage, static_cast<int>(prepared));
+                return failed(recordingFailed);
+            }
+            if (const auto replay = recordTerrainTileReplayPlan(context, plan, stage - 1u, TerrainTileAttachmentMode::Load);
+                !replay) {
+                dbgLogError("OIT terrain lane: %s", replay.error().message.c_str());
+                return failed(recordingFailed);
+            }
+        }
+        mcdr_oit_normalization_lane_v1 input{};
+        input.schemaVersion = 1;
+        input.structSize = sizeof(input);
+        input.laneIndex = lane;
+        input.q = {static_cast<mcdr_object*>(batch.q.object), 0, count};
+        for (uint32_t index = 0; index < coefficientCount; ++index)
+            input.coefficients[index] = {static_cast<mcdr_object*>(batch.coefficients[index].object), 0, count};
+        if (const auto result = recordNormalizationLane(context, handle, input);
+            result != MCDR_OIT_NORMALIZATION_RECORDED_UNVERIFIED) {
+            dbgLogError("OIT lane normalization: lane=%u (%d)", lane, result);
+            return failed(result);
+        }
+    }
+    if (const auto result = recordNormalizationAverage(context, handle);
+        result != MCDR_OIT_NORMALIZATION_RECORDED_UNVERIFIED) return failed(result);
+    if (!corrected) return success;
+    ID3D12Resource* normalized{};
+    if (const auto result = resolveNormalizationOutput(context, handle, &normalized);
+        result != MCDR_OIT_NORMALIZATION_SUCCESS) return failed(result);
+    if (prepareSampledTextureWrite(context, corrected, 0, 1) != SampledTextureContentStatus::Ready)
+        return failed(recordingFailed);
+    const auto version = frame->input.identity.resourceVersion;
+    const vanilla::PassResourceUse uses[] = {
+        {nullptr, version, 0, 1, vanilla::ResourceAccess::Read, D3D12_RESOURCE_STATE_COPY_SOURCE,
+            UINT32_MAX, vanilla::ExternalResourceState::Tracked, normalized, D3D12_RESOURCE_STATE_COMMON},
+        {corrected, version, 0, 1, vanilla::ResourceAccess::Write, D3D12_RESOURCE_STATE_COPY_DEST},
+    };
+    vanilla::DeclaredPassToken* pass{};
+    if (vanilla::beginDeclaredPass(context, 0x22b, uses, static_cast<uint32_t>(std::size(uses)), 0, &pass) != success)
+        return failed(recordingFailed);
+    context->commandList->CopyResource(corrected->resource.Get(), normalized);
+    if (vanilla::finishDeclaredPass(context, pass) != success) return failed(recordingFailed);
+    stream.normalizedPublished = true;
+    cancelExecutionTextureCaptures(*frame);
+    return success;
+} catch (...) {
+    auto frame = findExecutionFrameV2(opaqueContext, streamHandle);
+    if (!frame || !frame->executionStreamV2->tileExecutionStarted) throw;
+    vanilla::failRasterInputPass(opaqueContext);
+    markExecutionOperationFailure(*frame);
+    dbgLogError("OIT tile command recording threw an exception");
+    return recordingFailed;
 }
 int beginExecutionStream(void* opaqueContext, void* opaqueFrame, const mcdr_oit_execution_begin_v1& input,
     void** output) {
@@ -2599,7 +3870,8 @@ int beginTerrainStageDraw(void* opaqueContext, void* opaqueFrame,
     }
     const auto token = nextToken.fetch_add(1);
     if (!token) return recordingFailed;
-    frame->terrainStageDraw = TerrainStageDraw{token, input};
+    frame->terrainStageDraw = TerrainStageDraw{token, input,
+        static_cast<uint32_t>(frame->terrainDrawReceipts.size())};
     *output = reinterpret_cast<void*>(token);
     return success;
 }
@@ -2619,7 +3891,8 @@ int prepareTerrainStageDrawReceipt(void* opaqueContext, const void* vertex, uint
     draw.prepared = true;
     return success;
 }
-int confirmTerrainStageDrawReceipt(void* opaqueContext) {
+int confirmTerrainStageDrawReceipt(void* opaqueContext, std::shared_ptr<const void> replayPacket,
+    mcdr::terrain_tile::PacketPreparationV2 prepareReplay, PacketContentStatus content) {
     const auto* context = static_cast<CommandContext*>(opaqueContext);
     if (!context || !context->oitFrameState) return success;
     auto frame = std::static_pointer_cast<Frame>(context->oitFrameState);
@@ -2635,6 +3908,26 @@ int confirmTerrainStageDrawReceipt(void* opaqueContext) {
         frame->terrainStagePackets.size() >= frame->terrainStagePackets.capacity()) return recordingFailed;
     auto* sourceOrdinal = findTerrainSourceOrdinal(frame->terrainStageOrdinals, draw.input.sourceDrawId);
     if (!sourceOrdinal || sourceOrdinal->second == UINT32_MAX) return recordingFailed;
+    const bool historyCapture = frame->bound && frame->boundTerrainVertex;
+    if (frame->terrainDrawReceipts.size() != static_cast<size_t>(draw.terrainReceiptCountAtBegin) +
+            (historyCapture ? 1u : 0u))
+        return reject(recordingFailed, "Terrain stage history receipt count differs");
+    if (historyCapture) {
+        const auto ordinal = draw.terrainReceiptCountAtBegin;
+        const auto& terrainReceipt = frame->terrainDrawReceipts[ordinal];
+        if (draw.input.stage != MCDR_OIT_EXECUTION_STAGE_ACCUMULATE ||
+            terrainReceipt.value.frameSerial != frame->serial ||
+            terrainReceipt.value.producerScopeSerial != draw.input.producerScopeSerial ||
+            terrainReceipt.value.producerKind != MCDR_OIT_SOURCE_TERRAIN ||
+            !sameIdentity(terrainReceipt.value.identity, draw.input.identity) ||
+            ordinal >= frame->terrainDrawPackets.size() || !frame->terrainDrawPackets[ordinal].confirmed ||
+            frame->terrainDrawPackets[ordinal].packet != terrainReceipt.packet)
+            return reject(recordingFailed, "Terrain stage history receipt differs");
+        auto& history = frame->terrainDrawPackets[ordinal];
+        if (history.stagePacketIndex != UINT32_MAX || (replayPacket && replayPacket != history.packet))
+            return reject(recordingFailed, "Terrain history packet already linked");
+        history.stagePacketIndex = static_cast<uint32_t>(frame->terrainStagePackets.size());
+    }
     const auto ordinal = sourceOrdinal->second;
     const uint64_t receiptId = nextToken.fetch_add(1);
     if (!receiptId) return recordingFailed;
@@ -2643,7 +3936,10 @@ int confirmTerrainStageDrawReceipt(void* opaqueContext) {
     receipt.structSize = sizeof(receipt);
     receipt.stage = draw.input.stage;
     receipt.producerKind = MCDR_OIT_SOURCE_TERRAIN;
-    receipt.contentState = MCDR_OIT_EXECUTION_CONTENT_UNSUPPORTED;
+    const bool replayableContent = draw.packet.validated && replayPacket && prepareReplay &&
+        content == PacketContentStatus::Frozen;
+    receipt.contentState = replayableContent ? MCDR_OIT_EXECUTION_CONTENT_ORIGINAL :
+        MCDR_OIT_EXECUTION_CONTENT_UNSUPPORTED;
     receipt.receiptId = receiptId;
     receipt.nativeSequence = frame->nextNativeCommandSequence++;
     receipt.frameSerial = frame->serial;
@@ -2656,10 +3952,33 @@ int confirmTerrainStageDrawReceipt(void* opaqueContext) {
     receipt.pipelineIdentity = reinterpret_cast<uintptr_t>(context->currentPipeline);
     draw.packet.programGeneration = frame->input.programGeneration;
     draw.packet.resourceVersion = frame->input.identity.resourceVersion;
-    draw.packet.shaderGeneration = context->currentPipeline->captureGeneration;
+    draw.packet.shaderGeneration = context->currentPipeline->shaderGeneration;
+    draw.packet.executionV2Ordinal = ordinal;
+    if (replayableContent) {
+        draw.packet.replayPacket = std::move(replayPacket);
+        draw.packet.prepareReplay = prepareReplay;
+        const auto attachment = [&](const Dx12Object* object) -> LaneTexture {
+            if (!object) return {};
+            const auto range = std::ranges::find_if(context->activeAttachmentRanges, [object](const auto& entry) {
+                return entry.object == object && entry.subresourceCount == 1;
+            });
+            return range == context->activeAttachmentRanges.end()
+                ? LaneTexture{} : LaneTexture{object, range->firstSubresource};
+        };
+        draw.packet.depth = attachment(context->activeDepthTarget);
+        for (size_t index = 0; index < context->activeColorTargets.size() && index < draw.packet.colors.size(); ++index)
+            draw.packet.colors[index] = attachment(context->activeColorTargets[index]);
+        const auto slots = terrainTileLaneBindingSlots(context->currentPipeline->terrainTileRoute.get());
+        for (size_t index = 0; index < slots.size(); ++index) {
+            if (slots[index] >= context->graphicsBindings.size()) continue;
+            const auto& binding = context->graphicsBindings[slots[index]];
+            const auto* view = binding.type == 1 ? binding.view : nullptr;
+            if (view && view->hasSrvDesc && view->srvDesc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D)
+                draw.packet.laneReads[index] = {view->sourceTexture, view->srvDesc.Texture2D.MostDetailedMip};
+        }
+    }
     frame->terrainStageReceipts.push_back(receipt);
     frame->terrainStagePackets.push_back(std::move(draw.packet));
-    frame->terrainStagePackets.back().executionV2Ordinal = ordinal;
     sourceOrdinal->first = receipt.sourceDrawId;
     ++sourceOrdinal->second;
     draw.receiptId = receiptId;
@@ -2807,7 +4126,8 @@ int validateTerrainStageReads(void* opaqueContext, const void* terrainBatch, con
     const void* atlas, uint64_t atlasOffset, uint64_t atlasLength, uint32_t sectionCount,
     const void* globals, uint64_t globalsOffset, uint64_t globalsLength,
     const void* candidates, uint64_t candidatesOffset, uint64_t candidatesLength,
-    std::shared_ptr<const void> batchLease) {
+    std::shared_ptr<const void> batchLease, TerrainReplayDraw* replayDraw) {
+    if (replayDraw) *replayDraw = {};
     const auto* context = static_cast<CommandContext*>(opaqueContext);
     if (!context || !context->oitFrameState) return success;
     auto frame = std::static_pointer_cast<Frame>(context->oitFrameState);
@@ -2852,9 +4172,13 @@ int validateTerrainStageReads(void* opaqueContext, const void* terrainBatch, con
             return MCDR_OIT_READSET_MESHLET_UNAVAILABLE;
     }
     bool geometryFound = false, meshletFound = false;
+    uint64_t vertexBytes = 0, primitiveCount = 0;
     for (const auto& range : packet.geometry) {
         if (range.role == 1) {
-            if (range.object != vertex || range.byteOffset < vertexOffset) return MCDR_OIT_READSET_GEOMETRY_UNAVAILABLE;
+            if (range.object != vertex || range.byteOffset < vertexOffset || range.byteLength % (28u * 4u))
+                return MCDR_OIT_READSET_GEOMETRY_UNAVAILABLE;
+            vertexBytes = std::max(vertexBytes, range.byteOffset - vertexOffset + range.byteLength);
+            primitiveCount += range.byteLength / (28u * 2u);
             geometryFound = true;
         } else {
             if (range.object != atlas || range.byteOffset < atlasOffset ||
@@ -2882,6 +4206,11 @@ int validateTerrainStageReads(void* opaqueContext, const void* terrainBatch, con
     if (!meshletFound) return MCDR_OIT_READSET_MESHLET_UNAVAILABLE;
     packet.batchLease = std::move(batchLease);
     packet.validated = true;
+    if (replayDraw && primitiveCount != 0 && primitiveCount <= UINT32_MAX) {
+        *replayDraw = {frame->input.identity, frame->serial, frame->input.programGeneration,
+            vertexBytes, sectionCount, static_cast<uint32_t>(primitiveCount),
+            frame->terrainStageDraw->input.stage - MCDR_OIT_EXECUTION_STAGE_DEPTH_BOUNDS, frame->input.totalBudgetBytes};
+    }
     return success;
 }
 int appendExecutionEvent(void* opaqueContext, void* opaqueStream, const mcdr_oit_execution_event_v1& input,
@@ -3147,9 +4476,17 @@ mcdr::terrain_tile::Result prepareTerrainTilesV3(void* context, void* token,
     if (payload.laneIndex >= mcdr::terrain_tile::laneCount || payload.residentTileCount == 0 ||
         payload.residentTileCount > mcdr::terrain_tile::maximumResidentTiles)
         return Result::InvalidBatch;
-    const auto& packet = frame->terrainDrawPackets[batch.packetOrdinal];
-    if (!packet.prepareV2 || !packet.packet) return Result::UnsupportedContent;
-    return packet.prepareV2(context, packet.packet, payload);
+    const auto& history = frame->terrainDrawPackets[batch.packetOrdinal];
+    if (history.stagePacketIndex >= frame->terrainStagePackets.size()) return Result::UnsupportedContent;
+    auto& packet = frame->terrainStagePackets[history.stagePacketIndex];
+    if (!packet.replayPacket || !packet.prepareReplay || packet.replayPacket != history.packet)
+        return Result::UnsupportedContent;
+    auto& plan = packet.replayPlans[payload.laneIndex];
+    if (plan) return Result::InvalidBatch;
+    const auto constants = uploadTileConstants(*frame, payload);
+    if (!constants) return Result::UnsupportedContent;
+    const auto prepared = packet.prepareReplay(context, packet.replayPacket, payload, *constants, &plan);
+    return prepared == Result::Prepared ? Result::UnsupportedContent : prepared;
 }
 
 int unbindDraw(void* context, void* token) {
@@ -3297,8 +4634,7 @@ int resolveRecordsV4(void* opaqueContext, const mcdr_oit_resolve_v4& input) {
         const auto& packet = packets[index];
         if (packet.schemaVersion != 3 || packet.structSize != sizeof(packet) ||
             packet.packetCount == 0 || packet.packetCount != frame->terrainDrawPackets.size() ||
-            packet.packetOrdinal >= packet.packetCount ||
-            !validTileResolveBatch(packet.payload, *frame)) return invalid;
+            packet.packetOrdinal >= packet.packetCount || !validTileResolveBatch(packet.payload, *frame)) return invalid;
     }
     return unsupported;
 }

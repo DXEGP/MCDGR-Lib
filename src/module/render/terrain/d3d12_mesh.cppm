@@ -19,6 +19,7 @@ module;
 #include "_d3d12_module_prelude.h"
 #include "mcdr_terrain_tile.h"
 #include "mcdr_terrain_tile_adapter.h"
+#include <span>
 
 export module mcdr.d3d12.mesh;
 
@@ -71,6 +72,7 @@ struct TerrainTileReplayBindingV2 {
     int64_t length = 0;
     int32_t texelFormat = 0;
     void* view = nullptr;
+    bool laneAttachment = false;
 };
 
 struct TerrainTileReplayReadV2 {
@@ -84,6 +86,8 @@ struct TerrainTileReplayReadV2 {
 struct TerrainTileReplayInputsV2 {
     std::vector<TerrainTileReplayBindingV2> bindings;
     std::vector<TerrainTileReplayReadV2> reads;
+    D3D12_VIEWPORT sourceViewport{};
+    D3D12_RECT sourceScissor{};
     std::array<uint8_t, 128> pushConstants{};
     uint32_t pushConstantBytes = 0;
     bool pushConstantsValid = false;
@@ -92,6 +96,11 @@ struct TerrainTileReplayInputsV2 {
 enum class TerrainTileAttachmentMode : uint32_t {
     Load = 0,
     Clear = 1,
+};
+
+struct TerrainTileEnvelopeChunk {
+    uint32_t firstVisible = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS destination = 0;
 };
 
 // 创建 mesh 管线（失败返回 mcdr::Error，成功返回句柄）。root signature 用 1.1 版本且
@@ -134,10 +143,15 @@ mcdr::Result<void*> createTerrainTileRoute(uint64_t rootSignature,
 void destroyTerrainTileRoute(void* route);
 mcdr::Result<void> bindTerrainTileRoute(void* capturePipeline, void* route);
 mcdr::Result<void> bindTerrainTilePipeline(void* route, void* tilePipeline);
+mcdr::Result<void> bindTerrainTileEnvelopeV1(void* route, const void* dxil, uint32_t bytes);
 mcdr::Result<void> bindTerrainTileStageV2(void* source, void* route,
-    const mcdr_terrain_tile_stage_v2& contract);
+    const mcdr_terrain_tile_stage_v2& contract, std::span<const uint32_t> laneRegisters = {});
+inline constexpr uint32_t terrainOpaqueSeedStage = 3;
+mcdr::Result<void> bindTerrainOpaqueSeedV1(void* source, void* route, uint64_t programGeneration,
+    uint32_t quadsPerMeshlet);
 mcdr::terrain_tile::StageAdapterDescription describeTerrainTileStageAdapter(
     const std::shared_ptr<const void>& routeLease, uint64_t sourceIdentity, uint64_t sourceGeneration);
+std::span<const uint32_t> terrainTileLaneBindingSlots(const void* route);
 
 // 本机是否具备 mesh 管线的最小条件（12_2 + mesh shader tier ≥ 1 + DXC 能编 ms_6_x
 // + 能拿到 ID3D12Device2）。why 收到不满足的原因（可为 nullptr）。
@@ -165,16 +179,33 @@ mcdr::Result<void*> prepareTerrainWorkGraph(void* context, void* program,
     void* const* buffers, const uint64_t* offsets, const uint64_t* lengths,
     uint32_t bindingCount, uint32_t sectionCount, uint32_t meshletCapacity);
 mcdr::Result<void> drawTerrainWorkGraph(void* context, void* batch,
-    void* vertexBuffer, uint64_t vertexOffset);
+    void* vertexBuffer, uint64_t vertexOffset, uint64_t vertexBytes = 0);
 mcdr::terrain_tile::Result prepareTerrainTilePacket(void* context,
     const std::shared_ptr<const void>& packet, const mcdr::terrain_tile::Batch& batch);
 mcdr::terrain_tile::Result prepareTerrainTilePacketV2(void* context,
-    const std::shared_ptr<const void>& packet, const mcdr::terrain_tile::BatchV2& batch);
+    const std::shared_ptr<const void>& packet, const mcdr::terrain_tile::BatchV2& batch,
+    const mcdr::terrain_tile::ResourceRef& opaqueSeedDepth, mcdr::terrain_tile::ConstantAddresses constants,
+    std::shared_ptr<const void>* replayPlan);
+mcdr::Result<void> recordTerrainTileReplayPlan(void* context,
+    const std::shared_ptr<const void>& replayPlan, uint32_t stageIndex,
+    TerrainTileAttachmentMode attachmentMode);
+mcdr::Result<void> initializeTerrainTileLane(void* context, const mcdr::terrain_tile::BatchV2& batch);
 mcdr::Result<void> recordTerrainTileReplay(void* context, void* route,
     const mcdr::terrain_tile::BatchV2& batch, const TerrainTileGeometryV2& geometry,
     const TerrainTileReplayInputsV2& inputs, uint32_t stageIndex, TerrainTileAttachmentMode attachmentMode);
 mcdr::Result<void> validateTerrainTileReplay(void* route,
-    const mcdr::terrain_tile::BatchV2& batch);
+    const mcdr::terrain_tile::BatchV2& batch, const TerrainTileReplayInputsV2& inputs,
+    uint32_t stageIndex);
+mcdr::Result<void> validateTerrainOpaqueSeedReplay(void* route,
+    const mcdr::terrain_tile::BatchV2& batch, const TerrainTileReplayInputsV2& inputs,
+    const mcdr::terrain_tile::ResourceRef& depth);
+mcdr::Result<void> recordTerrainOpaqueSeedReplay(void* context, void* route,
+    const mcdr::terrain_tile::BatchV2& batch, const TerrainTileGeometryV2& geometry,
+    const TerrainTileReplayInputsV2& inputs, const mcdr::terrain_tile::ResourceRef& depth);
+bool hasTerrainTileEnvelopePipeline(const void* route);
+mcdr::Result<void> recordTerrainTileEnvelopes(void* context, const void* route,
+    const mcdr::terrain_tile::BatchV2& batch, const TerrainTileGeometryV2& geometry,
+    const TerrainTileReplayInputsV2& inputs, const TerrainTileEnvelopeChunk& chunk);
 void destroyTerrainBatch(void* batch);
 
 }  // export namespace d3d12_mc —— 导出接口到此为止

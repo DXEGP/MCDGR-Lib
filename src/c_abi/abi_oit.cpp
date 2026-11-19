@@ -186,6 +186,13 @@ int32_t MCDR_CALL mcdr_dx12OitAbortExecutionStreamV2(mcdr_command_ctx* context, 
         return d3d12_mc::oit::abortExecutionStreamV2(context, stream);
     });
 }
+int32_t MCDR_CALL mcdr_dx12OitExecuteTileStreamV2(mcdr_command_ctx* context, void* stream,
+    const void* fourLaneBatches, mcdr_object* corrected) {
+    return callOit("oit.execution.v2.execute", [&] {
+        return d3d12_mc::oit::executeTileStreamV2(context, stream,
+            static_cast<const mcdr::terrain_tile::BatchV2*>(fourLaneBatches), corrected);
+    });
+}
 int32_t MCDR_CALL mcdr_dx12OitQueryExecutionStreamV1(
     mcdr_command_ctx* context, void* stream, mcdr_oit_execution_info_v1* output) {
     if (output) *output = {};

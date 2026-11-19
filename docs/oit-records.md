@@ -2,21 +2,23 @@
 
 当前 native 实现提供有界 fragment records、不可变 producer/primitive 语义、GPU compact、逐 surface 材质 RGB 历史与 Resolve V3。生产主循环的启用由 JVM 帧编排负责；本模块不会自行替换原透明合成，alpha/coverage AA 与 FG 分层尚未实现。
 
-`include/mcdr_abi.h` 是 CPU ABI、producer kind、结果码与状态位的唯一来源。顶层 ABI 25；Resolve 使用 schema 3，terrain Begin/metadata/draw 使用 schema 2，其余 OIT CPU 契约保持 schema 1。`include/mcdr_oit_shader.h` 独占 shader ABI 5、144 B record、8 B pixel 存储与 shader contract hash。`McdrOitFragmentV1`、`AppendV1` 保留源码名称。调用内复制 metadata，不保留 JVM Arena 指针。
+`include/mcdr_abi.h` 是 CPU ABI、producer kind、结果码与状态位的唯一来源。Resolve 使用 schema 3，terrain Begin/metadata/draw 使用 schema 2，执行流使用 V2 契约。`include/mcdr_oit_shader.h` 定义 shader ABI 5、144 B record、8 B pixel 存储与 shader contract hash。调用内复制 metadata，JVM Arena 指针只在调用期间有效。
 
 世界输出使用 `mcdr_world_output_input` schema 3、360 B，尾部追加 `sourceStage` 与零值 `reservedStage`。`COMPLETE_WORLD` 在 WorldReady 后运行整幅世界重建；`OPAQUE_BEFORE_COMPOSITE` 在 Recording 内对不透明层运行曝光、可选 provider mask、重建与场景转存，随后保持 OpaquePost，允许继续录制云、透明物体、粒子、天气及 OIT Resolve。它不要求透明捕获已 seal。完整世界合成完成后，调用 WorldReady 将 OpaquePost 转为 WorldPost，再进入 GUI；该调用检查不透明输出已完成，禁止第二次重建。首次无前帧时仍按原规则复制当前不透明层，透明合成的顺序保持一致。普通 draw、terrain WG 与 OIT 继续使用同一冻结资源版本和 declared-pass 调度。
 
-Vanilla frame 默认仅保存内嵌的 world-depth 注册、clear/write 计数、注册前是否发生 depth 命令和关闭状态；未启用 opaque seed consumer 时不分配事件表、descriptor heap、packet 或逐 draw 租约。world depth 只接受 `setRasterMotionTarget` 的真实注册，注册前发生 depth 命令会阻止后续 arm，注册后其它 DSV 不计入 seed。
+Vanilla frame 保存实际 D32 深度纹理和 clear/write 计数。ABI27 的 `mcdr_dx12VanillaRegisterWorldDepthV1` 在世界帧开始后绑定纹理、录制身份和 fence，登记完成后才进入世界 clear 和 draw。登记拒绝迟到、换目标和失效录制。arm、seal、read 和 OIT 校验共用这份登记。未启用 opaque seed consumer 时只保留帧级租约和计数。
 
-native 模块内部的 `armWorldDepthSeedCaptureV1` 要求在首个 depth clear/write 前调用，显式提交帧/recording/fence/submission 身份、真实 world depth、已发布的 frame-program generation、预算、maxEvents 和完整 graphics observer。已有 observer 时返回 Busy，不覆盖对方；晚启用返回 LateArm。创建失败只释放候选，不改变普通帧或绑定 observer。成功后由该入口绑定所给 observer，seal/cancel 只解绑同 owner、回调、预算和内容策略的绑定。graphics observer 默认 `FactsOnly`，不会在当前没有 executor 的情况下触发内容冻结；未来 executor 必须显式请求 `FreezeBindings` 并在同 recording 消费冻结绑定。重复 seal 仍核对帧与 recording 身份，过期时返回 StaleRecording；已封口 capture 的 cancel 返回原状态，不把 Ready 改报成 Cancelled。当前生产代码没有 arm 调用，也没有 opaque seed executor，因此 `GAP_OPAQUE_SEED` 保持缺失。
+ABI28 的 `mcdr_dx12VanillaArmWorldDepthSeedV1` 在深度登记后、首个 clear/write 前开采集。journal 归对应录制所有，使用已登记的纹理、fence 和已发布程序代际。observer 只接收写入该纹理的 draw，逐条确认实际 packet。零顶点或实例的命令经过确认并从深度事件中排除。采集采用 `FactsOnly`，绑定冻结和可执行 adapter 另由对应能力判定。
 
-arm 后按实际事件数量增长 `WorldDepthSeedJournal`，vector 扩容前申请预算，迁移期间旧/新容量同时计费，超过 maxEvents 或预算使 recordingFailed。depth owner 只创建一次，journal、consumer 与实际 packet 由 command-list recording leases 持有到对应 fence；reset/cancel 不提前释放，提交未知保留原租约。事件保存实际 PSO 的强引用、不可变 pipeline 创建 generation、consumer program generation、真实 depth 子资源/DSV 描述和源句柄；journal 另保留不复用的等价 DSV。draw packet 必须来自 arm 提供的 observer，并匹配实际 recording、PSO 与命令类型，缺项使 capture incomplete 并拒绝提交。资源保活不冻结内容，四 lane replay 仍需完整内容冻结和执行契约。
+arm 后按实际事件数量增长 `WorldDepthSeedJournal`。vector 扩容前申请预算，迁移期间旧/新容量同时计费。达到事件上限或预算耗尽时结束采集，保留原 draw。depth owner 只创建一次，journal、consumer 与实际 packet 由 command-list recording leases 持有到对应 fence，提交未知时继续保留。事件保存实际 PSO、pipeline generation、consumer program generation、真实 depth 子资源和源 DSV，journal 另持有独立的等价 DSV。draw packet 必须来自 arm 提供的 observer 并匹配实际 recording、PSO 与命令类型。发现录制不一致时拒绝提交。
 
-实际 IA、indirect、mesh 与主 `drawTerrainWorkGraph` 的 ExecuteIndirect 都报告 depth writer；WG 使用真实 Mesh 命令类型和原 graphics packet，tile replay 不反写 opaque seed。`LevelRendererOitProducerMixin` 在 `executeOit` HEAD 调用 `captureOpaqueAndBeginRecords`，先复制不透明输入，再进入 native OIT `beginFrame`。seed 在该 `beginFrame` 的首次 OIT GPU 命令前封口并移交给 OIT Frame；之后的 water mask、depth cull、accumulate 不再进入 seed。`prepareComposite` 才调用的 `prepareWorldOutput(OPAQUE_BEFORE_COMPOSITE)` 已晚于这些命令，只检查已 arm capture 是否漏封口，不再补封口。没有 OIT 或没有 arm 的普通帧继续使用轻量路径，WorldReady 关闭轻量记录；已 arm 却跳过 OIT begin 的路径取消 capture 并拒绝本帧。
+实际 IA、indirect、mesh 与 `drawTerrainWorkGraph` 的 ExecuteIndirect 都报告 depth writer。`LevelRendererOitProducerMixin` 在 `executeOit` 入口封口，随后复制不透明输入并进入 native OIT `beginFrame`。water mask、depth cull、accumulate 在封口之后录制。如果本帧跳过 OIT，无 pending draw 的 `FactsOnly` journal 在世界输出或 WorldReady 时以 Incomplete 退休。
+
+ABI32 的 `mcdr_dx12CreateOpaqueSeedPipelineV1` 使用原 IA 管线的输入布局、材质绑定和光栅深度状态创建 depth-only PSO，由原管线持有。tile root signature 增加 `b0, space3` 的四个 DWORD 和 `b1, space3` 的 batch CBV。journal 仍采集绘制事实。冻结绑定和几何范围后，执行器才能在各 lane 按原顺序录制。
 
 `WorldDepthSeedJournalV1` 是 native vanilla 模块导出的只读事实，包含完整 FrameInput、recording identity、fence/submission、真实 world depth owner、独立 DSV heap/句柄和有序 clear/draw 事件。事件携带 clear depth/rect、depth 子资源与源 DSV、实际 PSO 强引用、pipeline identity、shader/program generation、命令族/ordinal 和原 packet。`readWorldDepthSeedCaptureV1` 每次清空输出，核对同 recording/fence/submission 与 frame/depth/program 身份，仅在 closed、Ready 且录制正常时返回 const journal；打开状态返回 Busy，过期返回 StaleRecording，取消、预算与录制失败保留对应 typed 状态。OIT begin 验证 journal 与本 Frame 的身份及事件事实，再保存共享所有权。opaqueDepth 是 JVM 已复制的不透明纹理，真实 seed depth 按 world-depth 注册身份验证，不拿复制纹理冒充原 DSV。
 
-生产 arm 需要未来 executor 在 world frame 已冻结、真实 world depth 已注册且首次 clear/write 之前建立 consumer 和完整 observer，并由 arm 保留 owner；到 OIT begin 封口后，consumer 根据只读 journal 继续冻结内容与四 lane 执行。目前没有这个 executor，生产不自动 arm，也不启用昂贵逐 draw 捕获。journal 与 OIT Frame 的引用不会早于 recording lease/fence 释放；取消与 reset 只关闭入口，提交未知继续保留实际资源。seal 只确认已收集事件，不发布 executor 成功，也不清 `GAP_OPAQUE_SEED`、normalization 或覆盖缺项。
+ABI29 在 `executeOit` 入口封口，随后 OIT begin 取得只读 journal。采集容量或 packet 预算耗尽时关闭事实采集，保留原 draw 和 `GAP_OPAQUE_SEED`。V2 seal 验证完整 clear 与命令顺序，成功时清除该缺项。内容冻结、adapter 和 normalization 各自报告缺项。
 
 ```mermaid
 flowchart LR
@@ -45,15 +47,29 @@ metadata 行容量不足使用专用结果 `MCDR_OIT_RESULT_METADATA_CAPACITY_EX
 
 terrain 用 80 B GPU section 表代替逐三角形 previous：保存 surface/material generation、逻辑 primitive 范围、真实 VBO 顶点范围和 previous 相对原点。metadata 同步复制 CPU section 行并保留真实 VBO 租约；实际 terrain draw 核对 VBO/偏移后消费绑定。MS 从同代静态顶点计算 previous clip，材质 previous 复用同一 UV；几何 generation 变化清 geometry/material previous，材质或 texture generation 变化只清 material previous。`identity.z` 最高位标识 terrain，其余 31 位为帧内逻辑 primitive，通过有序 prefix 二分定位 section，且同时核对 source kind。
 
-terrain tile replay 的资源状态由 vanilla declared-pass scheduler 按真实资源范围推进：binning 的 initialize/work-graph、prefix、scatter 分别声明 RAW/WAR/UAV 前沿；commands/control 在 scatter 结束前从 UAV 转为 INDIRECT_ARGUMENT。每个 replay stage 声明其实际 RT/DSV 写集、捕获的材质与几何读取及间接参数读取，结束回到 COMMON；Resolve 再声明 scratch/coefficients/q 的 shader 读取和输出 UAV。stage 0 只写原 bounds，stage 1 按 shader 布局写 1/2/4 个 coefficient targets，stage 2 只写 Q；输出通过对象身份检查，不能把 cull、terrain/cloud depth 或 normalization 的结果塞进几何 stage 的 MRT。tile SRV 始终使用 Texture2DArray，单 resident tile 也不切换维度。
+terrain tile replay 通过 vanilla declared-pass scheduler 声明 binning 的资源读写和 UAV 依赖。scatter 结束前将 commands/control 转为 INDIRECT_ARGUMENT。每个阶段声明实际 RT/DSV 写集、材质与几何读取及间接参数读取，目标结束时回到 COMMON。Depth Bounds 写原 bounds，Transmittance 读取 cull 后的 bounds 并按 shader 布局写 1/2/4 个 coefficient targets，Accumulate 读取 cull 后的 bounds 和 coefficients，再写 Q。每个 coefficient scratch 使用 68×68、单 mip、单采样的 Texture2DArray 层，单 tile 也使用数组 SRV。分桶 viewport 必须匹配原 draw，回放保留原深度范围。每个数组层绑定自己平移后的原 scissor，裁到该 tile 的有效范围及 guard。
 
-replay 从 packet 保存的绑定、push constants 和读取范围恢复输入，不读取打开新 pass 后已清空的 context 绑定。输入闭包只固定绑定事实；内容冻结还要求原 owner 的不可复用范围租约或实际副本。当前 `BatchV2` 没有独立 depth/cull/normalization 事件，正确映射后仍在任何 binning/replay GPU 命令前返回 `UnsupportedContent`。`McdrOitTileInfoV1.w` 保持 0，Resolve V3 继续输出原版 Q 量纲，原 composite 只归一化一次；四 lane 的 premultiplied 输出必须使用独立的版本化消费契约。
+每份 replay plan 固定使用原 draw packet 注册的 stage、tile PSO 和 root signature。录制前检查 stage 和材质布局。batch owner 持有冻结内容，通过录制租约保留到实际 fence 完成。
+
+ABI30 将 envelope compute PSO 绑到同一 stage route。compute 读取冻结的 VS 参数、顶点、section 和 meshlet atlas，按实际 Work Graph visible header 截断尾项，在 DEFAULT UAV buffer 中写每个 meshlet 的 64 B 屏幕包围记录。每次按最多 4096 条记录执行 envelope、分类、prefix、scatter 和间接 mesh。分桶传递原 section、descriptor 和 primitive 身份。tile 包围缓冲的 UAV 写入先转为 SRV，再供分类和 scatter 读取。共享附件只在整条回放的首次 chunk 按调用方模式初始化，后续 chunk 保留内容。
+
+各阶段的回放 packet 从本次 draw 已校验的 section 读集取得顶点跨度和 primitive 数量。只有同代 tile adapter 已注册且 observer 显式请求 `FreezeBindings` 时才打开冻结。原 draw 成功且内容冻结成功后，阶段回执持有该 packet，执行流按阶段回执索引定位它。旧 V2/V3 批次入口通过 Accumulate 历史回执定位关联阶段，仍保留旧 packet ordinal 语义。
+
+replay 从 packet 保存的绑定、push constants 和读取范围恢复输入。terrain packet 冻结实际几何和材质读取范围。visible 和 arguments 直接使用生成它们的 `TerrainBatch` 强租约，只有最后一个外部租约释放后批次才可复用。本次录制的 fence 持有该租约，因此两份 GPU 输出无需复制。graphics input 的 buffer 缺少更窄的绑定范围时按真实对象大小冻结。无法表达的 SRV 类型、越界范围或预算不足返回 `UnsupportedContent`。`BatchV2` 缺少 depth、cull 与 normalization 的独立事件字段，仍在录制 binning/replay 前返回 `UnsupportedContent`。Resolve V3 继续输出原版 Q 量纲，四 lane 的 premultiplied 输出使用独立消费契约。
 
 原始 terrain draw packet 数量、四个采样 lane 与 resident tile batch 分别独立计数。旧 `BatchV3` 只增加 packet 选择，没有补齐执行事件；准备入口保留身份与资源范围检查，Resolve V4 校验输入后返回 unavailable，不通过每 packet 的布尔值或固定四个 packet 发布执行完成。完整 executor 的成功发布必须同时确认事件顺序、各 packet/lane/batch、资源版本与 normalization 输出。
 
 `mcdr_dx12OitAppendExecutionOperationEventV1` 把原 draw 取得的 operation receipt 关联到 V2 事件。入口只接受同一 Frame、同一 recording 中已 Finished 且 confirmed/inputPassCompleted 的真实 packet，逐字段匹配 receipt、事件 key/kind、PSO 和 generation，并拒绝重复消费。调用方的事件 `receiptCount/receiptIds` 保持零；query、manifest 和 seal 的 expected/observed 继续采用 terrain receipt 计数。operation packet 由 stream 的独立表保留 shared ownership，Frame receipt 索引只保存本 Frame 拥有的 operation/packet 指针，取消未录制操作时清理索引。索引开销随 packet 计入共享预算，独立事件表与有序命令表按 maxEvents/maxReceipts 计入 stream 预算；登记操作只在预留容量内发布事件和 packet，不增加 GPU 内容复制。
 
-V2 seal 将 terrain receipt 和 operation packet 按共享 `nativeSequence` 合并为不可变命令表，检查每个 Finished operation 的 confirmed packet 恰好关联一次；缺失的 operation receipt 设置 `GAP_RECEIPT`，并可通过 seal 的 `receiptId` 返回实际缺项。该表确认真实命令归属与顺序，四 lane executor、冻结内容、adapter、opaque seed 与 normalization 缺项继续保留，seal 仍返回 Unavailable。普通 graphics operation packet 会保存 terrain tile adapter 的 source/tile 身份、代际、shader contract、stage、route lease 和注册状态；`Registered` 只说明 source 与 tile 的 root/PSO contract 已登记，adapter execution state 在完整 executor 消费冻结输入前保持 `Unavailable`，不会被提升为 `Ready`。
+V2 seal 将 terrain receipt 和 operation packet 按共享 `nativeSequence` 合并为不可变命令表，检查每个 Finished operation 的 confirmed packet 恰好关联一次。缺失的 operation receipt 设置 `GAP_RECEIPT`，seal 通过 `receiptId` 报告缺项。逐事件核对原始 DSV、RTV、采样槽位、深度和 bounds 的初始化顺序，以及 Composite 所读的 Q 和系数。完整事件流返回 `SEALED`，可提交给 `mcdr_dx12OitExecuteTileStreamV2`。
+
+depth copy、bounds copy/cull 和 water mask 的 V2 资源行使用 `OBJECT_ONLY`。每行携带实际 backing texture、同一帧资源版本和单个子资源，owner 与内容版本字段置零。seal 按 native 命令顺序核对原 packet 的 SRV/RTV/DSV 和读写角色。bounds copy 与 cull 使用同一 pass 的原 bounds 和 culled bounds，water mask 使用同 pass 里深度 copy 的目标。对象、子资源或命令顺序不匹配时设置 `GAP_READ_SET`，并报告对应 receipt。冻结内容与 shader adapter 继续由各自的缺项表示。
+
+通过 ABI31 专用入口创建的 lane operation PSO 保存源码认证对应的 kind、program generation 和 Projection binding。copy plan 只接受同代、全尺寸且方向一致的原版 blit。native 的 `recordExecutionLaneOperation` 按 receipt 选择源和目标角色，通过 declared pass 复制 68×68 的全部 resident slices。bounds cull 使用在原 draw 前冻结的 64 字节 Projection，加载 bounds 和已初始化的 culled bounds、main depth，使用 `GREATER_EQUAL` 在各层写 culled bounds 和深度。剔除写入按实际颜色和深度附件登记。资源随实际录制租约在 fence 完成后退休。
+
+ABI34 的执行入口每次接收同一组 tile 的四个 lane，依原命令顺序重建 opaque depth、地形和普通 IA OIT，再按每 lane 的 Q 和 1／2／4 张系数图归一化。每帧用 64 KiB 上传页保存 256 B 对齐的 draw CBV 与 lane CBV。地形、opaque seed 和水遮罩复用同一个 lane CBV，opaque seed 和水遮罩按 scratch 深度数组复用 DSV。计算程序按 shader generation 成组准备，输入纹理通过实际计算 PSO 的设备身份核对，以适配由 interposer 创建设备的路径。
+
+累积区域覆盖整幅后，最后一次调用才把四路平均写入调用方的 RGBA32_FLOAT 输出。预算不足时将执行流标为 Unavailable，并由原 Composite 消费当帧结果。已录制的 scratch 工作仍保留到实际 fence 完成。命令录制错误由提交入口拒绝整帧。
 
 内容冻结或 tile 事件缺失返回 typed unavailable，原始 draw 继续执行。capture 绑定、OIT 帧身份或 packet 注册校验失败属于录制契约错误，必须中止本帧；不得吞掉错误后继续使用已经绑定的 capture PSO。
 

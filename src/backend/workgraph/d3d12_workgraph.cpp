@@ -57,12 +57,11 @@ mcdr::Result<std::shared_ptr<Instance>> retainInstanceForRecording(Handle& handl
                                                                  d3d12_mc::CommandContext& context) {
     std::shared_ptr<Instance> instance;
     for (const auto& candidate : handle.instances) {
-        if (candidate.use_count() == 1) {
-            instance = candidate;
-            break;
-        }
         if (candidate->recordingFence == context.fence.Get() &&
-            candidate->recordingSerial == context.fenceValue + 1) return candidate;
+            candidate->recordingSerial == context.fenceValue + 1 && candidate.use_count() > 1)
+            return candidate;
+        if (!instance && candidate.use_count() == 1)
+            instance = candidate;
     }
     if (!instance) {
         if (handle.program->backingBytes != 0 &&
@@ -255,13 +254,13 @@ mcdr::Result<void> dispatchBuffers(void* opaqueContext, void* opaqueProgram, con
         (recordCount != 0 && (!records || reinterpret_cast<uintptr_t>(records) % handle->program->recordAlignment != 0))) {
         return mcdr::err("workgraph.dispatchBuffers", "Invalid context or bindings");
     }
-    std::vector<uint64_t> addresses(bindingCount);
+    std::array<uint64_t, 32> addresses{};
     struct ResourceState {
         d3d12_mc::Dx12Object* object;
         D3D12_RESOURCE_STATES state;
     };
-    std::vector<ResourceState> resourceStates;
-    resourceStates.reserve(bindingCount);
+    std::array<ResourceState, 32> resourceStates{};
+    uint32_t resourceStateCount = 0;
     const auto deviceMatches = [&](d3d12_mc::Dx12Object* object) {
         ComPtr<ID3D12Device> owner;
         return object && object->resource &&
@@ -288,12 +287,12 @@ mcdr::Result<void> dispatchBuffers(void* opaqueContext, void* opaqueProgram, con
         const auto requiredState = kind == 0 ? D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER :
             (kind == 1 ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         const bool requiresUav = (requiredState & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) != 0;
-        auto existing = std::find_if(resourceStates.begin(), resourceStates.end(),
+        auto existing = std::find_if(resourceStates.begin(), resourceStates.begin() + resourceStateCount,
             [resource = buffer->resource.Get()](const ResourceState& entry) {
                 return entry.object->resource.Get() == resource;
             });
-        if (existing == resourceStates.end()) {
-            resourceStates.push_back({buffer, requiredState});
+        if (existing == resourceStates.begin() + resourceStateCount) {
+            resourceStates[resourceStateCount++] = {buffer, requiredState};
         } else {
             const bool existingUav = (existing->state & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) != 0;
             if (requiresUav != existingUav && (requiresUav || existingUav)) {
@@ -305,7 +304,8 @@ mcdr::Result<void> dispatchBuffers(void* opaqueContext, void* opaqueProgram, con
     if (recordCount == 0) return {};
     for (uint32_t index = 0; index < bindingCount; ++index)
         d3d12_mc::retainObjectForRecording(context, buffers[index]);
-    for (const auto& resource : resourceStates) {
+    for (uint32_t index = 0; index < resourceStateCount; ++index) {
+        const auto& resource = resourceStates[index];
         if (resource.object->heapType != D3D12_HEAP_TYPE_UPLOAD)
             d3d12_mc::transitionBufferTo(context, resource.object, resource.state);
     }
@@ -337,8 +337,8 @@ static mcdr::Result<void> dispatchInput(void* opaqueContext, void* opaqueProgram
             return mcdr::err("workgraph.dispatch", "Invalid root buffer address alignment");
         }
     }
-    ComPtr<ID3D12GraphicsCommandList10> list;
-    if (FAILED(context->commandList->QueryInterface(IID_PPV_ARGS(&list)))) {
+    auto* list = context->workGraphCommandList;
+    if (!list) {
         return mcdr::err("workgraph.dispatch", "Work Graph command list interface is unavailable");
     }
     auto acquired = retainInstanceForRecording(*handle, *context);
@@ -420,7 +420,7 @@ mcdr::Result<void> dispatchGpuBuffers(void* opaqueContext, void* opaqueProgram, 
         inputBytes > static_cast<uint64_t>(input->size) - inputOffset) {
         return mcdr::err("workgraph.dispatchGpuBuffers", "Invalid GPU input buffer span or alignment");
     }
-    std::vector<uint64_t> addresses(bindingCount);
+    std::array<uint64_t, 32> addresses{};
     for (uint32_t index = 0; index < bindingCount; ++index) {
         auto* buffer = static_cast<Dx12Object*>(buffers[index]);
         const auto kind = handle->program->bindings[index].kind;

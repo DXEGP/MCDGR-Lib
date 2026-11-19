@@ -25,6 +25,7 @@ enum class Result : uint32_t {
     FrameNotSealed,
     Consumed,
     RecordingFailed,
+    Prepared,
 };
 
 enum class ReplayStage : uint32_t {
@@ -134,6 +135,26 @@ struct BatchV3 {
     BatchV2 payload{};
 };
 
+struct BatchConstants {
+    uint32_t schema, resident, lane, flags;
+    float viewport[4];
+    uint32_t regions[maximumResidentTiles][4];
+
+    explicit BatchConstants(const BatchV2& batch)
+        : schema(1), resident(batch.residentTileCount), lane(batch.laneIndex), flags(batch.flags),
+          viewport{batch.sourceViewport[0], batch.sourceViewport[1], batch.sourceViewport[2], batch.sourceViewport[3]},
+          regions{} {
+        for (uint32_t index = 0; index < resident; ++index) {
+            const auto& tile = batch.tiles[index];
+            auto& region = regions[index];
+            region[0] = tile.originX;
+            region[1] = tile.originY;
+            region[2] = tile.effectiveWidth;
+            region[3] = tile.effectiveHeight;
+        }
+    }
+};
+static_assert(sizeof(BatchConstants) == 288);
 
 static_assert(offsetof(BatchV2, sourceViewport) % alignof(float) == 0);
 static_assert(offsetof(BatchV2, tiles) > offsetof(BatchV2, sourceViewport));
@@ -142,7 +163,12 @@ static_assert(offsetof(BatchV3, payload) == 16);
 static_assert(sizeof(BatchV3) == 1304);
 
 using PacketPreparation = Result (*)(void* context, const std::shared_ptr<const void>& packet, const Batch& batch);
-using PacketPreparationV2 = Result (*)(void* context, const std::shared_ptr<const void>& packet, const BatchV2& batch);
+struct ConstantAddresses {
+    uint64_t draw;
+    uint64_t batch;
+};
+using PacketPreparationV2 = Result (*)(void* context, const std::shared_ptr<const void>& packet,
+    const BatchV2& batch, ConstantAddresses constants, std::shared_ptr<const void>* replayPlan);
 
 
 static_assert(sizeof(DrawRoute) == 16);

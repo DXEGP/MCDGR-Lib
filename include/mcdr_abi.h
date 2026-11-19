@@ -50,10 +50,11 @@ extern "C" {
 //
 // Current append-only milestones are reflected in the matching Kotlin mirrors:
 // SR/FG dispatch contracts, transactional frame configuration, graphics/OIT
-// recording contracts, and terrain tile stage registration. Any new aggregate or
-// signature must update this version, MCDR_Layout.kt, MCDR_ABI.kt and abi_meta.cpp
-// together; the loader rejects a partial update before device creation.
-#define MCDR_ABI_VERSION 26u
+// recording contracts, bounded vertex slice and lane-local terrain bindings (ABI33),
+// opaque terrain seed routes and bounded mesh draw (ABI34).
+// Any new aggregate or signature must update the matching Kotlin mirrors and native metadata.
+// The loader rejects a partial update before device creation.
+#define MCDR_ABI_VERSION 34u
 
 // The same value at runtime, so a stale Java-side constant cannot be optimised
 // away and a mismatched pair fails at load time rather than at first draw.
@@ -195,6 +196,20 @@ typedef struct mcdr_pipeline_desc {
     int32_t _pad2;
     const mcdr_pipeline_binding_desc* bindings;
 } mcdr_pipeline_desc;
+
+#define MCDR_OIT_LANE_DEPTH_COPY 1u
+#define MCDR_OIT_LANE_BOUNDS_COPY 2u
+#define MCDR_OIT_LANE_BOUNDS_CULL 3u
+MCDR_API mcdr_pipeline* MCDR_CALL mcdr_dx12CreateOitLaneOperationPipelineV1(
+    const mcdr_pipeline_desc* descriptor, uint32_t kind, uint64_t programGeneration, uint32_t projectionBinding);
+MCDR_API mcdr_pipeline* MCDR_CALL mcdr_dx12CreateOpaqueSeedPipelineV1(
+    const mcdr_pipeline_desc* descriptor, int32_t pushConstantBytes, const void* tileVertex, int32_t tileVertexBytes,
+    const void* tileFragment, int32_t tileFragmentBytes, uint64_t programGeneration);
+MCDR_API mcdr_pipeline* MCDR_CALL mcdr_dx12CreateOitTileIAPipelineV1(
+    const mcdr_pipeline_desc* descriptor, int32_t pushConstantBytes, const void* tileVertex, int32_t tileVertexBytes,
+    const void* tileFragment, int32_t tileFragmentBytes, uint64_t programGeneration,
+    const uint32_t* laneRegisters, uint32_t stage);
+MCDR_API int32_t MCDR_CALL mcdr_dx12AttachOitTileIARouteV1(mcdr_pipeline* source, mcdr_pipeline* base);
 
 // ---------------------------------------------------------------------------
 // P72: mesh-shader (amplification / mesh) pipeline description.
@@ -1393,6 +1408,8 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12SetViewport(mcdr_command_ctx* ctx, int32_t x
                                                 int32_t height);
 MCDR_API int32_t MCDR_CALL mcdr_dx12SetVertexBuffer(mcdr_command_ctx* ctx, int32_t slot, mcdr_object* buffer,
                                                     int64_t offset, int32_t stride);
+MCDR_API int32_t MCDR_CALL mcdr_dx12SetVertexBufferRangeV1(mcdr_command_ctx* ctx, int32_t slot,
+    mcdr_object* buffer, int64_t offset, int64_t length, int32_t stride);
 MCDR_API int32_t MCDR_CALL mcdr_dx12SetIndexBuffer(mcdr_command_ctx* ctx, mcdr_object* buffer,
                                                    int32_t indexType);
 
@@ -1856,8 +1873,14 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12BindTerrainTileRouteV1(
     mcdr_pipeline* capturePipeline, void* route);
 MCDR_API int32_t MCDR_CALL mcdr_dx12BindTerrainTilePipelineV1(
     void* route, mcdr_pipeline* tilePipeline);
+MCDR_API int32_t MCDR_CALL mcdr_dx12BindTerrainTileEnvelopeV1(
+    void* route, const void* dxil, uint32_t bytes);
 MCDR_API int32_t MCDR_CALL mcdr_dx12BindTerrainTileStageV2(
     mcdr_pipeline* source, void* route, const mcdr_terrain_tile_stage_v2* contract);
+MCDR_API int32_t MCDR_CALL mcdr_dx12BindTerrainTileStageV3(
+    mcdr_pipeline* source, void* route, const mcdr_terrain_tile_stage_v2* contract, const uint32_t laneRegisters[5]);
+MCDR_API int32_t MCDR_CALL mcdr_dx12BindTerrainOpaqueSeedV1(
+    mcdr_pipeline* source, void* route, uint64_t programGeneration, uint32_t quadsPerMeshlet);
 MCDR_API void MCDR_CALL mcdr_dx12DestroyTerrainTileRouteV1(void* route);
 MCDR_API int32_t MCDR_CALL mcdr_dx12OitBeginFrameV1(mcdr_command_ctx* context, const mcdr_oit_begin_v1* input, void** frame);
 MCDR_API int32_t MCDR_CALL mcdr_dx12OitBeginFrameV2(mcdr_command_ctx* context, const mcdr_oit_begin_v2* input, void** frame);
@@ -2015,6 +2038,10 @@ typedef struct mcdr_vanilla_resource_use {
     uint32_t externalState;
 } mcdr_vanilla_resource_use;
 MCDR_API int32_t MCDR_CALL mcdr_dx12VanillaBeginFrame(mcdr_command_ctx* context, const mcdr_vanilla_frame_input* input);
+MCDR_API int32_t MCDR_CALL mcdr_dx12VanillaRegisterWorldDepthV1(mcdr_command_ctx* context, mcdr_object* depth);
+MCDR_API int32_t MCDR_CALL mcdr_dx12VanillaArmWorldDepthSeedV1(
+    mcdr_command_ctx* context, uint32_t maxEvents, uint64_t totalBudgetBytes);
+MCDR_API int32_t MCDR_CALL mcdr_dx12VanillaSealWorldDepthSeedV1(mcdr_command_ctx* context);
 MCDR_API int32_t MCDR_CALL mcdr_dx12VanillaWorldReady(mcdr_command_ctx* context, const mcdr_frame_identity* input);
 MCDR_API int32_t MCDR_CALL mcdr_dx12VanillaGuiReady(mcdr_command_ctx* context, const mcdr_frame_identity* input);
 MCDR_API int32_t MCDR_CALL mcdr_dx12VanillaPublishPreparedFrame(mcdr_command_ctx* context, const mcdr_prepared_frame* input);
@@ -2043,6 +2070,9 @@ enum {
  */
 MCDR_API int32_t MCDR_CALL mcdr_dx12PrepareFramePrograms(mcdr_command_ctx* context,
     uint64_t generation, uint32_t flags, void** candidate);
+MCDR_API int32_t MCDR_CALL mcdr_dx12PrepareFrameProgramsV2(mcdr_command_ctx* context,
+    uint64_t generation, uint32_t flags, const mcdr_oit_normalization_program_v1* normalizationPrograms,
+    uint32_t normalizationProgramCount, void** candidate);
 MCDR_API int32_t MCDR_CALL mcdr_dx12CommitFramePrograms(mcdr_command_ctx* context, void* candidate);
 MCDR_API void MCDR_CALL mcdr_dx12AbortFramePrograms(void* candidate);
 MCDR_API int32_t MCDR_CALL mcdr_dx12VanillaResetFrame(mcdr_command_ctx* context);
@@ -2132,6 +2162,8 @@ MCDR_API void* MCDR_CALL mcdr_dx12PrepareTerrainWorkGraph(void* context, void* p
     int32_t bindingCount, uint32_t sectionCount, uint32_t meshletCapacity);
 MCDR_API int32_t MCDR_CALL mcdr_dx12DrawTerrainWorkGraph(void* context, void* batch,
     void* vertexBuffer, uint64_t vertexOffset);
+MCDR_API int32_t MCDR_CALL mcdr_dx12DrawTerrainWorkGraphV2(void* context, void* batch,
+    void* vertexBuffer, uint64_t vertexOffset, uint64_t vertexBytes);
 MCDR_API void MCDR_CALL mcdr_dx12DestroyTerrainBatch(void* batch);
 MCDR_API int32_t MCDR_CALL mcdr_dx12DispatchWorkGraph(
     mcdr_command_ctx* ctx, void* program, const void* records, uint32_t recordCount,

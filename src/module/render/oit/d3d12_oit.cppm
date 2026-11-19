@@ -40,7 +40,19 @@ struct TerrainDrawIdentity {
     uint32_t primitiveCount = 0;
     std::vector<TerrainDrawSectionIdentity> sections;
 };
-int preparePrograms(void* context, uint64_t generation, void** prepared);
+
+struct TerrainReplayDraw {
+    mcdr_frame_identity frame{};
+    uint64_t frameSerial = 0;
+    uint64_t programGeneration = 0;
+    uint64_t vertexBytes = 0;
+    uint32_t sectionCount = 0;
+    uint32_t primitiveCount = 0;
+    uint32_t stage = UINT32_MAX;
+    uint64_t totalBudgetBytes = 0;
+};
+int preparePrograms(void* context, uint64_t generation, void** prepared,
+    const mcdr_oit_normalization_program_v1 (*normalization)[3] = nullptr);
 int validatePreparedPrograms(void* context, void* prepared);
 void exchangePreparedPrograms(void* context, void* prepared) noexcept;
 void destroyPreparedPrograms(void* prepared) noexcept;
@@ -54,16 +66,16 @@ int bindTerrainDraw(void* context, void* frame, void* metadata, const mcdr_oit_t
 int validateTerrainDraw(void* context, void* vertex, uint64_t offset, TerrainDrawIdentity* identity);
 int retainTerrainDrawPacket(void* context, const TerrainDrawIdentity& identity,
     TerrainDrawContent content, std::shared_ptr<const void> packet,
-    mcdr::terrain_tile::PacketPreparation prepare,
-    mcdr::terrain_tile::PacketPreparationV2 prepareV2);
+    mcdr::terrain_tile::PacketPreparation prepare);
 int confirmTerrainDrawReceipt(void* context);
 int prepareTerrainStageDrawReceipt(void* context, const void* vertex, uint64_t vertexOffset);
-int confirmTerrainStageDrawReceipt(void* context);
+int confirmTerrainStageDrawReceipt(void* context, std::shared_ptr<const void> packet,
+    mcdr::terrain_tile::PacketPreparationV2 prepareReplay, PacketContentStatus content);
 int validateTerrainStageReads(void* context, const void* terrainBatch, const void* vertex, uint64_t vertexOffset,
     const void* atlas, uint64_t atlasOffset, uint64_t atlasLength, uint32_t sectionCount,
     const void* globals, uint64_t globalsOffset, uint64_t globalsLength,
     const void* candidates, uint64_t candidatesOffset, uint64_t candidatesLength,
-    std::shared_ptr<const void> batchLease);
+    std::shared_ptr<const void> batchLease, TerrainReplayDraw* replayDraw);
 int beginExecutionStream(void* context, void* frame, const mcdr_oit_execution_begin_v1& input, void** stream);
 int captureExecutionTextureV1(void* context, void* frame, void* view, uint64_t totalBudgetBytes,
     mcdr_oit_execution_texture_v1* output);
@@ -77,6 +89,21 @@ int queryExecutionTerrainReceiptV2(void* context, void* stream, uint64_t receipt
 int sealExecutionStreamV2(void* context, void* stream, const mcdr_oit_execution_manifest_v2& input,
     void** sealedStream, mcdr_oit_execution_seal_result_v2* result);
 int abortExecutionStreamV2(void* context, void* stream);
+int executeTileStreamV2(void* context, void* stream, const mcdr::terrain_tile::BatchV2* batches, void* corrected);
+struct ExecutionLaneTargets {
+    void* mainDepth = nullptr;
+    void* terrainDepth = nullptr;
+    void* cloudDepth = nullptr;
+    void* bounds = nullptr;
+    void* culledBounds = nullptr;
+    uint32_t residentTileCount = 0;
+    const mcdr::terrain_tile::BatchV2* batch = nullptr;
+    uint64_t batchConstants = 0;
+};
+int recordExecutionOpaqueSeed(void* context, void* stream, void* mainDepth,
+    const mcdr::terrain_tile::BatchV2& batch, mcdr::terrain_tile::ConstantAddresses constants);
+int recordExecutionLaneOperation(void* context, void* stream, uint64_t receiptId,
+    const ExecutionLaneTargets& targets);
 int beginExecutionOperation(void* context, void* frame,
     const mcdr_oit_execution_operation_begin_v1& input, void** operation);
 int finishExecutionOperation(void* context, void* frame, void* operation, uint64_t* receiptCount);
@@ -98,10 +125,16 @@ int appendExecutionEvent(void* context, void* stream, const mcdr_oit_execution_e
 int sealExecutionStream(void* context, void* stream, const mcdr_oit_execution_manifest_v1& manifest,
     void** sealedStream, mcdr_oit_execution_seal_result_v1* result);
 int createNormalizationPrograms(void* context, const mcdr_oit_normalization_program_v1& input, void** programs);
+int prepareNormalizationPrograms(void* context, uint64_t generation,
+    const mcdr_oit_normalization_program_v1 (&inputs)[3], std::shared_ptr<void>* output);
 void destroyNormalizationPrograms(void* programs) noexcept;
 int createNormalizationBatch(void* context, void* programs, const mcdr_oit_normalization_batch_v1& input, void** batch);
+int createPreparedNormalizationBatch(void* context, const std::shared_ptr<void>& programs,
+    uint32_t targetCount, const mcdr_oit_normalization_batch_v1& input, void** batch);
 int recordNormalizationLane(void* context, void* batch, const mcdr_oit_normalization_lane_v1& input);
 int recordNormalizationAverage(void* context, void* batch);
+// The last batch exposes full-frame output for the same recording. The recording lease owns the texture.
+int resolveNormalizationOutput(void* context, void* batch, ID3D12Resource** output);
 int queryNormalizationBatch(void* context, void* batch, mcdr_oit_normalization_info_v1* output);
 void destroyNormalizationBatch(void* batch) noexcept;
 mcdr::terrain_tile::Result prepareTerrainTiles(void* context, void* frame,

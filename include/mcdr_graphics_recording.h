@@ -13,6 +13,7 @@ enum class Completion : uint32_t { Succeeded, Failed };
 // Content capture is opt-in. Ordinary operation recording must remain a facts-only
 // path until an executor has a real adapter and will consume the frozen bindings.
 enum class ContentPolicy : uint32_t { FactsOnly = 0, FreezeBindings = 1 };
+enum class TileDrawScope : uint32_t { DepthBounds = 0, Transmittance = 1, Accumulate = 2, Seed, None };
 
 struct AdapterFacts {
     AdapterState state = AdapterState::Unavailable;
@@ -23,6 +24,7 @@ struct AdapterFacts {
     uint32_t schemaVersion = 0, structSize = 0, shaderAbiVersion = 0, addressingVersion = 0;
     uint32_t stage = 0, quadsPerMeshlet = 0;
     std::shared_ptr<const void> routeLease;
+    std::shared_ptr<const void> replayContent;
 };
 
 struct Command {
@@ -48,9 +50,12 @@ struct Observer {
     std::weak_ptr<void> owner;
     uint64_t totalBudgetBytes = 0;
     ContentPolicy contentPolicy = ContentPolicy::FactsOnly;
+    const void* depthWriteTarget = nullptr;
+    TileDrawScope (*tileDrawScope)(void* owner) noexcept = nullptr;
     int (*prepare)(void* owner, void* context, const PacketFacts&, std::shared_ptr<const void> packet) = nullptr;
     int (*confirm)(void* owner, void* context, const void* packet) = nullptr;
     int (*complete)(void* owner, void* context, Completion completion) = nullptr;
+    void (*budgetExceeded)(void* owner, void* context) noexcept = nullptr;
 };
 }
 

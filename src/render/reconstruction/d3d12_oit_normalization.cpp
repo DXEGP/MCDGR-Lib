@@ -6,6 +6,7 @@ module;
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <span>
 
 module mcdr.render.oit;
 
@@ -18,10 +19,42 @@ constexpr uint32_t normalizationLaneCount = 4;
 constexpr uint32_t normalizationConstantsStride = 512;
 constexpr uint32_t normalizationDescriptorStride = 8;
 constexpr uint32_t normalizationScratchSize = 68;
-constexpr uint32_t normalizationDescriptorCount = normalizationDescriptorStride * 5;
+constexpr uint32_t normalizationDispatchCount = normalizationLaneCount + 1;
+constexpr uint32_t normalizationBatchBytes = normalizationConstantsStride * normalizationDispatchCount;
+constexpr uint32_t normalizationPageBytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+constexpr uint32_t normalizationPageDescriptors = 512;
 constexpr uint32_t normalizationResidentCapacity = 16;
 constexpr uint32_t normalizationSliceCapacity = normalizationLaneCount * normalizationResidentCapacity;
 constexpr DXGI_FORMAT normalizationFormat = DXGI_FORMAT_R32G32B32A32_FLOAT;
+static_assert(normalizationConstantsStride % D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT == 0);
+
+struct NormalizationUploadPage {
+    std::shared_ptr<mcdr::oit_budget::Reservation> budget;
+    ComPtr<ID3D12Resource> resource;
+    std::byte* mapped = nullptr;
+    uint32_t usedBytes = 0;
+};
+
+struct NormalizationDescriptorPage {
+    std::shared_ptr<mcdr::oit_budget::Reservation> budget;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    uint32_t usedDescriptors = 0;
+};
+
+struct NormalizationSourceView {
+    ID3D12Resource* resource = nullptr;
+    DXGI_FORMAT format = normalizationFormat;
+    uint32_t firstSlice = 0;
+    uint32_t sliceCount = 0;
+
+    bool operator==(const NormalizationSourceView&) const = default;
+};
+
+struct NormalizationDescriptorTable {
+    std::array<NormalizationSourceView, 5> sources{};
+    ID3D12DescriptorHeap* heap = nullptr;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu{};
+};
 
 struct NormalizationFrame {
     std::shared_ptr<const void> recordingIdentity;
@@ -29,7 +62,12 @@ struct NormalizationFrame {
     ComPtr<ID3D12Resource> normalized, corrected;
     std::shared_ptr<mcdr::oit_budget::Reservation> budget;
     std::vector<mcdr_oit_normalization_region_v1> regions;
+    std::vector<NormalizationUploadPage> uploadPages;
+    std::vector<NormalizationDescriptorPage> descriptorPages;
+    std::array<NormalizationDescriptorTable, normalizationDispatchCount> recentTables;
     uint64_t batchSequence = 0;
+    uint64_t averagedPixels = 0;
+    uint32_t targetCount = 0;
     bool batchOpen = false;
     bool recordingFailed = false;
 };
@@ -39,10 +77,12 @@ struct NormalizationPrograms {
     DWORD ownerThread = 0;
     ComPtr<ID3D12Fence> contextFence;
     uint64_t generation = 0;
-    uint32_t targetCount = 0;
+    uint32_t legacyTargetCount = 0;
     ComPtr<ID3D12Device> device;
+    ComPtr<IUnknown> deviceIdentity;
     ComPtr<ID3D12RootSignature> root;
-    ComPtr<ID3D12PipelineState> lane, average;
+    std::array<ComPtr<ID3D12PipelineState>, 5> lane;
+    ComPtr<ID3D12PipelineState> average;
     std::shared_ptr<mcdr::oit_budget::Reservation> budget;
     std::weak_ptr<NormalizationFrame> frame;
 };
@@ -55,9 +95,7 @@ struct NormalizationBatch {
     std::shared_ptr<NormalizationPrograms> programs;
     std::shared_ptr<NormalizationFrame> frame;
     uint64_t sequence = 0;
-    ComPtr<ID3D12Resource> constants;
-    ComPtr<ID3D12DescriptorHeap> descriptors;
-    std::shared_ptr<mcdr::oit_budget::Reservation> budget;
+    D3D12_GPU_VIRTUAL_ADDRESS constants = 0;
     std::vector<std::shared_ptr<void>> inputLeases;
     uint32_t nextLane = 0;
     bool averageRecorded = false;
@@ -157,85 +195,35 @@ ComPtr<ID3D12Resource> createNormalizationTexture(ID3D12Device* device,
     return resource;
 }
 
-D3D12_CPU_DESCRIPTOR_HANDLE normalizationCpuDescriptor(const NormalizationBatch& batch, uint32_t index) {
-    auto handle = batch.descriptors->GetCPUDescriptorHandleForHeapStart();
-    handle.ptr += static_cast<SIZE_T>(index) * deviceContext().srvInc;
-    return handle;
-}
-
-D3D12_GPU_DESCRIPTOR_HANDLE normalizationGpuDescriptor(const NormalizationBatch& batch, uint32_t index) {
-    auto handle = batch.descriptors->GetGPUDescriptorHandleForHeapStart();
-    handle.ptr += static_cast<UINT64>(index) * deviceContext().srvInc;
-    return handle;
-}
-
-void createNormalizationSourceDescriptor(NormalizationBatch& batch, uint32_t index,
-    const mcdr_prepared_binding& binding) {
-    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
-    view.Format = binding.object ? binding.object->dxgiFormat : normalizationFormat;
-    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    view.Texture2DArray.MostDetailedMip = 0;
-    view.Texture2DArray.MipLevels = 1;
-    view.Texture2DArray.FirstArraySlice = binding.firstSubresource;
-    view.Texture2DArray.ArraySize = binding.object ? binding.subresourceCount : batch.input.residentCount;
-    batch.programs->device->CreateShaderResourceView(binding.object ? binding.object->resource.Get() : nullptr,
-        &view, normalizationCpuDescriptor(batch, index));
-}
-
-void createNormalizationBatchDescriptors(NormalizationBatch& batch) {
-    auto* device = batch.programs->device.Get();
-    D3D12_DESCRIPTOR_HEAP_DESC heap{};
-    heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heap.NumDescriptors = normalizationDescriptorCount;
-    heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    requireNormalizationSuccess(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&batch.descriptors)),
-        "CreateNormalizationDescriptors");
-    for (uint32_t group = 0; group <= normalizationLaneCount; ++group) {
-        const uint32_t base = group * normalizationDescriptorStride;
-        for (uint32_t source = 0; source < 5; ++source)
-            createNormalizationSourceDescriptor(batch, base + source, {});
-        D3D12_SHADER_RESOURCE_VIEW_DESC normalizedView{};
-        normalizedView.Format = normalizationFormat;
-        normalizedView.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-        normalizedView.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        normalizedView.Texture2DArray.MipLevels = 1;
-        normalizedView.Texture2DArray.ArraySize = normalizationSliceCapacity;
-        device->CreateShaderResourceView(group == normalizationLaneCount ? batch.frame->normalized.Get() : nullptr,
-            &normalizedView, normalizationCpuDescriptor(batch, base + 5));
-        D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
-        view.Format = normalizationFormat;
-        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
-        view.Texture2DArray.ArraySize = normalizationSliceCapacity;
-        device->CreateUnorderedAccessView(group < normalizationLaneCount ? batch.frame->normalized.Get() : nullptr,
-            nullptr, &view,
-            normalizationCpuDescriptor(batch, base + 6));
-        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-        view.Texture2D = {};
-        device->CreateUnorderedAccessView(group == normalizationLaneCount ? batch.frame->corrected.Get() : nullptr,
-            nullptr, &view,
-            normalizationCpuDescriptor(batch, base + 7));
+int writeNormalizationBatchConstants(NormalizationBatch& batch) {
+    auto& pages = batch.frame->uploadPages;
+    if (pages.empty() || pages.back().usedBytes > normalizationPageBytes - normalizationBatchBytes) {
+        NormalizationUploadPage page{};
+        page.budget = mcdr::oit_budget::reserve(normalizationPageBytes, batch.input.totalBudgetBytes);
+        if (!page.budget) return MCDR_OIT_NORMALIZATION_BUDGET_EXCEEDED;
+        D3D12_RESOURCE_DESC description{};
+        description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        description.Width = normalizationPageBytes;
+        description.Height = 1;
+        description.DepthOrArraySize = 1;
+        description.MipLevels = 1;
+        description.SampleDesc.Count = 1;
+        description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        requireNormalizationSuccess(batch.programs->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
+            &description, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&page.resource)),
+            "CreateNormalizationUploadPage");
+        void* mapped = nullptr;
+        const D3D12_RANGE noRead{0, 0};
+        requireNormalizationSuccess(page.resource->Map(0, &noRead, &mapped), "MapNormalizationUploadPage");
+        page.mapped = static_cast<std::byte*>(mapped);
+        pages.push_back(std::move(page));
     }
-}
-
-void createNormalizationConstants(NormalizationBatch& batch) {
-    D3D12_RESOURCE_DESC description{};
-    description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    description.Width = normalizationConstantsStride * 5;
-    description.Height = 1;
-    description.DepthOrArraySize = 1;
-    description.MipLevels = 1;
-    description.SampleDesc.Count = 1;
-    description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    D3D12_HEAP_PROPERTIES heap{};
-    heap.Type = D3D12_HEAP_TYPE_UPLOAD;
-    requireNormalizationSuccess(batch.programs->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
-        &description, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&batch.constants)),
-        "CreateNormalizationConstants");
     struct Constants {
         uint32_t schema, resident, lane, flags;
         uint32_t width, height, reserved[2];
-        mcdr_oit_normalization_region_v1 regions[16];
+        mcdr_oit_normalization_region_v1 regions[normalizationResidentCapacity];
     } constants{};
     static_assert(sizeof(constants) == 288);
     constants.schema = 1;
@@ -243,17 +231,104 @@ void createNormalizationConstants(NormalizationBatch& batch) {
     constants.width = batch.input.outputWidth;
     constants.height = batch.input.outputHeight;
     std::memcpy(constants.regions, batch.input.regions, sizeof(constants.regions));
-    void* mapped = nullptr;
-    const D3D12_RANGE noRead{0, 0};
-    requireNormalizationSuccess(batch.constants->Map(0, &noRead, &mapped), "MapNormalizationConstants");
-    auto* bytes = static_cast<std::byte*>(mapped);
-    std::memset(bytes, 0, static_cast<size_t>(description.Width));
-    for (uint32_t lane = 0; lane <= normalizationLaneCount; ++lane) {
-        constants.lane = lane == normalizationLaneCount ? 0 : lane;
-        std::memcpy(bytes + lane * normalizationConstantsStride, &constants, sizeof(constants));
+
+    auto& page = pages.back();
+    auto* bytes = page.mapped + page.usedBytes;
+    std::memset(bytes, 0, normalizationBatchBytes);
+    for (uint32_t group = 0; group < normalizationDispatchCount; ++group) {
+        constants.lane = group == normalizationLaneCount ? 0 : group;
+        std::memcpy(bytes + group * normalizationConstantsStride, &constants, sizeof(constants));
     }
-    const D3D12_RANGE written{0, static_cast<SIZE_T>(description.Width)};
-    batch.constants->Unmap(0, &written);
+    batch.constants = page.resource->GetGPUVirtualAddress() + page.usedBytes;
+    return MCDR_OIT_NORMALIZATION_SUCCESS;
+}
+
+int ensureNormalizationDescriptorSpace(NormalizationBatch& batch) {
+    auto& pages = batch.frame->descriptorPages;
+    constexpr uint32_t maxBatchDescriptors = normalizationDispatchCount * normalizationDescriptorStride;
+    if (!pages.empty() && pages.back().usedDescriptors <= normalizationPageDescriptors - maxBatchDescriptors)
+        return MCDR_OIT_NORMALIZATION_SUCCESS;
+
+    NormalizationDescriptorPage page{};
+    page.budget = mcdr::oit_budget::reserve(normalizationPageBytes, batch.input.totalBudgetBytes);
+    if (!page.budget) return MCDR_OIT_NORMALIZATION_BUDGET_EXCEEDED;
+    D3D12_DESCRIPTOR_HEAP_DESC description{};
+    description.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    description.NumDescriptors = normalizationPageDescriptors;
+    description.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    requireNormalizationSuccess(batch.programs->device->CreateDescriptorHeap(&description, IID_PPV_ARGS(&page.heap)),
+        "CreateNormalizationDescriptorPage");
+    pages.push_back(std::move(page));
+    return MCDR_OIT_NORMALIZATION_SUCCESS;
+}
+
+NormalizationDescriptorTable normalizationTable(NormalizationBatch& batch, uint32_t group,
+    std::span<const mcdr_prepared_binding> inputs) {
+    auto& frame = *batch.frame;
+    const bool average = group == normalizationLaneCount;
+    std::array<NormalizationSourceView, 5> sources{};
+    for (auto& source : sources)
+        source.sliceCount = batch.input.residentCount;
+    for (size_t index = 0; index < inputs.size(); ++index) {
+        const auto& binding = inputs[index];
+        sources[index] = {binding.object->resource.Get(), binding.object->dxgiFormat,
+            binding.firstSubresource, binding.subresourceCount};
+    }
+
+    // A lane table and the average table have different SRV/UAV layouts.
+    auto& recent = frame.recentTables[group];
+    auto candidates = std::span(frame.recentTables);
+    const auto matchingLayout = average ? candidates.last(1) : candidates.first(normalizationLaneCount);
+    for (const auto& table : matchingLayout) {
+        if (table.heap && table.sources == sources) {
+            recent = table;
+            return recent;
+        }
+    }
+
+    // Batch creation leaves space for all five dispatches before recording can begin.
+    auto& page = frame.descriptorPages.back();
+    auto* device = batch.programs->device.Get();
+    const auto increment = deviceContext().srvInc;
+    const auto first = page.usedDescriptors;
+    const auto cpu = page.heap->GetCPUDescriptorHandleForHeapStart();
+    const auto cpuDescriptor = [&](uint32_t index) {
+        return D3D12_CPU_DESCRIPTOR_HANDLE{cpu.ptr + static_cast<SIZE_T>(first + index) * increment};
+    };
+    for (uint32_t index = 0; index < sources.size(); ++index) {
+        const auto& source = sources[index];
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = source.format;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture2DArray.MipLevels = 1;
+        view.Texture2DArray.FirstArraySlice = source.firstSlice;
+        view.Texture2DArray.ArraySize = source.sliceCount;
+        device->CreateShaderResourceView(source.resource, &view, cpuDescriptor(index));
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC normalizedView{};
+    normalizedView.Format = normalizationFormat;
+    normalizedView.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    normalizedView.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    normalizedView.Texture2DArray.MipLevels = 1;
+    normalizedView.Texture2DArray.ArraySize = normalizationSliceCapacity;
+    device->CreateShaderResourceView(average ? frame.normalized.Get() : nullptr,
+        &normalizedView, cpuDescriptor(5));
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+    view.Format = normalizationFormat;
+    view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+    view.Texture2DArray.ArraySize = normalizationSliceCapacity;
+    device->CreateUnorderedAccessView(average ? nullptr : frame.normalized.Get(), nullptr, &view, cpuDescriptor(6));
+    view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    view.Texture2D = {};
+    device->CreateUnorderedAccessView(average ? frame.corrected.Get() : nullptr, nullptr, &view, cpuDescriptor(7));
+
+    page.usedDescriptors += normalizationDescriptorStride;
+    auto gpu = page.heap->GetGPUDescriptorHandleForHeapStart();
+    gpu.ptr += static_cast<UINT64>(first) * increment;
+    recent = {sources, page.heap.Get(), gpu};
+    return recent;
 }
 
 bool validNormalizationSource(const NormalizationBatch& batch, const mcdr_prepared_binding& binding) {
@@ -264,7 +339,9 @@ bool validNormalizationSource(const NormalizationBatch& batch, const mcdr_prepar
         return false;
     const auto description = object->resource->GetDesc();
     ComPtr<ID3D12Device> device;
-    if (FAILED(object->resource->GetDevice(IID_PPV_ARGS(&device))) || device.Get() != batch.programs->device.Get())
+    ComPtr<IUnknown> deviceIdentity;
+    if (FAILED(object->resource->GetDevice(IID_PPV_ARGS(&device))) || FAILED(device.As(&deviceIdentity)) ||
+        deviceIdentity.Get() != batch.programs->deviceIdentity.Get())
         return false;
     return description.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
         description.Width == normalizationScratchSize && description.Height == normalizationScratchSize &&
@@ -276,16 +353,16 @@ bool validNormalizationSource(const NormalizationBatch& batch, const mcdr_prepar
         object->resource.Get() != batch.frame->corrected.Get();
 }
 
-void bindNormalizationCompute(CommandContext* context, NormalizationBatch& batch, uint32_t group) {
-    ID3D12DescriptorHeap* heaps[] = {batch.descriptors.Get()};
+void bindNormalizationCompute(CommandContext* context, const NormalizationBatch& batch, uint32_t group,
+    const NormalizationDescriptorTable& table) {
+    ID3D12DescriptorHeap* heaps[] = {table.heap};
     context->commandList->SetDescriptorHeaps(1, heaps);
     context->commandList->SetComputeRootSignature(batch.programs->root.Get());
     context->commandList->SetComputeRootConstantBufferView(0,
-        batch.constants->GetGPUVirtualAddress() + group * normalizationConstantsStride);
-    context->commandList->SetComputeRootDescriptorTable(1,
-        normalizationGpuDescriptor(batch, group * normalizationDescriptorStride));
+        batch.constants + group * normalizationConstantsStride);
+    context->commandList->SetComputeRootDescriptorTable(1, table.gpu);
     context->commandList->SetComputeRootDescriptorTable(2,
-        normalizationGpuDescriptor(batch, group * normalizationDescriptorStride + 6));
+        {table.gpu.ptr + 6ull * deviceContext().srvInc});
 }
 
 struct NormalizationRecording {
@@ -304,28 +381,32 @@ struct NormalizationRecording {
     }
 };
 
-}
-
-int createNormalizationPrograms(void* opaqueContext, const mcdr_oit_normalization_program_v1& input,
-    void** output) try {
-    if (output) *output = nullptr;
-    auto* context = static_cast<CommandContext*>(opaqueContext);
+int buildNormalizationPrograms(CommandContext* context, uint64_t generation,
+    std::span<const mcdr_oit_normalization_program_v1> inputs, std::shared_ptr<NormalizationPrograms>& output) {
     auto* device = deviceContext().device.Get();
-    if (!output || !context || !context->fence || !device || input.schemaVersion != 1 ||
-        input.structSize != sizeof(input) || input.reserved != 0 || input.programGeneration == 0 ||
-        (input.targetCount != 1 && input.targetCount != 2 && input.targetCount != 4) ||
-        !input.laneDxil || !input.averageDxil || input.laneDxilBytes == 0 || input.averageDxilBytes == 0 ||
-        input.laneDxilBytes > mcdr::oit_budget::limit || input.averageDxilBytes > mcdr::oit_budget::limit)
+    const auto& first = inputs.front();
+    if (!context || !context->fence || !device || !generation || !first.averageDxil ||
+        !first.averageDxilBytes || first.averageDxilBytes > mcdr::oit_budget::limit)
         return MCDR_OIT_NORMALIZATION_INVALID_REQUEST;
+    uint64_t programBytes = (inputs.size() + 1) * (2ull * 1024 * 1024) + first.averageDxilBytes;
+    uint32_t targetMask = 0;
+    for (const auto& input : inputs) {
+        if (input.schemaVersion != 1 || input.structSize != sizeof(input) || input.reserved ||
+            input.programGeneration != generation || (input.targetCount != 1 && input.targetCount != 2 && input.targetCount != 4) ||
+            !input.laneDxil || !input.laneDxilBytes || input.laneDxilBytes > mcdr::oit_budget::limit ||
+            input.averageDxil != first.averageDxil || input.averageDxilBytes != first.averageDxilBytes ||
+            (targetMask & input.targetCount)) return MCDR_OIT_NORMALIZATION_INVALID_REQUEST;
+        targetMask |= input.targetCount;
+        programBytes += input.laneDxilBytes;
+    }
     if (context->submissionFailed.load()) return MCDR_OIT_NORMALIZATION_SUBMISSION_UNKNOWN;
     auto programs = std::make_shared<NormalizationPrograms>();
     programs->context = context;
     programs->ownerThread = GetCurrentThreadId();
     programs->contextFence = context->fence;
     programs->device = device;
-    programs->generation = input.programGeneration;
-    programs->targetCount = input.targetCount;
-    programs->budget = mcdr::oit_budget::reserve(4ull * 1024 * 1024 + input.laneDxilBytes + input.averageDxilBytes);
+    programs->generation = generation;
+    programs->budget = mcdr::oit_budget::reserve(programBytes);
     if (!programs->budget) return MCDR_OIT_NORMALIZATION_BUDGET_EXCEEDED;
     D3D12_FEATURE_DATA_FORMAT_SUPPORT format{normalizationFormat};
     requireNormalizationSuccess(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &format, sizeof(format)),
@@ -354,12 +435,47 @@ int createNormalizationPrograms(void* opaqueContext, const mcdr_oit_normalizatio
         serialized->GetBufferSize(), IID_PPV_ARGS(&programs->root)), "CreateNormalizationRoot");
     D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline{};
     pipeline.pRootSignature = programs->root.Get();
-    pipeline.CS = {input.laneDxil, static_cast<SIZE_T>(input.laneDxilBytes)};
-    requireNormalizationSuccess(device->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&programs->lane)),
-        "CreateNormalizationLanePipeline");
-    pipeline.CS = {input.averageDxil, static_cast<SIZE_T>(input.averageDxilBytes)};
+    for (const auto& input : inputs) {
+        pipeline.CS = {input.laneDxil, static_cast<SIZE_T>(input.laneDxilBytes)};
+        requireNormalizationSuccess(device->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&programs->lane[input.targetCount])),
+            "CreateNormalizationLanePipeline");
+    }
+    pipeline.CS = {first.averageDxil, static_cast<SIZE_T>(first.averageDxilBytes)};
     requireNormalizationSuccess(device->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&programs->average)),
         "CreateNormalizationAveragePipeline");
+    // Device children can report the underlying device when creation uses an interposer.
+    ComPtr<ID3D12Device> pipelineDevice;
+    requireNormalizationSuccess(programs->average->GetDevice(IID_PPV_ARGS(&pipelineDevice)), "QueryNormalizationPipelineDevice");
+    requireNormalizationSuccess(pipelineDevice.As(&programs->deviceIdentity), "QueryNormalizationDeviceIdentity");
+    output = std::move(programs);
+    return MCDR_OIT_NORMALIZATION_SUCCESS;
+}
+
+}
+
+int prepareNormalizationPrograms(void* opaqueContext, uint64_t generation,
+    const mcdr_oit_normalization_program_v1 (&inputs)[3], std::shared_ptr<void>* output) try {
+    if (!output) return MCDR_OIT_NORMALIZATION_INVALID_REQUEST;
+    output->reset();
+    std::shared_ptr<NormalizationPrograms> programs;
+    const auto status = buildNormalizationPrograms(static_cast<CommandContext*>(opaqueContext), generation, inputs, programs);
+    if (status == MCDR_OIT_NORMALIZATION_SUCCESS) *output = std::move(programs);
+    return status;
+} catch (const NormalizationResourceFailure& failure) {
+    return reportNormalizationFailure(static_cast<CommandContext*>(opaqueContext), failure);
+} catch (const std::bad_alloc&) {
+    return MCDR_OIT_NORMALIZATION_BUDGET_EXCEEDED;
+}
+
+int createNormalizationPrograms(void* opaqueContext, const mcdr_oit_normalization_program_v1& input,
+    void** output) try {
+    if (!output) return MCDR_OIT_NORMALIZATION_INVALID_REQUEST;
+    *output = nullptr;
+    std::shared_ptr<NormalizationPrograms> programs;
+    const auto status = buildNormalizationPrograms(static_cast<CommandContext*>(opaqueContext), input.programGeneration,
+        std::span{&input, 1}, programs);
+    if (status != MCDR_OIT_NORMALIZATION_SUCCESS) return status;
+    programs->legacyTargetCount = input.targetCount;
     const uintptr_t handle = nextNormalizationHandle.fetch_add(1);
     if (handle == 0) return MCDR_OIT_NORMALIZATION_UNSUPPORTED;
     std::lock_guard lock(normalizationRegistryMutex);
@@ -368,6 +484,8 @@ int createNormalizationPrograms(void* opaqueContext, const mcdr_oit_normalizatio
     return MCDR_OIT_NORMALIZATION_SUCCESS;
 } catch (const NormalizationResourceFailure& failure) {
     return reportNormalizationFailure(static_cast<CommandContext*>(opaqueContext), failure);
+} catch (const std::bad_alloc&) {
+    return MCDR_OIT_NORMALIZATION_BUDGET_EXCEEDED;
 }
 
 void destroyNormalizationPrograms(void* handle) noexcept {
@@ -375,16 +493,18 @@ void destroyNormalizationPrograms(void* handle) noexcept {
     normalizationPrograms.erase(reinterpret_cast<uintptr_t>(handle));
 }
 
-int createNormalizationBatch(void* opaqueContext, void* programsHandle,
-    const mcdr_oit_normalization_batch_v1& input, void** output) try {
+namespace {
+int createNormalizationBatch(void* opaqueContext, const std::shared_ptr<NormalizationPrograms>& programs,
+    uint32_t targetCount, const mcdr_oit_normalization_batch_v1& input, void** output) try {
     if (output) *output = nullptr;
     auto* context = static_cast<CommandContext*>(opaqueContext);
     if (const int status = normalizationRecordingStatus(context); status != MCDR_OIT_NORMALIZATION_SUCCESS)
         return status;
-    auto programs = findNormalizationPrograms(programsHandle);
     if (!programs || programs->context != context || programs->contextFence.Get() != context->fence.Get() ||
         programs->ownerThread != GetCurrentThreadId() || programs->device.Get() != deviceContext().device.Get())
         return MCDR_OIT_NORMALIZATION_STALE;
+    if (targetCount >= programs->lane.size() || !programs->lane[targetCount])
+        return MCDR_OIT_NORMALIZATION_UNSUPPORTED;
     if (!output || input.schemaVersion != 1 || input.structSize != sizeof(input) || input.reserved != 0 ||
         input.residentCount == 0 || input.residentCount > 16 || input.outputWidth == 0 || input.outputHeight == 0 ||
         input.outputWidth > 16384 || input.outputHeight > 16384 || input.identity.worldEpoch == 0 ||
@@ -420,7 +540,8 @@ int createNormalizationBatch(void* opaqueContext, void* programsHandle,
             prior.identity.resourceVersion != input.identity.resourceVersion ||
             prior.frameSerial != input.frameSerial || prior.historyGeneration != input.historyGeneration ||
             prior.programGeneration != input.programGeneration || prior.outputWidth != input.outputWidth ||
-            prior.outputHeight != input.outputHeight || prior.totalBudgetBytes != input.totalBudgetBytes)
+            prior.outputHeight != input.outputHeight || prior.totalBudgetBytes != input.totalBudgetBytes ||
+            frame->targetCount != targetCount)
             return MCDR_OIT_NORMALIZATION_STALE;
         for (uint32_t index = 0; index < input.residentCount; ++index) {
             const auto& region = input.regions[index];
@@ -436,6 +557,7 @@ int createNormalizationBatch(void* opaqueContext, void* programsHandle,
         frame = std::make_shared<NormalizationFrame>();
         frame->recordingIdentity = context->recordingIdentity;
         frame->input = input;
+        frame->targetCount = targetCount;
         const auto normalized = normalizationTextureDescription(normalizationScratchSize, normalizationScratchSize,
             normalizationSliceCapacity);
         const auto corrected = normalizationTextureDescription(input.outputWidth, input.outputHeight, 1);
@@ -458,11 +580,11 @@ int createNormalizationBatch(void* opaqueContext, void* programsHandle,
     batch->input = input;
     batch->programs = programs;
     batch->frame = frame;
-    batch->budget = mcdr::oit_budget::reserve(131072, input.totalBudgetBytes);
-    if (!batch->budget) return MCDR_OIT_NORMALIZATION_BUDGET_EXCEEDED;
-    createNormalizationConstants(*batch);
-    createNormalizationBatchDescriptors(*batch);
-    batch->inputLeases.reserve(normalizationLaneCount * (1 + batch->programs->targetCount));
+    if (const auto status = ensureNormalizationDescriptorSpace(*batch); status != MCDR_OIT_NORMALIZATION_SUCCESS)
+        return status;
+    if (const auto status = writeNormalizationBatchConstants(*batch); status != MCDR_OIT_NORMALIZATION_SUCCESS)
+        return status;
+    batch->inputLeases.reserve(normalizationLaneCount * (1 + targetCount));
     const size_t regionCount = frame->regions.size() + input.residentCount;
     if (regionCount > frame->regions.capacity())
         frame->regions.reserve(std::max(regionCount, frame->regions.capacity() * 2));
@@ -472,6 +594,7 @@ int createNormalizationBatch(void* opaqueContext, void* programsHandle,
     std::lock_guard lock(normalizationRegistryMutex);
     normalizationBatches.emplace(handle, batch);
     frame->regions.insert(frame->regions.end(), input.regions, input.regions + input.residentCount);
+    frame->uploadPages.back().usedBytes += normalizationBatchBytes;
     batch->sequence = ++frame->batchSequence;
     frame->batchOpen = true;
     programs->frame = frame;
@@ -479,6 +602,21 @@ int createNormalizationBatch(void* opaqueContext, void* programsHandle,
     return MCDR_OIT_NORMALIZATION_SUCCESS;
 } catch (const NormalizationResourceFailure& failure) {
     return reportNormalizationFailure(static_cast<CommandContext*>(opaqueContext), failure);
+} catch (const std::bad_alloc&) {
+    return MCDR_OIT_NORMALIZATION_BUDGET_EXCEEDED;
+}
+}
+
+int createPreparedNormalizationBatch(void* opaqueContext, const std::shared_ptr<void>& programs,
+    uint32_t targetCount, const mcdr_oit_normalization_batch_v1& input, void** output) {
+    return createNormalizationBatch(opaqueContext, std::static_pointer_cast<NormalizationPrograms>(programs),
+        targetCount, input, output);
+}
+
+int createNormalizationBatch(void* opaqueContext, void* programsHandle,
+    const mcdr_oit_normalization_batch_v1& input, void** output) {
+    const auto programs = findNormalizationPrograms(programsHandle);
+    return createNormalizationBatch(opaqueContext, programs, programs ? programs->legacyTargetCount : 0, input, output);
 }
 
 int recordNormalizationLane(void* opaqueContext, void* handle, const mcdr_oit_normalization_lane_v1& input) {
@@ -488,14 +626,19 @@ int recordNormalizationLane(void* opaqueContext, void* handle, const mcdr_oit_no
         return status;
     if (input.schemaVersion != 1 || input.structSize != sizeof(input) || input.reserved != 0 ||
         input.laneIndex >= normalizationLaneCount || input.laneIndex != batch->nextLane || batch->averageRecorded ||
-        !batch->frame->batchOpen || batch->sequence != batch->frame->batchSequence ||
-        !validNormalizationSource(*batch, input.q))
+        !batch->frame->batchOpen || batch->sequence != batch->frame->batchSequence)
         return MCDR_OIT_NORMALIZATION_INVALID_REQUEST;
+    if (!validNormalizationSource(*batch, input.q)) {
+        dbgLogError("OIT normalization: invalid Q texture");
+        return MCDR_OIT_NORMALIZATION_INVALID_REQUEST;
+    }
     std::vector<mcdr_prepared_binding> inputs{input.q};
     for (uint32_t index = 0; index < 4; ++index) {
-        if (index < batch->programs->targetCount) {
-            if (!validNormalizationSource(*batch, input.coefficients[index]))
+        if (index < batch->frame->targetCount) {
+            if (!validNormalizationSource(*batch, input.coefficients[index])) {
+                dbgLogError("OIT normalization: invalid coefficient texture (%u)", index);
                 return MCDR_OIT_NORMALIZATION_INVALID_REQUEST;
+            }
             inputs.push_back(input.coefficients[index]);
         } else if (input.coefficients[index].object || input.coefficients[index].firstSubresource ||
             input.coefficients[index].subresourceCount) {
@@ -517,17 +660,15 @@ int recordNormalizationLane(void* opaqueContext, void* handle, const mcdr_oit_no
         vanilla::ResourceAccess::Uav, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, UINT32_MAX,
         vanilla::ExternalResourceState::Tracked, batch->frame->normalized.Get(), D3D12_RESOURCE_STATE_COMMON});
     for (auto& lease : leases) batch->inputLeases.push_back(std::move(lease));
-    for (uint32_t index = 0; index < inputs.size(); ++index)
-        createNormalizationSourceDescriptor(*batch, input.laneIndex * normalizationDescriptorStride + index,
-            inputs[index]);
+    const auto table = normalizationTable(*batch, input.laneIndex, inputs);
     NormalizationRecording recording{context, *batch};
     try {
         vanilla::DeclaredPassToken* token = nullptr;
         if (vanilla::beginDeclaredPass(context, 0x240 + input.laneIndex, uses.data(),
                 static_cast<uint32_t>(uses.size()), 3, &token) != 1)
             return MCDR_OIT_NORMALIZATION_RECORDING_FAILED;
-        bindNormalizationCompute(context, *batch, input.laneIndex);
-        context->commandList->SetPipelineState(batch->programs->lane.Get());
+        bindNormalizationCompute(context, *batch, input.laneIndex, table);
+        context->commandList->SetPipelineState(batch->programs->lane[batch->frame->targetCount].Get());
         context->commandList->Dispatch(9, 9, batch->input.residentCount);
         D3D12_RESOURCE_BARRIER barrier{};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -563,12 +704,13 @@ int recordNormalizationAverage(void* opaqueContext, void* handle) {
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, UINT32_MAX, vanilla::ExternalResourceState::Tracked,
             batch->frame->corrected.Get(), D3D12_RESOURCE_STATE_COMMON},
     };
+    const auto table = normalizationTable(*batch, normalizationLaneCount, {});
     NormalizationRecording recording{context, *batch};
     try {
         vanilla::DeclaredPassToken* token = nullptr;
         if (vanilla::beginDeclaredPass(context, 0x244, uses, 2, 3, &token) != 1)
             return MCDR_OIT_NORMALIZATION_RECORDING_FAILED;
-        bindNormalizationCompute(context, *batch, normalizationLaneCount);
+        bindNormalizationCompute(context, *batch, normalizationLaneCount, table);
         context->commandList->SetPipelineState(batch->programs->average.Get());
         context->commandList->Dispatch(8, 8, batch->input.residentCount);
         D3D12_RESOURCE_BARRIER barrier{};
@@ -577,6 +719,10 @@ int recordNormalizationAverage(void* opaqueContext, void* handle) {
         context->commandList->ResourceBarrier(1, &barrier);
         if (vanilla::finishDeclaredPass(context, token) != 1)
             return MCDR_OIT_NORMALIZATION_RECORDING_FAILED;
+        for (uint32_t index = 0; index < batch->input.residentCount; ++index) {
+            const auto& region = batch->input.regions[index];
+            batch->frame->averagedPixels += static_cast<uint64_t>(region.width) * region.height;
+        }
         batch->averageRecorded = true;
         batch->frame->batchOpen = false;
         recording.completed = true;
@@ -588,6 +734,21 @@ int recordNormalizationAverage(void* opaqueContext, void* handle) {
         dbgLogError("OIT normalization average recording failed with an unknown exception");
         return MCDR_OIT_NORMALIZATION_RECORDING_FAILED;
     }
+}
+
+int resolveNormalizationOutput(void* opaqueContext, void* handle, ID3D12Resource** output) {
+    if (!output) return MCDR_OIT_NORMALIZATION_INVALID_REQUEST;
+    *output = nullptr;
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    auto batch = findNormalizationBatch(handle);
+    if (const int status = normalizationBatchStatus(context, batch); status != MCDR_OIT_NORMALIZATION_SUCCESS)
+        return status;
+    const auto& frame = *batch->frame;
+    if (!batch->averageRecorded || frame.batchOpen || batch->sequence != frame.batchSequence ||
+        frame.averagedPixels != static_cast<uint64_t>(frame.input.outputWidth) * frame.input.outputHeight)
+        return MCDR_OIT_NORMALIZATION_UNSUPPORTED;
+    *output = frame.corrected.Get();
+    return MCDR_OIT_NORMALIZATION_SUCCESS;
 }
 
 int queryNormalizationBatch(void* opaqueContext, void* handle, mcdr_oit_normalization_info_v1* output) {
@@ -604,7 +765,7 @@ int queryNormalizationBatch(void* opaqueContext, void* handle, mcdr_oit_normaliz
     output->availability = MCDR_OIT_NORMALIZATION_UNAVAILABLE;
     output->unavailableReason = MCDR_OIT_NORMALIZATION_UNAVAILABLE_STAGE_EXECUTION;
     output->residentCount = batch->input.residentCount;
-    output->targetCount = batch->programs->targetCount;
+    output->targetCount = batch->frame->targetCount;
     output->frameSerial = batch->input.frameSerial;
     output->programGeneration = batch->programs->generation;
     return MCDR_OIT_NORMALIZATION_SUCCESS;

@@ -67,7 +67,8 @@ PipelinePtr* MCDR_CALL mcdr_dx12CreateGraphicsPipeline(const mcdr_pipeline_desc*
 }
 
 static PipelinePtr* createGraphicsPipelineErased(const mcdr_pipeline_desc* desc, int32_t byteSize,
-    const mcdr_oit_capture_pipeline_v1* capture, std::shared_ptr<const void> normalizationProvenance = {}) {
+    const mcdr_oit_capture_pipeline_v1* capture, std::shared_ptr<const void> normalizationProvenance = {},
+    d3d12_mc::PipelineDesc::OpaqueSeedShaders opaqueSeed = {}) {
     using mcdr::abi::failWithPtr;
     using mcdr::abi::setLastErrorf;
 
@@ -77,6 +78,7 @@ static PipelinePtr* createGraphicsPipelineErased(const mcdr_pipeline_desc* desc,
 
     d3d12_mc::PipelineDesc d;
     d.normalizationProvenance = std::move(normalizationProvenance);
+    d.opaqueSeed = opaqueSeed;
     if (byteSize < 0 || byteSize > 128 || byteSize % 4 != 0) {
         return failWithPtr<PipelinePtr>(kCreate, "invalid root constant size");
     }
@@ -221,6 +223,90 @@ PipelinePtr* MCDR_CALL mcdr_dx12CreateOitNormalizationPipelineV1(const mcdr_pipe
     } catch (...) {
         return mcdr::abi::failWithPtr<PipelinePtr>(operation, "Normalization pipeline creation failed");
     }
+}
+
+PipelinePtr* MCDR_CALL mcdr_dx12CreateOitLaneOperationPipelineV1(const mcdr_pipeline_desc* desc,
+    uint32_t kind, uint64_t programGeneration, uint32_t projectionBinding) {
+    constexpr const char* operation = "mcdr_dx12CreateOitLaneOperationPipelineV1";
+    const bool depthCopy = kind == MCDR_OIT_LANE_DEPTH_COPY;
+    const bool boundsCopy = kind == MCDR_OIT_LANE_BOUNDS_COPY;
+    const bool boundsCull = kind == MCDR_OIT_LANE_BOUNDS_CULL;
+    if (!desc || !programGeneration || (!depthCopy && !boundsCopy && !boundsCull) || desc->pipelineFlags ||
+        desc->topology != 4 || desc->inputElementCount || desc->polygonMode != 0 ||
+        (depthCopy ? (desc->colorCount < 0 || desc->colorCount > 1) : desc->colorCount != 1) ||
+        (desc->colorCount && !desc->colorTargets) || desc->bindingCount < 1 ||
+        desc->bindingCount > kMaxPipelineBindings || !desc->bindings)
+        return mcdr::abi::failWithPtr<PipelinePtr>(operation, "Invalid lane operation pipeline");
+    if ((!boundsCopy && (desc->hasDepth != 1 || desc->depth.depthFormat != 51 ||
+            desc->depth.depthWrite != 1 || desc->depth.depthCompareOp != (boundsCull ? 5u : 0u))) ||
+        (boundsCopy && desc->hasDepth))
+        return mcdr::abi::failWithPtr<PipelinePtr>(operation, "Invalid lane operation depth state");
+    if (desc->colorCount) {
+        const auto& color = desc->colorTargets[0];
+        if (toDxgiFormat(color.format) != DXGI_FORMAT_R32G32B32A32_FLOAT ||
+            color.writeMask != (depthCopy ? 0u : 15u) || color.blendEnabled)
+            return mcdr::abi::failWithPtr<PipelinePtr>(operation, "Invalid lane operation color state");
+    }
+    if (boundsCull ? projectionBinding >= static_cast<uint32_t>(desc->bindingCount) ||
+            desc->bindings[projectionBinding].type != 0 :
+            projectionBinding != UINT32_MAX || desc->bindingCount != 1 || desc->bindings[0].type != 1)
+        return mcdr::abi::failWithPtr<PipelinePtr>(operation, "Invalid lane operation bindings");
+    auto* pipeline = createGraphicsPipelineErased(desc, 0, nullptr);
+    if (pipeline) pipeline->oitLaneOperation = {kind, projectionBinding, programGeneration};
+    return pipeline;
+}
+
+PipelinePtr* MCDR_CALL mcdr_dx12CreateOpaqueSeedPipelineV1(const mcdr_pipeline_desc* desc,
+    int32_t pushConstantBytes, const void* tileVertex, int32_t tileVertexBytes, const void* tileFragment,
+    int32_t tileFragmentBytes, uint64_t programGeneration) {
+    constexpr const char* operation = "mcdr_dx12CreateOpaqueSeedPipelineV1";
+    if (!desc || !programGeneration || !tileVertex || tileVertexBytes <= 0 || !tileFragment || tileFragmentBytes <= 0 ||
+        desc->hasDepth != 1 || desc->depth.depthWrite != 1 || toDxgiFormat(desc->depth.depthFormat) != DXGI_FORMAT_D32_FLOAT ||
+        (desc->pipelineFlags & ~1u) || desc->polygonMode != 0)
+        return mcdr::abi::failWithPtr<PipelinePtr>(operation, "Invalid opaque depth seed pipeline");
+    try {
+        return createGraphicsPipelineErased(desc, pushConstantBytes, nullptr, {}, {
+            {static_cast<const char*>(tileVertex), static_cast<size_t>(tileVertexBytes)},
+            {static_cast<const char*>(tileFragment), static_cast<size_t>(tileFragmentBytes)}, programGeneration});
+    } catch (const std::exception& failure) {
+        return mcdr::abi::failWithPtr<PipelinePtr>(operation, failure.what());
+    }
+}
+
+PipelinePtr* MCDR_CALL mcdr_dx12CreateOitTileIAPipelineV1(const mcdr_pipeline_desc* desc,
+    int32_t pushConstantBytes, const void* tileVertex, int32_t tileVertexBytes, const void* tileFragment,
+    int32_t tileFragmentBytes, uint64_t programGeneration, const uint32_t* laneRegisters, uint32_t stage) try {
+    constexpr const char* operation = "mcdr_dx12CreateOitTileIAPipelineV1";
+    if (!desc || !programGeneration || !tileVertex || tileVertexBytes <= 0 || !tileFragment ||
+        tileFragmentBytes <= 0 || !laneRegisters || stage > 2 || desc->pipelineFlags ||
+        desc->hasDepth != 1 || toDxgiFormat(desc->depth.depthFormat) != DXGI_FORMAT_D32_FLOAT)
+        return mcdr::abi::failWithPtr<PipelinePtr>(operation, "Invalid tile IA pipeline");
+    d3d12_mc::PipelineDesc::OpaqueSeedShaders route{
+        {static_cast<const char*>(tileVertex), static_cast<size_t>(tileVertexBytes)},
+        {static_cast<const char*>(tileFragment), static_cast<size_t>(tileFragmentBytes)}, programGeneration, stage};
+    std::copy_n(laneRegisters, route.laneRegisters.size(), route.laneRegisters.begin());
+    return createGraphicsPipelineErased(desc, pushConstantBytes, nullptr, {}, route);
+} catch (const std::exception& failure) {
+    return mcdr::abi::failWithPtr<PipelinePtr>("mcdr_dx12CreateOitTileIAPipelineV1", failure.what());
+}
+
+int32_t MCDR_CALL mcdr_dx12AttachOitTileIARouteV1(PipelinePtr* source, PipelinePtr* base) {
+    constexpr const char* operation = "mcdr_dx12AttachOitTileIARouteV1";
+    const auto bindingPrefix = [](const auto& baseBindings, const auto& sourceBindings) {
+        return sourceBindings.size() >= baseBindings.size() &&
+            std::equal(baseBindings.begin(), baseBindings.end(), sourceBindings.begin());
+    };
+    if (!source || !base || source == base || !base->tileRoute || source->tileRoute ||
+        base->tileRoute->tileStage > 2 || source->isMesh || base->isMesh ||
+        source->topology != base->topology || source->vertexStrides != base->vertexStrides ||
+        source->pushConstantBytes != base->pushConstantBytes || source->depthWrite != base->depthWrite ||
+        source->depthTargetFormat != base->depthTargetFormat ||
+        !bindingPrefix(base->graphicsBindingTypes, source->graphicsBindingTypes) ||
+        !bindingPrefix(base->graphicsBindingRegisters, source->graphicsBindingRegisters) ||
+        !bindingPrefix(base->colorTargetFormats, source->colorTargetFormats))
+        return mcdr::abi::failWith(operation, "Tile IA variant differs from its source layout");
+    source->tileRoute = base->tileRoute;
+    return 1;
 }
 
 PipelinePtr* MCDR_CALL mcdr_dx12CreateGraphicsCapturePipelineV1(const mcdr_pipeline_desc* desc, uint32_t byteSize,

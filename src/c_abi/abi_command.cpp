@@ -44,21 +44,50 @@ int reportVanillaPostResult(const char* operation, int result) {
     return result;
 }
 
+int reportDepthSeedStatus(const char* operation, vanilla::WorldDepthSeedStatus status) {
+    using vanilla::WorldDepthSeedStatus;
+    if (status == WorldDepthSeedStatus::Ready) return 1;
+    if (status == WorldDepthSeedStatus::NotArmed) return 0;
+    mcdr::abi::setLastErrorf(operation, "Seed capture failed (%u)", static_cast<unsigned>(status));
+    switch (status) {
+        case WorldDepthSeedStatus::LateArm: return -2;
+        case WorldDepthSeedStatus::BudgetExceeded: return -3;
+        case WorldDepthSeedStatus::Busy: return -4;
+        case WorldDepthSeedStatus::StaleRecording: return -5;
+        case WorldDepthSeedStatus::Incomplete: return -6;
+        case WorldDepthSeedStatus::Cancelled: return -7;
+        case WorldDepthSeedStatus::RecordingFailed: return -8;
+        default: return -1;
+    }
+}
+
 }  // namespace
 
 extern "C" int32_t MCDR_CALL mcdr_dx12PrepareFramePrograms(mcdr_command_ctx* context,
     uint64_t generation, uint32_t flags, void** candidate) {
+    return mcdr_dx12PrepareFrameProgramsV2(context, generation, flags, nullptr, 0, candidate);
+}
+
+extern "C" int32_t MCDR_CALL mcdr_dx12PrepareFrameProgramsV2(mcdr_command_ctx* context,
+    uint64_t generation, uint32_t flags, const mcdr_oit_normalization_program_v1* normalizationPrograms,
+    uint32_t normalizationProgramCount, void** candidate) {
+    constexpr const char* operation = "mcdr_dx12PrepareFrameProgramsV2";
     if (candidate) *candidate = nullptr;
+    if (normalizationPrograms ? normalizationProgramCount != 3 : normalizationProgramCount != 0) {
+        mcdr::abi::setLastError(operation, "Expected an empty or three-entry normalization program array");
+        return MCDR_FRAME_PROGRAMS_INVALID_REQUEST;
+    }
     try {
-        const auto result = vanilla::prepareFramePrograms(context, generation, flags, candidate);
+        const auto* normalization = reinterpret_cast<const mcdr_oit_normalization_program_v1 (*)[3]>(normalizationPrograms);
+        const auto result = vanilla::prepareFramePrograms(context, generation, flags, candidate, normalization);
         if (result != MCDR_FRAME_PROGRAMS_SUCCESS)
-            mcdr::abi::setLastError("mcdr_dx12PrepareFramePrograms", vanilla::frameProgramsFailureText());
+            mcdr::abi::setLastError(operation, vanilla::frameProgramsFailureText());
         return result;
     } catch (const std::exception& failure) {
-        mcdr::abi::setLastError("mcdr_dx12PrepareFramePrograms", failure.what());
+        mcdr::abi::setLastError(operation, failure.what());
         return MCDR_FRAME_PROGRAMS_COMPILATION_FAILED;
     } catch (...) {
-        mcdr::abi::setLastError("mcdr_dx12PrepareFramePrograms", "Frame program preparation failed");
+        mcdr::abi::setLastError(operation, "Frame program preparation failed");
         return MCDR_FRAME_PROGRAMS_COMPILATION_FAILED;
     }
 }
@@ -86,6 +115,23 @@ extern "C" int32_t MCDR_CALL mcdr_dx12VanillaBeginFrame(mcdr_command_ctx* contex
                                                           const mcdr_vanilla_frame_input* input) {
     return reportVanillaPostResult("mcdr_dx12VanillaBeginFrame",
         vanilla::beginFrame(context, input, sizeof(*input)));
+}
+
+extern "C" int32_t MCDR_CALL mcdr_dx12VanillaRegisterWorldDepthV1(
+    mcdr_command_ctx* context, mcdr_object* depth) {
+    return reportVanillaPostResult("mcdr_dx12VanillaRegisterWorldDepthV1",
+        vanilla::registerWorldDepthV1(context, depth));
+}
+
+extern "C" int32_t MCDR_CALL mcdr_dx12VanillaArmWorldDepthSeedV1(
+    mcdr_command_ctx* context, uint32_t maxEvents, uint64_t totalBudgetBytes) {
+    return reportDepthSeedStatus("mcdr_dx12VanillaArmWorldDepthSeedV1",
+        vanilla::armWorldDepthSeedCaptureV1(context, maxEvents, totalBudgetBytes));
+}
+
+extern "C" int32_t MCDR_CALL mcdr_dx12VanillaSealWorldDepthSeedV1(mcdr_command_ctx* context) {
+    return reportDepthSeedStatus("mcdr_dx12VanillaSealWorldDepthSeedV1",
+        vanilla::sealWorldDepthSeedCaptureV1(context, nullptr));
 }
 
 extern "C" int32_t MCDR_CALL mcdr_dx12VanillaWorldReady(mcdr_command_ctx* context,

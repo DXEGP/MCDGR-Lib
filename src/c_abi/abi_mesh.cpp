@@ -8,6 +8,7 @@ module;
 #include "_d3d12_module_prelude.h"
 #include "mcdr_graphics_capture.h"
 #include "mcdr_terrain_tile_adapter.h"
+#include <span>
 
 module mcdr.abi.common;
 
@@ -141,6 +142,14 @@ int32_t MCDR_CALL mcdr_dx12DrawTerrainWorkGraph(void* context, void* batch,
     return 1;
 }
 
+int32_t MCDR_CALL mcdr_dx12DrawTerrainWorkGraphV2(void* context, void* batch,
+    void* vertexBuffer, uint64_t vertexOffset, uint64_t vertexBytes) {
+    constexpr const char* operation = "mcdr_dx12DrawTerrainWorkGraphV2";
+    if (!vertexBytes) return mcdr::abi::failWith(operation, "Missing vertex range");
+    auto result = drawTerrainWorkGraph(context, batch, vertexBuffer, vertexOffset, vertexBytes);
+    return result ? 1 : mcdr::abi::failWith(operation, result.error().message);
+}
+
 void MCDR_CALL mcdr_dx12DestroyTerrainBatch(void* batch) {
     destroyTerrainBatch(batch);
 }
@@ -155,7 +164,7 @@ int32_t MCDR_CALL mcdr_dx12DispatchWorkGraph(mcdr_command_ctx* ctx, void* progra
     if (bindingCount > 32 || (bindingCount != 0 && !buffers)) {
         return mcdr::abi::failWith("mcdr_dx12DispatchWorkGraph", "Invalid binding count");
     }
-    std::vector<void*> handles(bindingCount);
+    std::array<void*, 32> handles{};
     for (uint32_t index = 0; index < bindingCount; ++index) handles[index] = buffers[index];
     auto result = mcdr::workgraph::dispatchBuffers(ctx, program, records, recordCount,
         recordStride, handles.data(), offsets, lengths, bindingCount);
@@ -169,7 +178,7 @@ int32_t MCDR_CALL mcdr_dx12DispatchWorkGraphGpuBuffers(mcdr_command_ctx* ctx, vo
     if (bindingCount > 32 || (bindingCount != 0 && !buffers)) {
         return mcdr::abi::failWith("mcdr_dx12DispatchWorkGraphGpuBuffers", "Invalid binding count");
     }
-    std::vector<void*> handles(bindingCount);
+    std::array<void*, 32> handles{};
     for (uint32_t index = 0; index < bindingCount; ++index) handles[index] = buffers[index];
     auto result = mcdr::workgraph::dispatchGpuBuffers(ctx, program, inputSchema, inputBuffer,
         inputOffset, inputBytes, handles.data(), offsets, lengths, bindingCount);
@@ -413,11 +422,33 @@ int32_t MCDR_CALL mcdr_dx12BindTerrainTilePipelineV1(void* route, PipelinePtr* t
     return 1;
 }
 
+int32_t MCDR_CALL mcdr_dx12BindTerrainTileEnvelopeV1(void* route, const void* dxil, uint32_t bytes) {
+    const auto result = d3d12_mc::bindTerrainTileEnvelopeV1(route, dxil, bytes);
+    if (!result) return mcdr::abi::failWith("terrain.tile.envelope", result.error().message);
+    return 1;
+}
+
 int32_t MCDR_CALL mcdr_dx12BindTerrainTileStageV2(PipelinePtr* source, void* route,
     const mcdr_terrain_tile_stage_v2* contract) {
     if (!contract) return mcdr::abi::failWith("terrain.tile.stage", "Tile stage contract is null");
     const auto result = d3d12_mc::bindTerrainTileStageV2(source, route, *contract);
     if (!result) return mcdr::abi::failWith("terrain.tile.stage", result.error().message);
+    return 1;
+}
+
+int32_t MCDR_CALL mcdr_dx12BindTerrainTileStageV3(PipelinePtr* source, void* route,
+    const mcdr_terrain_tile_stage_v2* contract, const uint32_t* laneRegisters) {
+    if (!contract || !laneRegisters)
+        return mcdr::abi::failWith("terrain.tile.stage", "Missing tile stage contract or lane registers");
+    const auto result = d3d12_mc::bindTerrainTileStageV2(source, route, *contract, std::span{laneRegisters, 5});
+    if (!result) return mcdr::abi::failWith("terrain.tile.stage", result.error().message);
+    return 1;
+}
+
+int32_t MCDR_CALL mcdr_dx12BindTerrainOpaqueSeedV1(PipelinePtr* source, void* route,
+    uint64_t programGeneration, uint32_t quadsPerMeshlet) {
+    const auto result = d3d12_mc::bindTerrainOpaqueSeedV1(source, route, programGeneration, quadsPerMeshlet);
+    if (!result) return mcdr::abi::failWith("terrain.seed.route", result.error().message);
     return 1;
 }
 

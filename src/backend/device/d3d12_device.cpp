@@ -5,6 +5,7 @@ module;
 #include "mcdr_graphics_capture.h"
 #include "mcdr_graphics_recording.h"
 #include "mcdr_oit_budget.h"
+#include <span>
 #include "mcdr_rt_state.h"  // P117: 光追模式（创建期日志/后续 G-Buffer 都要读）
 
 // RTX（DLSS/NRD）可用性探测接口。和 dxcapi.h 同理必须放在全局模块片段里，
@@ -62,6 +63,12 @@ Dx12Surface* gActiveSurface = nullptr;
 
 namespace {
 std::atomic<uint64_t> nextSampledTextureOwnerGeneration{1};
+
+void invalidateGraphicsBindingReadCache(CommandContext* context) {
+    if (!context) return;
+    context->graphicsBindingReadCache.clear();
+    context->graphicsBindingReadCacheValid = false;
+}
 
 DeviceContext* makeDeviceContext() {
     return new DeviceContext();
@@ -2178,10 +2185,17 @@ void retireTextureWriteRecordings(Dx12Object& texture, const std::shared_ptr<con
         }
     }
 }
-bool textureWriteOrderingAvailable(const Dx12Object& texture, const std::shared_ptr<const void>& identity) {
-    if (texture.textureWriteRecording.identity && texture.textureWriteRecording.identity != identity) return false;
+bool hasPriorTextureSubmission(const CommandContext& context, const ID3D12Fence* fence, uint64_t submission) {
+    return fence == context.fence.Get() && submission && submission <= context.fenceValue;
+}
+bool textureWriteOrderingAvailable(const Dx12Object& texture, const CommandContext* context) {
+    const auto hasOrdering = [context](const TextureWriteRecording& recording) {
+        return !recording.identity || (context && (recording.identity == context->recordingIdentity ||
+            hasPriorTextureSubmission(*context, recording.fence.Get(), recording.submission)));
+    };
+    if (!hasOrdering(texture.textureWriteRecording)) return false;
     for (auto* entry = texture.additionalTextureWriteRecordings.get(); entry; entry = entry->next.get()) {
-        if (entry->recording.identity != identity) return false;
+        if (!hasOrdering(entry->recording)) return false;
     }
     return true;
 }
@@ -2240,9 +2254,19 @@ bool sampledCoverageOverlaps(const SampledTextureVersion& version, uint32_t firs
     return false;
 }
 struct PacketContentObjects {
+    ComPtr<ID3D12Fence> fence;
+    uint64_t submission = 0;
+    std::shared_ptr<mcdr::oit_budget::Reservation> budget;
+    std::shared_ptr<mcdr::oit_budget::Reservation> descriptorBudget;
+    std::vector<std::shared_ptr<mcdr::oit_budget::Reservation>> resourceBudgets;
     ComPtr<ID3D12DescriptorHeap> descriptors;
     std::vector<std::unique_ptr<Dx12Object>> objects;
 };
+bool addPacketContentBudget(uint64_t& total, uint64_t bytes) {
+    if (bytes > UINT64_MAX - total) return false;
+    total += bytes;
+    return true;
+}
 }
 
 SampledTextureContentCapture captureSampledTextureContent(void* opaqueContext, void* opaqueView,
@@ -2310,7 +2334,7 @@ SampledTextureContentCapture captureSampledTextureContent(void* opaqueContext, v
     try {
         if (texture->closeRequested.load(std::memory_order_acquire)) return result;
         retireTextureWriteRecordings(*texture, context->recordingIdentity);
-        if (!textureWriteOrderingAvailable(*texture, context->recordingIdentity)) {
+        if (!textureWriteOrderingAvailable(*texture, context)) {
             result.status = SampledTextureContentStatus::OrderingUnavailable;
             return result;
         }
@@ -2337,10 +2361,13 @@ SampledTextureContentCapture captureSampledTextureContent(void* opaqueContext, v
             }
             if (existing->number == owner->number) {
                 if (existing->recording != context->recordingIdentity) {
-                    result.status = SampledTextureContentStatus::OrderingUnavailable;
-                    return result;
+                    if (!hasPriorTextureSubmission(*context, existing->fence.Get(), existing->submission)) {
+                        result.status = SampledTextureContentStatus::OrderingUnavailable;
+                        return result;
+                    }
+                } else {
+                    version = std::move(existing);
                 }
-                version = std::move(existing);
             }
             ++iterator;
         }
@@ -2525,7 +2552,8 @@ SampledTextureContentStatus prepareSampledTextureWrite(void* opaqueContext, void
         size_t conflictCount = 0;
         for (auto iterator = owner->versions.begin(); iterator != owner->versions.end();) {
             auto version = iterator->lock();
-            if (!version || sampledVersionCompleted(*version)) {
+            if (!version || sampledVersionCompleted(*version) ||
+                hasPriorTextureSubmission(*context, version->fence.Get(), version->submission)) {
                 iterator = owner->versions.erase(iterator);
                 continue;
             }
@@ -2545,7 +2573,9 @@ SampledTextureContentStatus prepareSampledTextureWrite(void* opaqueContext, void
         conflicts.reserve(conflictCount);
         for (const auto& weak : owner->versions) {
             auto version = weak.lock();
-            if (version && !version->savedReady && sampledCoverageOverlaps(*version, firstSubresource, subresourceCount))
+            if (version && !version->savedReady && !sampledVersionCompleted(*version) &&
+                !hasPriorTextureSubmission(*context, version->fence.Get(), version->submission) &&
+                sampledCoverageOverlaps(*version, firstSubresource, subresourceCount))
                 conflicts.push_back(std::move(version));
         }
         for (const auto& version : conflicts) {
@@ -2621,7 +2651,7 @@ SampledTextureCpuWrite prepareSampledTextureCpuWrite(void* opaqueTexture,
         if (texture->closeRequested.load(std::memory_order_acquire) || !total || !subresourceCount ||
             firstSubresource >= *total || subresourceCount > *total - firstSubresource) return {};
         retireTextureWriteRecordings(*texture, {});
-        if (!textureWriteOrderingAvailable(*texture, {})) return {SampledTextureContentStatus::OrderingUnavailable};
+        if (!textureWriteOrderingAvailable(*texture, nullptr)) return {SampledTextureContentStatus::OrderingUnavailable};
         auto owner = std::static_pointer_cast<SampledTextureOwner>(texture->sampledContentOwner.load(std::memory_order_acquire));
         if (owner) {
             if (owner->closed || owner->number == UINT64_MAX) return {};
@@ -2670,13 +2700,33 @@ SampledTextureContentStatus prepareSampledRenderPassWrites(void* opaqueContext) 
     return SampledTextureContentStatus::Ready;
 }
 
-std::shared_ptr<const void> retainPacketContent(void* opaqueContext, void* opaqueRanges, uint32_t count) {
+std::shared_ptr<const void> retainPacketContent(void* opaqueContext, void* opaqueRanges, uint32_t count,
+    uint64_t budgetLimit) {
     auto* context = static_cast<CommandContext*>(opaqueContext);
     if (!context || !context->listOpen || !context->commandList || context->submissionFailed.load() || context->recordingFailed.load() ||
-        !context->recordingIdentity || !opaqueRanges || !count) return {};
-    auto content = std::make_shared<PacketContentLease>();
+        !context->recordingIdentity || !context->fence || context->fenceValue == UINT64_MAX || !opaqueRanges || !count) return {};
+    uint64_t contentBudgetBytes = sizeof(PacketContentLease) + sizeof(mcdr::oit_budget::Reservation);
+    if (!addPacketContentBudget(contentBudgetBytes, uint64_t(count) * sizeof(PacketContentRange)) ||
+        !addPacketContentBudget(contentBudgetBytes, uint64_t(count) * sizeof(PacketContentRange)) ||
+        !addPacketContentBudget(contentBudgetBytes, uint64_t(count) * sizeof(PacketContentTextureView))) return {};
+    auto contentBudget = mcdr::oit_budget::reserve(contentBudgetBytes, budgetLimit);
+    if (!contentBudget) return {};
+    std::shared_ptr<PacketContentLease> content;
+    try {
+        content = std::make_shared<PacketContentLease>();
+        content->budget = std::move(contentBudget);
+        content->reads.reserve(count);
+        content->frozenReads.reserve(count);
+        content->frozenViews.reserve(count);
+    } catch (...) {
+        return {};
+    }
     const auto* ranges = static_cast<const PacketContentRange*>(opaqueRanges);
-    content->reads.assign(ranges, ranges + count);
+    try {
+        content->reads.assign(ranges, ranges + count);
+    } catch (...) {
+        return {};
+    }
     content->fence = context->fence;
     content->submission = context->fenceValue + 1;
     content->recordingIdentity = context->recordingIdentity;
@@ -2710,7 +2760,8 @@ std::shared_ptr<const void> retainPacketContent(void* opaqueContext, void* opaqu
             (description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || description.SampleDesc.Count != 1 ||
                 *subresources != uint32_t(description.MipLevels) * description.DepthOrArraySize ||
                 !range.object || range.object->kind != Dx12Object::Kind::Texture ||
-                range.object->resource != range.resource || range.cpuWritable ||
+                range.object->resource != range.resource || range.cpuWritable || range.byteOffset ||
+                range.byteLength ||
                 (description.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                     D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) != 0)) {
             content->status = PacketContentStatus::UnsupportedContent;
@@ -2739,8 +2790,10 @@ std::shared_ptr<const void> retainPacketContent(void* opaqueContext, void* opaqu
                 return content;
             }
             const uint32_t firstMip = cube ? srv.TextureCube.MostDetailedMip : srv.Texture2D.MostDetailedMip;
-            const uint32_t mipCount = cube ? srv.TextureCube.MipLevels : srv.Texture2D.MipLevels;
+            const uint32_t declaredMipCount = cube ? srv.TextureCube.MipLevels : srv.Texture2D.MipLevels;
             const uint32_t layerCount = cube ? 6u : 1u;
+            const uint32_t mipCount = declaredMipCount == UINT32_MAX && firstMip < description.MipLevels
+                ? description.MipLevels - firstMip : declaredMipCount;
             if (firstMip >= description.MipLevels || mipCount == 0 ||
                 mipCount > description.MipLevels - firstMip || layerCount > description.DepthOrArraySize ||
                 (!cube && srv.Texture2D.PlaneSlice != 0)) {
@@ -2762,15 +2815,47 @@ std::shared_ptr<const void> retainPacketContent(void* opaqueContext, void* opaqu
             }
         }
     }
-    content->frozenReads.reserve(content->reads.size());
-    auto frozenOwner = std::make_shared<PacketContentObjects>();
+    uint64_t ownerBudgetBytes = sizeof(PacketContentObjects);
+    const uint64_t objectCapacity = uint64_t(count) * 2u;
+    if (objectCapacity > SIZE_MAX ||
+        !addPacketContentBudget(ownerBudgetBytes, objectCapacity * sizeof(std::unique_ptr<Dx12Object>)) ||
+        objectCapacity > UINT64_MAX / sizeof(Dx12Object) ||
+        !addPacketContentBudget(ownerBudgetBytes, objectCapacity * sizeof(Dx12Object)) ||
+        !addPacketContentBudget(ownerBudgetBytes,
+            uint64_t(count) * sizeof(std::shared_ptr<mcdr::oit_budget::Reservation>)) ||
+        !addPacketContentBudget(ownerBudgetBytes, uint64_t(count) * sizeof(Dx12Object*)) ||
+        !addPacketContentBudget(ownerBudgetBytes,
+            (uint64_t(count) + 1u) * sizeof(mcdr::oit_budget::Reservation))) {
+        content->status = PacketContentStatus::UnsupportedContent;
+        return content;
+    }
+    std::shared_ptr<PacketContentObjects> frozenOwner;
+    try {
+        frozenOwner = std::make_shared<PacketContentObjects>();
+        frozenOwner->budget = mcdr::oit_budget::reserve(ownerBudgetBytes, budgetLimit);
+        if (!frozenOwner->budget) {
+            content->status = PacketContentStatus::UnsupportedContent;
+            return content;
+        }
+        frozenOwner->fence = context->fence;
+        frozenOwner->submission = content->submission;
+        frozenOwner->resourceBudgets.reserve(content->reads.size());
+        frozenOwner->objects.reserve(static_cast<size_t>(objectCapacity));
+    } catch (...) {
+        content->status = PacketContentStatus::UnsupportedContent;
+        return content;
+    }
     content->frozenOwner = frozenOwner;
-    const auto makeFrozenObject = [&]() {
-        auto object = std::make_unique<Dx12Object>();
-        object->packetContentOwner = frozenOwner;
-        auto* retained = object.get();
-        frozenOwner->objects.push_back(std::move(object));
-        return retained;
+    const auto makeFrozenObject = [&]() -> Dx12Object* {
+        try {
+            auto object = std::make_unique<Dx12Object>();
+            object->packetContentOwner = frozenOwner;
+            auto* retained = object.get();
+            frozenOwner->objects.push_back(std::move(object));
+            return retained;
+        } catch (...) {
+            return nullptr;
+        }
     };
     for (const auto& range : content->reads) {
         const auto existing = std::find_if(content->frozenReads.begin(), content->frozenReads.end(),
@@ -2818,12 +2903,28 @@ std::shared_ptr<const void> retainPacketContent(void* opaqueContext, void* opaqu
             }
             frozenDescription.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
         } else {
-            frozenDescription.Width = (range.byteLength + 255u) & ~255u;
+            frozenDescription.Width = (range.byteLength + 255ull) & ~255ull;
+        }
+        const auto allocation = gCtx.device->GetResourceAllocationInfo(0, 1, &frozenDescription);
+        if (!allocation.SizeInBytes || allocation.SizeInBytes == UINT64_MAX) {
+            content->status = PacketContentStatus::UnsupportedContent;
+            return content;
+        }
+        auto resourceBudget = mcdr::oit_budget::reserve(allocation.SizeInBytes, budgetLimit);
+        if (!resourceBudget) {
+            content->status = PacketContentStatus::UnsupportedContent;
+            return content;
         }
         const auto frozenInitial = range.cpuWritable ? D3D12_RESOURCE_STATE_GENERIC_READ
             : D3D12_RESOURCE_STATE_COPY_DEST;
         if (FAILED(gCtx.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &frozenDescription,
                 frozenInitial, nullptr, IID_PPV_ARGS(&frozenResource)))) {
+            content->status = PacketContentStatus::UnsupportedContent;
+            return content;
+        }
+        try {
+            frozenOwner->resourceBudgets.push_back(std::move(resourceBudget));
+        } catch (...) {
             content->status = PacketContentStatus::UnsupportedContent;
             return content;
         }
@@ -2854,6 +2955,10 @@ std::shared_ptr<const void> retainPacketContent(void* opaqueContext, void* opaqu
             if (unmapSource) range.resource->Unmap(0, nullptr);
         }
         auto object = makeFrozenObject();
+        if (!object) {
+            content->status = PacketContentStatus::UnsupportedContent;
+            return content;
+        }
         object->kind = texture ? Dx12Object::Kind::Texture : Dx12Object::Kind::Buffer;
         object->resource = frozenResource;
         object->heapType = heap.Type;
@@ -2867,11 +2972,24 @@ std::shared_ptr<const void> retainPacketContent(void* opaqueContext, void* opaqu
         content->frozenReads.push_back(std::move(frozen));
     }
     std::vector<Dx12Object*> views;
+    try {
+        views.reserve(content->frozenReads.size());
+    } catch (...) {
+        content->status = PacketContentStatus::UnsupportedContent;
+        return content;
+    }
     for (const auto& range : content->frozenReads) {
         if (range.view && std::find(views.begin(), views.end(), range.view) == views.end())
             views.push_back(range.view);
     }
     if (!views.empty()) {
+        const uint64_t descriptorBytes = std::max<uint64_t>(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+            uint64_t(views.size()) * gCtx.srvInc);
+        frozenOwner->descriptorBudget = mcdr::oit_budget::reserve(descriptorBytes, budgetLimit);
+        if (!frozenOwner->descriptorBudget) {
+            content->status = PacketContentStatus::UnsupportedContent;
+            return content;
+        }
         D3D12_DESCRIPTOR_HEAP_DESC description{};
         description.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         description.NumDescriptors = static_cast<UINT>(views.size());
@@ -2888,9 +3006,22 @@ std::shared_ptr<const void> retainPacketContent(void* opaqueContext, void* opaqu
                 return content;
             }
             auto view = makeFrozenObject();
+            if (!view) {
+                content->status = PacketContentStatus::UnsupportedContent;
+                return content;
+            }
             view->kind = Dx12Object::Kind::TextureView;
             view->sourceTexture = read->object;
             view->srvDesc = sourceView->srvDesc;
+            if (view->srvDesc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE) {
+                if (view->srvDesc.TextureCube.MipLevels == UINT32_MAX)
+                    view->srvDesc.TextureCube.MipLevels = read->resource->GetDesc().MipLevels -
+                        view->srvDesc.TextureCube.MostDetailedMip;
+            } else if (view->srvDesc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D &&
+                view->srvDesc.Texture2D.MipLevels == UINT32_MAX) {
+                view->srvDesc.Texture2D.MipLevels = read->resource->GetDesc().MipLevels -
+                    view->srvDesc.Texture2D.MostDetailedMip;
+            }
             view->hasSrvDesc = true;
             view->cpuHandle = descriptor;
             gCtx.device->CreateShaderResourceView(read->resource.Get(), &view->srvDesc, descriptor);
@@ -2900,7 +3031,28 @@ std::shared_ptr<const void> retainPacketContent(void* opaqueContext, void* opaqu
     }
     context->recordingLeases[context->currentListSlot].push_back(content);
     try {
+        uint64_t copiedCapacity = 0;
+        for (const auto& frozen : content->frozenReads) {
+            if (!frozen.immutableOwner && !frozen.cpuWritable &&
+                !addPacketContentBudget(copiedCapacity, frozen.subresourceCount)) {
+                content->status = PacketContentStatus::UnsupportedContent;
+                return content;
+            }
+        }
+        uint64_t copiedBudgetBytes = 0;
+        if (copiedCapacity > UINT64_MAX / sizeof(std::pair<ID3D12Resource*, uint32_t>) ||
+            !addPacketContentBudget(copiedBudgetBytes,
+                copiedCapacity * sizeof(std::pair<ID3D12Resource*, uint32_t>))) {
+            content->status = PacketContentStatus::UnsupportedContent;
+            return content;
+        }
+        auto copiedBudget = mcdr::oit_budget::reserve(copiedBudgetBytes, budgetLimit);
+        if (copiedCapacity && !copiedBudget) {
+            content->status = PacketContentStatus::UnsupportedContent;
+            return content;
+        }
         std::vector<std::pair<ID3D12Resource*, uint32_t>> copied;
+        copied.reserve(static_cast<size_t>(copiedCapacity));
         for (const auto& frozen : content->frozenReads) {
             if (frozen.immutableOwner || frozen.cpuWritable) continue;
             const bool texture = frozen.resource->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -2942,6 +3094,9 @@ std::shared_ptr<const void> retainPacketContent(void* opaqueContext, void* opaqu
                 }
             }
         }
+    } catch (const std::bad_alloc&) {
+        content->status = PacketContentStatus::UnsupportedContent;
+        return content;
     } catch (...) {
         content->status = PacketContentStatus::StaleRecording;
         context->recordingFailed.store(true, std::memory_order_release);
@@ -3481,11 +3636,17 @@ mcdr::Result<void*> createCommandEncoder() {
                                                   nullptr, IID_PPV_ARGS(&ctx->commandLists[i])))) {
             return mcdr::err("createCommandEncoder", "createCommandEncoder: CreateCommandList failed");
         }
+        const HRESULT workGraphInterface = ctx->commandLists[i].As(&ctx->workGraphCommandLists[i]);
+        if (FAILED(workGraphInterface) && (workGraphInterface != E_NOINTERFACE ||
+            gCtx.caps.workGraphsTier >= D3D12_WORK_GRAPHS_TIER_1_0)) {
+            return mcdr::err("createCommandEncoder", "Work Graph command list interface is unavailable");
+        }
         // 初始 closed 状态；beginCommandList 时 Reset。
         ctx->commandLists[i]->Close();
     }
     ctx->currentListSlot = 0;
     ctx->commandList = ctx->commandLists[0].Get();
+    ctx->workGraphCommandList = ctx->workGraphCommandLists[0].Get();
     if (FAILED(gCtx.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&ctx->fence)))) {
         return mcdr::err("createCommandEncoder", "createCommandEncoder: CreateFence failed");
     }
@@ -3545,7 +3706,9 @@ int destroyCommandEncoderChecked(CommandContext* ctx) {
         for (const auto& list : ctx->commandLists) gRecordingContexts.erase(list.Get());
     }
     ctx->commandList = nullptr;
+    ctx->workGraphCommandList = nullptr;
     for (auto& list : ctx->commandLists) list.Reset();
+    for (auto& list : ctx->workGraphCommandLists) list.Reset();
     if (ctx->recordingDiscarded) ctx->recordingDiscarded->store(true, std::memory_order_release);
     delete ctx;
     dbgLogInfo("destroyCommandEncoder: done ctx=%p", reinterpret_cast<void*>(ctx));
@@ -3587,6 +3750,7 @@ mcdr::Result<void> beginCommandList(CommandContext* ctx) {
     UINT slot = static_cast<UINT>(ctx->fenceValue % 3u);
     ctx->currentListSlot = slot;
     ctx->commandList = ctx->commandLists[slot].Get();
+    ctx->workGraphCommandList = ctx->workGraphCommandLists[slot].Get();
     // P55：DX12_CMD_RING=0 回退为旧的串行行为（等最近一次提交的 per-list fence，
     // 即帧 N-1），便于 AB 对比/出问题快速回退。默认开启三路 ring。
     static const bool sCmdRing = [] {
@@ -3829,7 +3993,12 @@ mcdr::Result<void> beginCommandListWithWait(CommandContext* ctx, UINT64 waitForV
     }
     dbgLogDebug("beginCommandListWithWait: list reset ok");
     if (ctx->recordingDiscarded) ctx->recordingDiscarded->store(true, std::memory_order_release);
-    ctx->recordingLeases[ctx->currentListSlot].clear();
+    const auto completed = ctx->fence->GetCompletedValue();
+    for (UINT slot = 0; slot < std::size(ctx->recordingLeases); ++slot) {
+        if (slot == ctx->currentListSlot ||
+            (completed != UINT64_MAX && ctx->slotFence[slot] && ctx->slotFence[slot] <= completed))
+            ctx->recordingLeases[slot].clear();
+    }
     ctx->recordingIdentity = std::move(recordingIdentity);
     ctx->recordingDiscarded = std::move(recordingDiscarded);
     ctx->recordingFailed.store(false, std::memory_order_release);
@@ -4500,6 +4669,18 @@ static D3D12_CLEAR_FLAGS depthClearFlags(DXGI_FORMAT format) {
     return D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL;
 }
 
+static SampledTextureContentStatus prepareDepthClearWrites(CommandContext* context, Dx12Object* texture) {
+    if (texture->dxgiFormat != DXGI_FORMAT_D32_FLOAT) return SampledTextureContentStatus::Ready;
+    const auto description = texture->resource->GetDesc();
+    if (description.MipLevels == 1)
+        return prepareSampledTextureWrite(context, texture, 0, description.DepthOrArraySize);
+    for (uint32_t layer = 0; layer < description.DepthOrArraySize; ++layer) {
+        const auto status = prepareSampledTextureWrite(context, texture, layer * description.MipLevels, 1);
+        if (status != SampledTextureContentStatus::Ready) return status;
+    }
+    return SampledTextureContentStatus::Ready;
+}
+
 // P64：取（或创建）(资源, mip) 对应的帧级瞬态 RTV。同一命令列表内复用同一 CPU 句柄，
 // 免去重复的 CreateRenderTargetView 驱动调用。句柄有效性由 beginCommandList 中
 // gNextFrameRtv 清零 + rtvCache.clear() 同步保证（两者必须同点发生）。
@@ -4604,8 +4785,7 @@ mcdr::Result<void> clearDepthTexture(CommandContext* ctx, Dx12Object* tex, doubl
     auto dsvRes = frameDsvFor(ctx, tex, 0);
     if (!dsvRes) return mcdr::err("clearDepthTexture", errorMessage(dsvRes.error()));
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = *dsvRes;
-    if (tex->dxgiFormat == DXGI_FORMAT_D32_FLOAT &&
-        prepareSampledTextureWrite(ctx, tex, 0, 1) != SampledTextureContentStatus::Ready)
+    if (prepareDepthClearWrites(ctx, tex) != SampledTextureContentStatus::Ready)
         return mcdr::err("clearDepthTexture", "sampled depth write ordering failed");
     transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     ctx->commandList->ClearDepthStencilView(cpu, depthClearFlags(tex->dxgiFormat),
@@ -4676,8 +4856,7 @@ mcdr::Result<void> clearDepthTextureRegion(CommandContext* ctx, Dx12Object* tex,
     auto dsvRes = frameDsvFor(ctx, tex, 0);
     if (!dsvRes) return mcdr::err("clearDepthTextureRegion", errorMessage(dsvRes.error()));
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = *dsvRes;
-    if (tex->dxgiFormat == DXGI_FORMAT_D32_FLOAT &&
-        prepareSampledTextureWrite(ctx, tex, 0, 1) != SampledTextureContentStatus::Ready)
+    if (prepareDepthClearWrites(ctx, tex) != SampledTextureContentStatus::Ready)
         return mcdr::err("clearDepthTextureRegion", "sampled depth write ordering failed");
     transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     D3D12_RECT rc{x, y, x + w, y + h};
@@ -5146,8 +5325,6 @@ mcdr::Result<void> setRasterMotionTarget(void* rawContext, void* rawWorldColor, 
     context->rasterMotionWorldColor = worldColor;
     context->rasterMotionWorldDepth = worldDepth;
     context->rasterMotionTarget = motion;
-    if (context->vanillaDepthSeedBind)
-        context->vanillaDepthSeedBind(context->vanillaDepthSeedState, context, worldDepth);
     return {};
 }
 
@@ -5157,6 +5334,7 @@ mcdr::Result<void> setAdditionalColorTarget(void* rawContext, void* rawTarget) {
     if (!context || !context->listOpen || !context->inRenderPass)
         return mcdr::err("setAdditionalColorTarget", "an open render pass is required");
     if (context->additionalColorTarget == target) return {};
+    invalidateGraphicsBindingReadCache(context);
     auto targets = context->activePassRtvs;
     D3D12_CPU_DESCRIPTOR_HANDLE additional{};
     if (target) {
@@ -5214,6 +5392,7 @@ mcdr::Result<void> beginRenderPass(CommandContext* ctx, Dx12Object* const* color
     ctx->activeColorTargetsTouched.clear();
     ctx->activeDepthTarget = nullptr;
     ctx->activeAttachmentRanges.clear();
+    invalidateGraphicsBindingReadCache(ctx);
     ctx->activePassRtvs.clear();
     ctx->additionalColorTarget = nullptr;
     ctx->additionalColorRtv = {};
@@ -5413,6 +5592,7 @@ mcdr::Result<void> endRenderPass(CommandContext* ctx) {
     ctx->rasterMotionSelected = false;
     ctx->activePassBoundColorCount = UINT_MAX;
     ctx->inRenderPass = 0;
+    invalidateGraphicsBindingReadCache(ctx);
     return {};
 }
 
@@ -6606,6 +6786,12 @@ mcdr::Result<void*> createGraphicsPipeline(const PipelineDesc& desc) {
         if (target.format >= 0 && target.writeMask != 0) pipeline->rasterMotionWritesWorldColor = true;
     }
     pipeline->colorTargetCount = static_cast<UINT>(numRT);
+    pipeline->colorTargetFormats.reserve(numRT);
+    for (int index = 0; index < numRT; ++index) {
+        const auto format = desc.colorTargets[index].format;
+        pipeline->colorTargetFormats.push_back(format < 0 ? DXGI_FORMAT_UNKNOWN : toDxgiFormat(format));
+    }
+    pipeline->depthTargetFormat = desc.hasDepth ? DXGI_FORMAT_D32_FLOAT : DXGI_FORMAT_UNKNOWN;
 
     // P192：每个 slot 用自己的步长（详见上面 slotStride 的注释）。
     for (UINT slot = 0; slot < 16; ++slot) {
@@ -6745,6 +6931,143 @@ mcdr::Result<void*> createGraphicsPipeline(const PipelineDesc& desc) {
     auto noDepthPso = buildPso(DXGI_FORMAT_UNKNOWN, false, D3D12_DEPTH_WRITE_MASK_ZERO,
                                D3D12_COMPARISON_FUNC_ALWAYS, pipeline->withoutDepth);
     if (!noDepthPso) return std::unexpected<mcdr::Error>(std::move(noDepthPso.error()));
+    if (desc.opaqueSeed.programGeneration) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+        if (SUCCEEDED(gCtx.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) &&
+            options.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation) {
+            pipeline->tileRoute = std::make_shared<Dx12Pipeline::TileRoute>();
+            auto& seed = *pipeline->tileRoute;
+            seed.tileStage = desc.opaqueSeed.tileStage;
+            seed.laneRegisters = desc.opaqueSeed.laneRegisters;
+            seed.laneBindingSlots.fill(UINT32_MAX);
+            seed.bindingCount = static_cast<uint32_t>(desc.bindings.size());
+            seed.pushConstantParam = pipeline->pushConstantParam;
+            if (desc.rasterMotion) {
+                if (seed.bindingCount < 2 || desc.bindings[seed.bindingCount - 2].type != 0 ||
+                    desc.bindings.back().type != 2)
+                    return mcdr::err("opaque.seed.pipeline", "Missing motion binding suffix");
+                seed.bindingCount -= 2;
+                // Lane depth replays the original shader with the original binding layout.
+                const auto constants = desc.pushConstantBytes ? params[constantParam] : D3D12_ROOT_PARAMETER{};
+                params.resize(cbvRegs.size() - 1);
+                cbvRegs.pop_back();
+                srvRanges.pop_back();
+                if (!srvRanges.empty()) {
+                    D3D12_ROOT_PARAMETER table{};
+                    table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                    table.DescriptorTable = {static_cast<UINT>(srvRanges.size()), srvRanges.data()};
+                    table.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+                    params.push_back(table);
+                }
+                if (desc.pushConstantBytes) {
+                    seed.pushConstantParam = static_cast<UINT>(params.size());
+                    params.push_back(constants);
+                }
+            }
+            const bool tileOit = seed.tileStage != UINT32_MAX;
+            if (cbvRegs.size() * 2 + (srvRanges.empty() ? 0 : 1) + desc.pushConstantBytes / 4 +
+                    (tileOit ? 7 : 6) > 64 ||
+                toTopologyType(desc.topology) != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE)
+                return mcdr::err("oit.tile.ia", "Incompatible root size or topology");
+            D3D12_DESCRIPTOR_RANGE laneReads{};
+            if (tileOit) {
+                std::array<bool, 256> seen{};
+                for (size_t index = 0; index < seed.laneRegisters.size(); ++index) {
+                    const auto reg = seed.laneRegisters[index];
+                    if (reg == UINT32_MAX) continue;
+                    const auto binding = std::ranges::find_if(desc.bindings, [reg](const auto& candidate) {
+                        return candidate.type == 1 && candidate.reg == reg;
+                    });
+                    if (reg >= seen.size() || seen[reg] || binding == desc.bindings.end())
+                        return mcdr::err("oit.tile.ia", "Invalid lane-local SRV");
+                    seen[reg] = true;
+                    seed.laneBindingSlots[index] = static_cast<uint32_t>(binding - desc.bindings.begin());
+                }
+                if (std::ranges::any_of(seen, [](bool used) { return used; })) {
+                    D3D12_DESCRIPTOR_HEAP_DESC heap{};
+                    heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+                    heap.NumDescriptors = 1;
+                    if (FAILED(gCtx.device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&seed.lanePlaceholderHeap))))
+                        return mcdr::err("oit.tile.ia", "Lane descriptor allocation failed");
+                    seed.lanePlaceholder.kind = Dx12Object::Kind::TextureView;
+                    seed.lanePlaceholder.cpuHandle = seed.lanePlaceholderHeap->GetCPUDescriptorHandleForHeapStart();
+                    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+                    view.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+                    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    view.Texture2D.MipLevels = 1;
+                    gCtx.device->CreateShaderResourceView(nullptr, &view, seed.lanePlaceholder.cpuHandle);
+                }
+                laneReads.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+                laneReads.NumDescriptors = static_cast<UINT>(seed.laneRegisters.size());
+                laneReads.RegisterSpace = 3;
+                D3D12_ROOT_PARAMETER table{};
+                table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                table.DescriptorTable = {1, &laneReads};
+                table.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+                seed.laneDescriptorParam = static_cast<UINT>(params.size());
+                params.push_back(table);
+            }
+            for (const auto& element : inputLayout)
+                seed.vertexStepRates[element.InputSlot] = element.InstanceDataStepRate;
+            constexpr std::string_view instanceBatchContract = "#define MCDR_TILE_IA_INSTANCE_BATCH_V1 1\n";
+            seed.instanceTileBatch = tileOit && desc.opaqueSeed.vertex.starts_with(instanceBatchContract) &&
+                desc.opaqueSeed.fragment.starts_with(instanceBatchContract) &&
+                std::ranges::all_of(inputLayout, [](const auto& element) {
+                    return element.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA &&
+                        element.InstanceDataStepRate == 0;
+                });
+            seed.drawParam = static_cast<UINT>(params.size());
+            D3D12_ROOT_PARAMETER draw{};
+            draw.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            draw.Constants = {0, 3, 4};
+            draw.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            params.push_back(draw);
+            seed.batchParam = static_cast<UINT>(params.size());
+            D3D12_ROOT_PARAMETER batch{};
+            batch.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+            batch.Descriptor = {1, 3};
+            batch.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            params.push_back(batch);
+            rsDesc.NumParameters = static_cast<UINT>(params.size());
+            rsDesc.pParameters = params.data();
+            rsBlob.Reset();
+            rsErr.Reset();
+            if (FAILED(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1_0, &rsBlob, &rsErr)) ||
+                FAILED(gCtx.device->CreateRootSignature(0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(),
+                    IID_PPV_ARGS(&seed.root)))) return mcdr::err("opaque.seed.pipeline", "Root signature creation failed");
+            std::vector<uint8_t> tileVertex, tileFragment;
+            if (auto compiled = compileHlslToDxil(std::string(desc.opaqueSeed.vertex), "main", "vs_" + smProfile, tileVertex); !compiled)
+                return std::unexpected(compiled.error());
+            if (auto compiled = compileHlslToDxil(std::string(desc.opaqueSeed.fragment), "main", "ps_" + smProfile, tileFragment); !compiled)
+                return std::unexpected(compiled.error());
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC depthOnly{};
+            depthOnly.pRootSignature = seed.root.Get();
+            depthOnly.VS = {tileVertex.data(), tileVertex.size()};
+            depthOnly.PS = {tileFragment.data(), tileFragment.size()};
+            depthOnly.InputLayout = {inputLayout.data(), static_cast<UINT>(inputLayout.size())};
+            depthOnly.RasterizerState = rs;
+            if (tileOit) {
+                depthOnly.BlendState = blend;
+                depthOnly.NumRenderTargets = static_cast<UINT>(numRT);
+                for (int index = 0; index < desc.colorCount; ++index) {
+                    const auto format = desc.colorTargets[index].format;
+                    depthOnly.RTVFormats[index] = format < 0 ? DXGI_FORMAT_UNKNOWN : toDxgiFormat(format);
+                }
+            }
+            depthOnly.DepthStencilState.DepthEnable = TRUE;
+            depthOnly.DepthStencilState.DepthWriteMask = depthWrite;
+            depthOnly.DepthStencilState.DepthFunc = wDepthFunc;
+            depthOnly.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            depthOnly.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+            depthOnly.SampleDesc.Count = 1;
+            depthOnly.SampleMask = UINT_MAX;
+            const auto created = gCtx.device->CreateGraphicsPipelineState(&depthOnly, IID_PPV_ARGS(&seed.pso));
+            if (FAILED(created))
+                return mcdr::err("opaque.seed.pipeline", "Depth PSO creation failed: " + formatBackendResult(created));
+            seed.programGeneration = desc.opaqueSeed.programGeneration;
+        }
+    }
     return static_cast<void*>(pipeline.release());
 }
 
@@ -6841,11 +7164,7 @@ mcdr::Result<void> setPipeline(CommandContext* ctx, Dx12Pipeline* pipeline, bool
     // 等）前必须先 SetGraphicsRootSignature。此前缺失 → UMD 首次真实 draw 时对 NULL root
     // signature 解引用崩溃（hs_err：NVIDIA UMD 内读 NULL+0x2b88，AV，PC 0x7ffcd70e8fa3）。
     if (ctx->graphicsBindingRoot != pipeline->rootSignature.Get()) {
-        const bool viewportValid = ctx->graphicsDrawState.viewportValid;
-        const bool scissorValid = ctx->graphicsDrawState.scissorValid;
         invalidateGraphicsInputBindings(ctx, false);
-        ctx->graphicsDrawState.viewportValid = viewportValid;
-        ctx->graphicsDrawState.scissorValid = scissorValid;
     }
     ctx->commandList->SetGraphicsRootSignature(pipeline->rootSignature.Get());
     ctx->graphicsBindingRoot = pipeline->rootSignature.Get();
@@ -6906,7 +7225,7 @@ mcdr::Result<void> setViewport(CommandContext* ctx, int x, int y, int w, int h) 
 }
 
 mcdr::Result<void> setVertexBuffer(CommandContext* ctx, int slot, Dx12Object* buffer, long long offset,
-                                   int stride) {
+                                   int stride, long long length) {
     if (!ctx || !ctx->listOpen) {
         return mcdr::err("setVertexBuffer", "setVertexBuffer: no open command list");
     }
@@ -6920,6 +7239,9 @@ mcdr::Result<void> setVertexBuffer(CommandContext* ctx, int slot, Dx12Object* bu
     if (offset < 0 || offset >= buffer->size) {
         return mcdr::err("setVertexBuffer", "setVertexBuffer: offset out of bounds");
     }
+    const auto bytes = length ? length : buffer->size - offset;
+    if (bytes <= 0 || bytes > UINT_MAX || bytes > buffer->size - offset)
+        return mcdr::err("setVertexBuffer", "Vertex range is out of bounds");
     transitionBufferTo(ctx, buffer, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
     // P6：使用管线中记录的修正 stride（覆盖 Java 传入的错误值）
     UINT effectiveStride = static_cast<UINT>(stride);
@@ -6927,11 +7249,12 @@ mcdr::Result<void> setVertexBuffer(CommandContext* ctx, int slot, Dx12Object* bu
         effectiveStride = ctx->currentPipeline->vertexStrides[slot];
     D3D12_VERTEX_BUFFER_VIEW vb;
     vb.BufferLocation = buffer->resource->GetGPUVirtualAddress() + static_cast<UINT64>(offset);
-    vb.SizeInBytes = static_cast<UINT>(buffer->size - offset);
+    vb.SizeInBytes = static_cast<UINT>(bytes);
     vb.StrideInBytes = effectiveStride;
     ctx->commandList->IASetVertexBuffers(static_cast<UINT>(slot), 1, &vb);
     ctx->graphicsVertexBuffers[slot] = buffer;
     ctx->graphicsVertexViews[slot] = vb;
+    ctx->graphicsVertexSlices[slot] = length != 0;
     retainObjectForRecording(ctx, buffer);
     DBG_LOG_DEBUG("setVertexBuffer: slot=%d buf=%p size=%lld off=%lld javaStride=%d effStride=%d heap=%d",
                   slot, (void*)buffer, (long long)buffer->size, (long long)offset, (int)stride,
@@ -7168,17 +7491,19 @@ void invalidateGraphicsInputBindings(void* rawContext, bool invalidateIa) {
     auto* context = static_cast<CommandContext*>(rawContext);
     if (!context) return;
     context->graphicsBindings.clear();
+    invalidateGraphicsBindingReadCache(context);
     context->graphicsBindingsValid = false;
     context->graphicsBindingRoot = nullptr;
     context->graphicsBindingTable = {};
     context->graphicsDrawState.pushConstantsValid = false;
-    context->graphicsDrawState.viewportValid = false;
-    context->graphicsDrawState.scissorValid = false;
     context->cachedPso = nullptr;
     if (invalidateIa) {
+        context->graphicsDrawState.viewportValid = false;
+        context->graphicsDrawState.scissorValid = false;
         for (auto& buffer : context->graphicsVertexBuffers) buffer = nullptr;
         context->graphicsIndexBuffer = nullptr;
         for (auto& view : context->graphicsVertexViews) view = {};
+        context->graphicsVertexSlices.fill(false);
         context->graphicsIndexView = {};
     }
 }
@@ -7212,9 +7537,22 @@ mcdr::Result<void> collectGraphicsInputs(void* rawContext, bool indexed, void* i
         return mcdr::err("graphicsInputs", "effective graphics bindings were invalidated");
     }
     auto& pending = context->graphicsCollectScratch;
-    pending.clear();
-    if (const auto result = bindingReadRanges(context, context->graphicsBindings.data(),
-        static_cast<uint32_t>(context->graphicsBindings.size()), pending, true); !result) return result;
+    const bool bindingLayoutMatches = context->graphicsBindings.size() == pipeline->graphicsBindingTypes.size() &&
+        std::equal(context->graphicsBindings.begin(), context->graphicsBindings.end(),
+            pipeline->graphicsBindingTypes.begin(), [](const auto& binding, const auto type) {
+                return binding.type == type;
+            });
+    const bool reuseBindingReads = context->graphicsBindingReadCacheValid &&
+        context->graphicsBindingsValid && context->graphicsBindingRoot == pipeline->rootSignature.Get() &&
+        bindingLayoutMatches;
+    if (reuseBindingReads) {
+        context->graphicsInputRanges = context->graphicsBindingReadCache;
+        pending.clear();
+    } else {
+        pending.clear();
+        if (const auto result = bindingReadRanges(context, context->graphicsBindings.data(),
+            static_cast<uint32_t>(context->graphicsBindings.size()), pending, true); !result) return result;
+    }
     if (!pipeline->isMesh) {
         for (const auto& input : pipeline->vertexStrides) {
             const int slot = input.first;
@@ -7233,7 +7571,15 @@ mcdr::Result<void> collectGraphicsInputs(void* rawContext, bool indexed, void* i
         if (const auto result = addBufferRead(pending, static_cast<Dx12Object*>(indirectCommands),
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT); !result) return result;
     }
-    if (const auto result = mergeGraphicsReads(context, context->graphicsInputRanges, pending); !result) return result;
+    if (reuseBindingReads) {
+        if (!pending.empty()) {
+            if (const auto result = mergeGraphicsReads(context, context->graphicsInputRanges, pending); !result)
+                return result;
+        }
+    } else {
+        if (const auto result = mergeGraphicsReads(context, context->graphicsInputRanges, pending); !result)
+            return result;
+    }
     if (pipeline->captureHash) {
         const auto& capture = context->graphicsCapture;
         if (!capture.lease || capture.contractHash != pipeline->captureHash || capture.generation != pipeline->captureGeneration)
@@ -7253,6 +7599,7 @@ mcdr::Result<void> appendGraphicsInputBindings(void* rawContext, const void* raw
     if (!context || !context->listOpen || !context->commandList || (count != 0 && !rawBindings)) {
         return mcdr::err("graphicsInputs", "additional graphics binding input is invalid");
     }
+    invalidateGraphicsBindingReadCache(context);
     return bindingReadRanges(context, static_cast<const DrawBinding*>(rawBindings), count,
         context->graphicsInputRanges, false);
 }
@@ -7340,17 +7687,26 @@ mcdr::Result<void> applyGraphicsCapture(void* rawContext) {
     return {};
 }
 
-mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindings) {
+mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindings,
+    DescriptorBindPoint bindPoint) {
     if (!ctx || !ctx->listOpen) {
         return mcdr::err("pushDescriptors", "pushDescriptors: no open command list");
     }
     UINT count = static_cast<UINT>(bindings.size());
     auto& bindingReads = ctx->graphicsBindingReadScratch;
-    bindingReads.clear();
-    if (const auto result = bindingReadRanges(ctx, bindings.data(), count, bindingReads, true); !result) return result;
-    if (const auto result = applyGraphicsRanges(ctx, bindingReads); !result) return result;
+    const bool graphics = bindPoint != DescriptorBindPoint::Compute;
+    const bool trackReads = bindPoint == DescriptorBindPoint::Graphics;
+    if (trackReads) {
+        invalidateGraphicsBindingReadCache(ctx);
+        bindingReads.clear();
+        if (const auto result = bindingReadRanges(ctx, bindings.data(), count, bindingReads, true); !result)
+            return result;
+        if (const auto result = applyGraphicsRanges(ctx, bindingReads); !result) return result;
+    }
     if (count == 0) {
+        if (!trackReads) return {};
         ctx->graphicsBindings.clear();
+        ctx->graphicsBindingReadCacheValid = true;
         ctx->graphicsBindingsValid = true;
         ctx->graphicsBindingTable = {};
         return {};
@@ -7421,7 +7777,7 @@ mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBi
         }
     }
     const UINT srvSlotOffset = descriptors.offset;
-    ctx->graphicsBindingTable = srvCount ? descriptors.gpu : D3D12_GPU_DESCRIPTOR_HANDLE{};
+    if (trackReads) ctx->graphicsBindingTable = srvCount ? descriptors.gpu : D3D12_GPU_DESCRIPTOR_HANDLE{};
     const SIZE_T base = static_cast<SIZE_T>(drawHeapSlotFor(ctx, srvSlotOffset)) * gCtx.drawInc;
     const D3D12_CPU_DESCRIPTOR_HANDLE cpu = descriptors.cpu;
     // 稠密编号：cbvIdx -> root 参数索引；srvIdx -> SRV 堆槽 / SRV 表内序号。
@@ -7473,7 +7829,8 @@ mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBi
                                     b1.offset, b1.length, (b1.buffer ? b1.buffer->heapType : -1));
                     }
                 }
-                ctx->commandList->SetGraphicsRootConstantBufferView(cbvIdx, va);
+                if (graphics) ctx->commandList->SetGraphicsRootConstantBufferView(cbvIdx, va);
+                else ctx->commandList->SetComputeRootConstantBufferView(cbvIdx, va);
                 ++cbvIdx;
                 break;
             }
@@ -7536,13 +7893,18 @@ mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBi
                  static_cast<unsigned long long>(drawHeapFor(ctx)->GetGPUDescriptorHandleForHeapStart().ptr),
                 static_cast<unsigned long long>(base), static_cast<unsigned>(srvCount));
         }
-        ctx->commandList->SetGraphicsRootDescriptorTable(cbvCount, gpuRoot);
+        if (graphics) ctx->commandList->SetGraphicsRootDescriptorTable(cbvCount, gpuRoot);
+        else ctx->commandList->SetComputeRootDescriptorTable(cbvCount, gpuRoot);
     }
-    ctx->graphicsBindings = bindings;
-    ctx->graphicsBindingsValid = true;
-    for (const auto& binding : bindings) {
-        retainObjectForRecording(ctx, binding.type == 1 ? binding.view : binding.buffer);
+    if (trackReads) {
+        ctx->graphicsBindings = bindings;
+        ctx->graphicsBindingReadCache.swap(bindingReads);
+        ctx->graphicsBindingReadCacheValid = true;
+        ctx->graphicsBindingsValid = true;
     }
+    if (bindPoint != DescriptorBindPoint::GraphicsDeclared)
+        for (const auto& binding : bindings)
+            retainObjectForRecording(ctx, binding.type == 1 ? binding.view : binding.buffer);
     return {};
 }
 
@@ -7668,11 +8030,16 @@ struct GraphicsCommandPacket {
     ComPtr<ID3D12DescriptorHeap> colorDescriptors, depthDescriptors;
     ComPtr<ID3D12CommandSignature> commandSignature;
     std::shared_ptr<void> pipelineOwner, captureOwner, routeOwner;
+    std::shared_ptr<const void> laneProjection;
     std::weak_ptr<void> observerOwner;
+    const void* depthWriteTarget = nullptr;
     int (*confirm)(void*, void*, const void*) = nullptr;
     std::shared_ptr<mcdr::oit_budget::Reservation> budget;
     std::vector<DrawBinding> bindings;
     std::vector<DrawBinding> contentBindings;
+    std::shared_ptr<const void> opaqueSeedBuffers;
+    mcdr::graphics_recording::Command opaqueSeedDraw;
+    uint64_t opaqueSeedProgramGeneration = 0;
     std::vector<std::shared_ptr<const void>> sampledReads;
     std::vector<std::unique_ptr<Dx12Object>> frozenBuffers;
     std::vector<std::shared_ptr<mcdr::oit_budget::Reservation>> contentBudgets;
@@ -7680,6 +8047,7 @@ struct GraphicsCommandPacket {
     std::vector<GraphicsResourceRange> attachments;
     std::vector<std::shared_ptr<void>> objectOwners;
     std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> renderTargets;
+    std::array<const Dx12Object*, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT> colorObjects{};
     D3D12_CPU_DESCRIPTOR_HANDLE depthTarget{};
     D3D12_VERTEX_BUFFER_VIEW vertices[16]{};
     D3D12_INDEX_BUFFER_VIEW indices{};
@@ -7806,6 +8174,152 @@ mcdr::Result<void> freezeGraphicsCommandContent(CommandContext* context,
     return {};
 }
 
+mcdr::Result<void> freezeTileDraw(CommandContext* context, GraphicsCommandPacket& packet,
+    uint64_t budgetLimit, mcdr::graphics_recording::TileDrawScope scope) {
+    using mcdr::graphics_recording::CommandFamily;
+    using mcdr::graphics_recording::ContentState;
+    auto* pipeline = static_cast<Dx12Pipeline*>(packet.pipelineOwner.get());
+    if (!pipeline->tileRoute) return {};
+    auto& route = *pipeline->tileRoute;
+    const uint32_t stage = scope == mcdr::graphics_recording::TileDrawScope::Seed
+        ? UINT32_MAX : static_cast<uint32_t>(scope);
+    auto draw = packet.facts.command;
+    const bool indexed = draw.family == CommandFamily::DrawIndexed;
+    packet.facts.content = ContentState::Unsupported;
+    static thread_local std::unordered_set<const Dx12Pipeline*> reportedTileInputs;
+    const auto explain = [&](const char* reason) -> mcdr::Result<void> {
+        if (reportedTileInputs.insert(pipeline).second)
+            dbgLogDebug("OIT tile draw input: %s (%u, %u)", reason,
+                static_cast<uint32_t>(scope), static_cast<uint32_t>(draw.family));
+        return {};
+    };
+    if ((draw.family != CommandFamily::Draw && !indexed) || !route.pso || route.tileStage != stage ||
+        route.programGeneration != context->frameProgramGeneration || packet.pso != pipeline->withDepth ||
+        packet.bindings.size() < route.bindingCount ||
+        !packet.state.viewportValid || !packet.state.scissorValid ||
+        (pipeline->pushConstantBytes &&
+            (!packet.state.pushConstantsValid || packet.state.pushRoot != pipeline->rootSignature.Get() ||
+                packet.state.pushConstantBytes != pipeline->pushConstantBytes))) {
+        if (reportedTileInputs.insert(pipeline).second)
+            dbgLogDebug("OIT tile state: stage=%u/%u generation=%llu/%llu depth=%d bindings=%zu/%u vp=%d sc=%d pc=%d",
+                route.tileStage, stage, route.programGeneration, context->frameProgramGeneration,
+                packet.pso == pipeline->withDepth, packet.bindings.size(), route.bindingCount,
+                packet.state.viewportValid, packet.state.scissorValid, packet.state.pushConstantsValid);
+        return {};
+    }
+    packet.opaqueSeedProgramGeneration = route.programGeneration;
+    const auto bindings = std::span(packet.bindings).first(route.bindingCount);
+    std::vector<PacketContentRange> ranges;
+    ranges.reserve(pipeline->vertexStrides.size() + indexed + bindings.size());
+    const auto appendBuffer = [&](Dx12Object* buffer, uint64_t offset, uint64_t length,
+                                  D3D12_RESOURCE_STATES state) {
+        if (!buffer || !buffer->resource || buffer->kind != Dx12Object::Kind::Buffer ||
+            (buffer->heapType != D3D12_HEAP_TYPE_DEFAULT && buffer->heapType != D3D12_HEAP_TYPE_UPLOAD) ||
+            buffer->size <= 0 || !length || offset > uint64_t(buffer->size) ||
+            length > uint64_t(buffer->size) - offset) return false;
+        const bool upload = buffer->heapType == D3D12_HEAP_TYPE_UPLOAD;
+        ranges.push_back({buffer->resource, 0, 1, offset, length, upload,
+            static_cast<uint32_t>(upload ? D3D12_RESOURCE_STATE_GENERIC_READ : state), buffer});
+        return true;
+    };
+    for (const auto& [slot, stride] : pipeline->vertexStrides) {
+        auto* buffer = context->graphicsVertexBuffers[slot];
+        const auto& view = packet.vertices[slot];
+        if (!stride || !view.SizeInBytes || stride != view.StrideInBytes) return explain("vertex stride");
+        const auto stepRate = route.vertexStepRates[slot];
+        uint64_t firstByte = 0;
+        uint64_t bytes = view.SizeInBytes;
+        if (stepRate) {
+            // Keep StartInstanceLocation and the instance binding's original base.
+            const uint64_t lastElement = uint64_t(draw.firstInstance) + (draw.instanceCount - 1) / stepRate;
+            if (lastElement >= bytes / stride) return explain("instance range");
+            bytes = (lastElement + 1) * stride;
+        } else if (!indexed) {
+            if (uint64_t(draw.firstVertexOrIndex) + draw.count > bytes / stride) return explain("vertex range");
+            firstByte = uint64_t(draw.firstVertexOrIndex) * stride;
+            bytes = uint64_t(draw.count) * stride;
+        } else if (!context->graphicsVertexSlices[slot]) {
+            // The index values may only be GPU-visible. The slice bounds the fetch domain.
+            return explain("missing vertex range");
+        }
+        const auto offset = view.BufferLocation - buffer->resource->GetGPUVirtualAddress();
+        if (!appendBuffer(buffer, offset + firstByte, bytes, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER))
+            return explain("vertex buffer");
+    }
+    if (indexed) {
+        auto* buffer = context->graphicsIndexBuffer;
+        const auto& view = packet.indices;
+        const uint32_t stride = view.Format == DXGI_FORMAT_R32_UINT ? 4 : 2;
+        if (uint64_t(draw.firstVertexOrIndex) + draw.count > view.SizeInBytes / stride) return explain("index range");
+        const auto offset = view.BufferLocation - buffer->resource->GetGPUVirtualAddress();
+        if (!appendBuffer(buffer, offset + uint64_t(draw.firstVertexOrIndex) * stride,
+                uint64_t(draw.count) * stride, D3D12_RESOURCE_STATE_INDEX_BUFFER)) return explain("index buffer");
+    }
+    for (const auto& binding : bindings) {
+        if (binding.type == 1) continue;
+        if (binding.offset < 0 || binding.length <= 0 ||
+            (binding.type != 0 && binding.type != 2) ||
+            (binding.type == 0 && binding.offset % D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT != 0))
+            return explain("shader buffer binding");
+        const auto state = binding.type == 0 ? D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER
+            : D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+        if (!appendBuffer(binding.buffer, binding.offset, binding.length, state)) return explain("shader buffer range");
+    }
+    packet.sampledReads.resize(bindings.size());
+    for (size_t i = 0; i < bindings.size(); ++i) {
+        if (bindings[i].type != 1 || std::ranges::contains(route.laneBindingSlots, i)) continue;
+        auto captured = captureSampledTextureContent(context, bindings[i].view, budgetLimit);
+        if (captured.status != SampledTextureContentStatus::Ready) {
+            for (const auto& read : packet.sampledReads) cancelSampledTextureContent(read);
+            if (captured.status == SampledTextureContentStatus::RecordingFailed)
+                return mcdr::err("opaque.seed.content", "Sampled input capture failed during recording");
+            if (reportedTileInputs.insert(pipeline).second)
+                dbgLogDebug("OIT sampled input: stage=%u slot=%zu status=%u", stage, i,
+                    static_cast<uint32_t>(captured.status));
+            return {};
+        }
+        packet.sampledReads[i] = std::move(captured.lease);
+    }
+    if (!ranges.empty()) {
+        packet.opaqueSeedBuffers = retainPacketContent(context, ranges.data(), static_cast<uint32_t>(ranges.size()),
+            budgetLimit);
+        if (packetContentStatus(context, packet.opaqueSeedBuffers) != PacketContentStatus::Frozen) {
+            for (const auto& read : packet.sampledReads) cancelSampledTextureContent(read);
+            if (context->recordingFailed.load() || context->submissionFailed.load())
+                return mcdr::err("opaque.seed.content", "Buffer capture failed during recording");
+            packet.opaqueSeedBuffers.reset();
+            return explain("buffer content");
+        }
+    }
+    packet.contentBindings.assign(bindings.begin(), bindings.end());
+    for (const auto slot : route.laneBindingSlots)
+        if (slot != UINT32_MAX) packet.contentBindings[slot].view = &route.lanePlaceholder;
+    if (const auto content = std::static_pointer_cast<const PacketContentLease>(packet.opaqueSeedBuffers)) {
+        auto input = content->frozenReads.begin();
+        for (const auto& [slot, stride] : pipeline->vertexStrides) {
+            auto& view = packet.vertices[slot];
+            view.BufferLocation = input->resource->GetGPUVirtualAddress() + input->byteOffset;
+            view.SizeInBytes = static_cast<UINT>(input->byteLength);
+            ++input;
+        }
+        if (indexed) {
+            packet.indices.BufferLocation = input->resource->GetGPUVirtualAddress() + input->byteOffset;
+            packet.indices.SizeInBytes = static_cast<UINT>(input->byteLength);
+            ++input;
+        }
+        for (auto& binding : packet.contentBindings) {
+            if (binding.type == 1) continue;
+            binding.buffer = input->object;
+            binding.offset = static_cast<long long>(input->byteOffset);
+            ++input;
+        }
+    }
+    if (indexed || !pipeline->vertexStrides.empty()) draw.firstVertexOrIndex = 0;
+    packet.opaqueSeedDraw = draw;
+    packet.facts.content = ContentState::Frozen;
+    return {};
+}
+
 mcdr::Result<std::shared_ptr<GraphicsCommandPacket>> prepareGraphicsCommand(CommandContext* context,
     const mcdr::graphics_recording::Command& command, const DrawBinding* meshBindings = nullptr,
     uint32_t meshBindingCount = 0, D3D12_GPU_DESCRIPTOR_HANDLE meshGeometry = {},
@@ -7814,6 +8328,10 @@ mcdr::Result<std::shared_ptr<GraphicsCommandPacket>> prepareGraphicsCommand(Comm
     using mcdr::graphics_recording::CommandFamily;
     const auto observer = context->graphicsCommandObserver;
     if (!observer.prepare) return std::shared_ptr<GraphicsCommandPacket>{};
+    if (observer.depthWriteTarget &&
+        (observer.depthWriteTarget != context->activeDepthTarget || !context->graphicsHasDepth ||
+            !context->currentPipeline || !context->currentPipeline->depthWrite))
+        return std::shared_ptr<GraphicsCommandPacket>{};
     auto owner = observer.owner.lock();
     if (!owner || !observer.confirm || !observer.complete || !context->recordingIdentity || !context->fence ||
         context->submissionFailed.load() || context->recordingFailed.load() ||
@@ -7835,7 +8353,11 @@ mcdr::Result<std::shared_ptr<GraphicsCommandPacket>> prepareGraphicsCommand(Comm
         context->activeAttachmentRanges.size() * sizeof(GraphicsResourceRange) +
         (context->activePassRtvs.size() + 2) * sizeof(D3D12_CPU_DESCRIPTOR_HANDLE);
     auto budget = mcdr::oit_budget::reserve(budgetBytes, observer.totalBudgetBytes);
-    if (!budget) return mcdr::err("graphics.record", "Graphics command packet budget exceeded");
+    if (!budget) {
+        if (!observer.budgetExceeded) return mcdr::err("graphics.record", "Graphics command packet budget exceeded");
+        observer.budgetExceeded(owner.get(), context);
+        return std::shared_ptr<GraphicsCommandPacket>{};
+    }
     auto packet = std::make_shared<GraphicsCommandPacket>();
     packet->budget = std::move(budget);
     packet->reads.reserve(static_cast<size_t>(readCapacity));
@@ -7858,6 +8380,7 @@ mcdr::Result<std::shared_ptr<GraphicsCommandPacket>> prepareGraphicsCommand(Comm
     packet->captureOwner = context->graphicsCapture.lease;
     packet->routeOwner = pipeline->terrainTileRoute;
     packet->observerOwner = observer.owner;
+    packet->depthWriteTarget = observer.depthWriteTarget;
     packet->confirm = observer.confirm;
     packet->captureConstants = context->graphicsCapture.constants;
     packet->captureDescriptors = context->graphicsCapture.descriptors;
@@ -7881,6 +8404,8 @@ mcdr::Result<std::shared_ptr<GraphicsCommandPacket>> prepareGraphicsCommand(Comm
         packet->renderTargets = context->activePassRtvs;
         if (context->additionalColorTarget) packet->renderTargets.push_back(context->additionalColorRtv);
         if (context->rasterMotionSelected) packet->renderTargets.push_back(context->activeMotionRtv);
+        std::copy_n(context->activeColorTargets.begin(),
+            std::min(context->activeColorTargets.size(), packet->colorObjects.size()), packet->colorObjects.begin());
     }
     packet->depthTarget = context->activePassDsv;
     pipeline->lifetimeReferences.fetch_add(1, std::memory_order_relaxed);
@@ -7971,9 +8496,34 @@ mcdr::Result<std::shared_ptr<GraphicsCommandPacket>> prepareGraphicsCommand(Comm
     auto& leases = context->recordingLeases[context->currentListSlot];
     leases.reserve(leases.size() + 1);
     leases.push_back(packet);
+    const auto& operation = pipeline->oitLaneOperation;
+    if (operation.kind == MCDR_OIT_LANE_BOUNDS_CULL && !packet->facts.empty &&
+        operation.projectionBinding < packet->bindings.size()) {
+        constexpr uint64_t projectionBytes = 64;
+        const auto& binding = packet->bindings[operation.projectionBinding];
+        auto* buffer = binding.buffer;
+        if (binding.type == 0 && buffer && buffer->resource && binding.offset >= 0 &&
+            binding.offset <= buffer->size && buffer->size - binding.offset >= projectionBytes &&
+            (binding.length == 0 || binding.length >= projectionBytes)) {
+            const bool cpuWritable = buffer->heapType == D3D12_HEAP_TYPE_UPLOAD;
+            PacketContentRange range{buffer->resource, 0, 1, static_cast<uint64_t>(binding.offset),
+                projectionBytes, cpuWritable, static_cast<uint32_t>(cpuWritable ? D3D12_RESOURCE_STATE_GENERIC_READ :
+                    D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER), buffer};
+            packet->laneProjection = retainPacketContent(context, &range, 1);
+            if (context->recordingFailed.load() || context->submissionFailed.load())
+                return mcdr::err("graphics.record", "Lane projection freeze failed during recording");
+        }
+    }
     if (observer.contentPolicy == mcdr::graphics_recording::ContentPolicy::FreezeBindings) {
         if (const auto frozen = freezeGraphicsCommandContent(context, *packet, observer.totalBudgetBytes); !frozen)
             return std::unexpected(frozen.error());
+    } else if (!packet->facts.empty) {
+        using mcdr::graphics_recording::TileDrawScope;
+        const auto scope = observer.depthWriteTarget ? TileDrawScope::Seed
+            : observer.tileDrawScope ? observer.tileDrawScope(owner.get()) : TileDrawScope::None;
+        if (scope != TileDrawScope::None)
+            if (const auto frozen = freezeTileDraw(context, *packet, observer.totalBudgetBytes, scope); !frozen)
+                return std::unexpected(frozen.error());
     }
     if (observer.prepare(owner.get(), context, packet->facts, packet) != 1)
         return mcdr::err("graphics.record", "Graphics command observer preparation failed");
@@ -8053,10 +8603,13 @@ bool graphicsCommandPacketMatchesObserver(void* opaqueContext, const std::shared
     auto boundOwner = bound.owner.lock();
     if (!expectedOwner || expectedOwner != boundOwner || bound.prepare != observer.prepare ||
         bound.confirm != observer.confirm || bound.complete != observer.complete ||
-        bound.totalBudgetBytes != observer.totalBudgetBytes || bound.contentPolicy != observer.contentPolicy) return false;
+        bound.totalBudgetBytes != observer.totalBudgetBytes || bound.contentPolicy != observer.contentPolicy ||
+        bound.depthWriteTarget != observer.depthWriteTarget ||
+        bound.budgetExceeded != observer.budgetExceeded) return false;
     const auto packet = std::static_pointer_cast<const GraphicsCommandPacket>(opaquePacket);
     auto packetOwner = packet->observerOwner.lock();
     return packetOwner == expectedOwner && packet->confirm == observer.confirm &&
+        packet->depthWriteTarget == observer.depthWriteTarget &&
         packet->recordingIdentity == context->recordingIdentity && packet->fence == context->fence &&
         packet->submission == context->fenceValue + 1 && packet->pso.Get() == context->cachedPso &&
         packet->pipelineGeneration == context->currentPipeline->shaderGeneration &&
@@ -8097,17 +8650,83 @@ GraphicsPacketInspection inspectGraphicsCommandPacket(void* opaqueContext,
         result.depthTargetBound = packet->depthTarget.ptr != 0 && depthAttachment != packet->attachments.end();
         result.depthObject = result.depthTargetBound ? depthAttachment->object : nullptr;
         result.routeBound = static_cast<bool>(packet->routeOwner);
+        result.opaqueSeedProgramGeneration = packet->opaqueSeedProgramGeneration;
         result.pipelineIdentity = packet->facts.pipelineIdentity;
         result.shaderGeneration = packet->pipelineGeneration;
         result.commandFamily = static_cast<uint32_t>(packet->facts.command.family);
         result.depthTarget = packet->depthTarget;
         result.pso = packet->pso;
+        result.viewport = packet->state.viewport;
+        result.scissor = packet->state.scissor;
+        const auto* pipeline = static_cast<const Dx12Pipeline*>(packet->pipelineOwner.get());
+        if (pipeline && pipeline->tileRoute && packet->opaqueSeedProgramGeneration)
+            result.tileStage = pipeline->tileRoute->tileStage;
+        if (pipeline && pipeline->oitLaneOperation.kind) {
+            result.oitLaneOperation = pipeline->oitLaneOperation;
+            result.laneProjection = packet->laneProjection;
+            const auto& command = packet->facts.command;
+            result.fullScreenTriangle = packet->state.viewportValid && packet->state.scissorValid &&
+                command.family == mcdr::graphics_recording::CommandFamily::Draw &&
+                command.count == 3 && command.instanceCount == 1 &&
+                command.firstVertexOrIndex == 0 && command.firstInstance == 0;
+        }
         result.status = GraphicsPacketInspectionStatus::Ready;
         return result;
     } catch (...) {
         result.status = GraphicsPacketInspectionStatus::Unsupported;
         return result;
     }
+}
+
+void cancelOpaqueSeedPacketCapture(const std::shared_ptr<const void>& opaquePacket) {
+    const auto packet = std::static_pointer_cast<const GraphicsCommandPacket>(opaquePacket);
+    if (!packet || !packet->opaqueSeedProgramGeneration) return;
+    for (const auto& read : packet->sampledReads) cancelSampledTextureContent(read);
+}
+
+bool matchesGraphicsCommandTexture(const std::shared_ptr<const void>& opaquePacket, const void* opaqueTexture,
+    uint32_t subresource, GraphicsCommandTextureBinding binding, uint32_t bindingIndex) {
+    if (!opaquePacket || !opaqueTexture) return false;
+    const auto packet = std::static_pointer_cast<const GraphicsCommandPacket>(opaquePacket);
+    const auto* texture = static_cast<const Dx12Object*>(opaqueTexture);
+    if (!packet->confirmed || !texture->resource || texture->kind != Dx12Object::Kind::Texture)
+        return false;
+    if (binding == GraphicsCommandTextureBinding::Sampled) {
+        if (bindingIndex != UINT32_MAX) {
+            const auto* pipeline = static_cast<const Dx12Pipeline*>(packet->pipelineOwner.get());
+            if (!pipeline || !pipeline->tileRoute || bindingIndex >= pipeline->tileRoute->laneBindingSlots.size())
+                return false;
+            const auto slot = pipeline->tileRoute->laneBindingSlots[bindingIndex];
+            if (slot >= packet->bindings.size()) return false;
+            const auto& source = packet->bindings[slot];
+            const auto* view = source.view;
+            return source.type == 1 && view && view->sourceTexture == texture && view->hasSrvDesc &&
+                view->srvDesc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D &&
+                view->srvDesc.Texture2D.PlaneSlice == 0 && view->srvDesc.Texture2D.MostDetailedMip == subresource;
+        }
+        return std::ranges::any_of(packet->reads, [&](const auto& read) {
+            constexpr uint32_t pixelRead = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            return read.resource == texture->resource && (read.state & pixelRead) != 0 &&
+                read.access == 1 && subresource >= read.firstSubresource &&
+                subresource - read.firstSubresource < read.subresourceCount;
+        });
+    }
+    const auto* pipeline = static_cast<const Dx12Pipeline*>(packet->pipelineOwner.get());
+    if (!pipeline) return false;
+    const bool depth = binding == GraphicsCommandTextureBinding::DepthTarget ||
+        binding == GraphicsCommandTextureBinding::DepthAttachment;
+    if (binding == GraphicsCommandTextureBinding::DepthTarget && !pipeline->depthWrite) return false;
+    if (depth ? !packet->depthTarget.ptr || packet->pso != pipeline->withDepth :
+        !pipeline->colorTargetCount || packet->renderTargets.empty()) return false;
+    if (!depth && bindingIndex != UINT32_MAX &&
+        (bindingIndex >= packet->colorObjects.size() || packet->colorObjects[bindingIndex] != texture))
+        return false;
+    const uint32_t state = depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET;
+    return std::ranges::any_of(packet->attachments, [&](const auto& attachment) {
+        return attachment.object == texture && attachment.state == state &&
+            subresource >= attachment.firstSubresource &&
+            subresource - attachment.firstSubresource < attachment.subresourceCount;
+    });
 }
 
 mcdr::Result<GraphicsCommandContentView> resolveGraphicsCommandContent(
@@ -8124,6 +8743,8 @@ mcdr::Result<GraphicsCommandContentView> resolveGraphicsCommandContent(
         return GraphicsCommandContentView{PacketContentStatus::StaleRecording};
     if (packet->facts.content != mcdr::graphics_recording::ContentState::Frozen)
         return GraphicsCommandContentView{PacketContentStatus::UnsupportedContent};
+    if (packet->contentBindings.size() != packet->sampledReads.size())
+        return GraphicsCommandContentView{PacketContentStatus::UnsupportedContent};
     for (size_t index = 0; index < packet->sampledReads.size(); ++index) {
         if (!packet->sampledReads[index]) continue;
         const auto resolved = resolveSampledTextureContent(context, packet->sampledReads[index]);
@@ -8136,6 +8757,117 @@ mcdr::Result<GraphicsCommandContentView> resolveGraphicsCommandContent(
     }
     return GraphicsCommandContentView{PacketContentStatus::Frozen,
         packet->contentBindings.data(), static_cast<uint32_t>(packet->contentBindings.size())};
+}
+
+mcdr::Result<void> recordTileGraphicsPacket(void* opaqueContext, const std::shared_ptr<const void>& opaquePacket,
+    std::span<const D3D12_VIEWPORT> viewports, std::span<const D3D12_RECT> scissors,
+    D3D12_GPU_VIRTUAL_ADDRESS batchConstants, std::span<Dx12Object* const> laneReads) {
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    const auto packet = std::static_pointer_cast<const GraphicsCommandPacket>(opaquePacket);
+    if (!context || !packet || !packet->confirmed || !packet->opaqueSeedProgramGeneration ||
+        packet->opaqueSeedProgramGeneration != context->frameProgramGeneration ||
+        !batchConstants || batchConstants % D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT ||
+        viewports.empty() || viewports.size() > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE ||
+        scissors.size() != viewports.size())
+        return mcdr::err("oit.tile.ia", "Tile draw state is incomplete");
+    const auto resolved = resolveGraphicsCommandContent(context, opaquePacket);
+    if (!resolved) return std::unexpected(resolved.error());
+    if (resolved->status != PacketContentStatus::Frozen)
+        return mcdr::err("oit.tile.ia", "Tile draw input unavailable");
+    const auto& bindings = packet->contentBindings;
+    const auto* pipeline = static_cast<const Dx12Pipeline*>(packet->pipelineOwner.get());
+    const auto& route = *pipeline->tileRoute;
+    const bool sampledLane = route.laneDescriptorParam != UINT_MAX;
+    if (sampledLane ? laneReads.size() != route.laneBindingSlots.size() : !laneReads.empty())
+        return mcdr::err("oit.tile.ia", "Tile draw lane input list is incomplete");
+    std::vector<DrawBinding> materialReads;
+    if (sampledLane) {
+        materialReads.reserve(bindings.size());
+        for (const auto& binding : bindings)
+            if (binding.view != &route.lanePlaceholder) materialReads.push_back(binding);
+    }
+    const auto& effectiveReads = sampledLane ? materialReads : bindings;
+    std::vector<GraphicsResourceRange> reads;
+    if (const auto result = bindingReadRanges(context, effectiveReads.data(),
+            static_cast<uint32_t>(effectiveReads.size()), reads, false); !result) return result;
+    if (const auto buffers = std::static_pointer_cast<const PacketContentLease>(packet->opaqueSeedBuffers)) {
+        if (packetContentStatus(context, packet->opaqueSeedBuffers) != PacketContentStatus::Frozen)
+            return mcdr::err("oit.tile.ia", "Tile buffers are stale");
+        auto& pending = context->graphicsCollectScratch;
+        pending.clear();
+        for (size_t i = 0; i < buffers->frozenReads.size(); ++i) {
+            const auto& range = buffers->frozenReads[i];
+            if (const auto result = addBufferRead(pending, range.object,
+                    buffers->reads[i].initialState); !result) return result;
+        }
+        if (const auto result = mergeGraphicsReads(context, reads, pending); !result) return result;
+    }
+    for (auto& read : reads) read.owner = std::const_pointer_cast<void>(opaquePacket);
+    if (const auto result = applyGraphicsRanges(context, reads); !result) return result;
+    if (sampledLane) {
+        const auto materialDescriptors = std::ranges::count_if(bindings, [](const DrawBinding& binding) {
+            return binding.type != 0;
+        });
+        if (!growDrawHeap(context, static_cast<UINT>(materialDescriptors + laneReads.size())))
+            return mcdr::err("oit.tile.ia", "Tile draw descriptor reservation failed");
+    }
+    auto* list = context->commandList;
+    list->SetPipelineState(route.pso.Get());
+    list->SetGraphicsRootSignature(route.root.Get());
+    if (const auto result = pushDescriptors(context, bindings, DescriptorBindPoint::GraphicsDeclared); !result)
+        return result;
+    if (sampledLane) {
+        const auto descriptors = allocateDrawDescriptors(context, static_cast<UINT>(laneReads.size()));
+        if (!descriptors) return std::unexpected(descriptors.error());
+        auto cpu = descriptors->cpu;
+        for (size_t index = 0; index < laneReads.size(); ++index) {
+            auto* object = route.laneBindingSlots[index] == UINT32_MAX ? nullptr : laneReads[index];
+            if (route.laneBindingSlots[index] != UINT32_MAX && (!object || !object->resource))
+                return mcdr::err("oit.tile.ia", "Tile draw lane SRV is missing");
+            D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+            view.Format = object ? object->dxgiFormat : DXGI_FORMAT_R32G32B32A32_FLOAT;
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            view.Texture2DArray.MipLevels = 1;
+            view.Texture2DArray.ArraySize = static_cast<UINT>(viewports.size());
+            gCtx.device->CreateShaderResourceView(object ? object->resource.Get() : nullptr, &view, cpu);
+            cpu.ptr += gCtx.srvInc;
+        }
+        list->SetGraphicsRootDescriptorTable(route.laneDescriptorParam, descriptors->gpu);
+    }
+    if (pipeline->pushConstantBytes)
+        list->SetGraphicsRoot32BitConstants(route.pushConstantParam, pipeline->pushConstantBytes / 4u,
+            packet->state.pushConstants.data(), 0);
+    list->SetGraphicsRootConstantBufferView(route.batchParam, batchConstants);
+    list->IASetPrimitiveTopology(toPrimitiveTopology(packet->topology));
+    for (const auto& [slot, stride] : pipeline->vertexStrides)
+        list->IASetVertexBuffers(static_cast<UINT>(slot), 1, &packet->vertices[slot]);
+    const auto& draw = packet->opaqueSeedDraw;
+    const bool indexed = draw.family == mcdr::graphics_recording::CommandFamily::DrawIndexed;
+    if (indexed) list->IASetIndexBuffer(&packet->indices);
+    const auto tileCount = static_cast<UINT>(viewports.size());
+    list->RSSetViewports(tileCount, viewports.data());
+    list->RSSetScissorRects(tileCount, scissors.data());
+    if (route.instanceTileBatch && draw.instanceCount == 1 && draw.firstInstance == 0) {
+        // 每个实例只写自己的 slice；同一 slice 内的图元顺序与原 draw 一致。
+        const UINT routeConstants[4]{0, 0, 0, 1};
+        list->SetGraphicsRoot32BitConstants(route.drawParam, static_cast<UINT>(std::size(routeConstants)),
+            routeConstants, 0);
+        if (indexed) list->DrawIndexedInstanced(draw.count, tileCount,
+            draw.firstVertexOrIndex, draw.baseVertex, 0);
+        else list->DrawInstanced(draw.count, tileCount, draw.firstVertexOrIndex, 0);
+        return {};
+    }
+    for (UINT tile = 0; tile < tileCount; ++tile) {
+        if (scissors[tile].left >= scissors[tile].right || scissors[tile].top >= scissors[tile].bottom) continue;
+        const UINT routeConstants[4]{tile, 0, 0, 0};
+        list->SetGraphicsRoot32BitConstants(route.drawParam, static_cast<UINT>(std::size(routeConstants)),
+            routeConstants, 0);
+        if (indexed) list->DrawIndexedInstanced(draw.count, draw.instanceCount,
+            draw.firstVertexOrIndex, draw.baseVertex, draw.firstInstance);
+        else list->DrawInstanced(draw.count, draw.instanceCount, draw.firstVertexOrIndex, draw.firstInstance);
+    }
+    return {};
 }
 
 int completeGraphicsCommandRecording(void* opaqueContext, mcdr::graphics_recording::Completion completion) {
@@ -10101,16 +10833,26 @@ mcdr::Result<void> abortDisplayFrame(void* opaqueContext) {
         if (SUCCEEDED(result)) result = gCtx.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
             allocator.Get(), nullptr, IID_PPV_ARGS(&list));
         if (SUCCEEDED(result)) result = list->Close();
+        ComPtr<ID3D12GraphicsCommandList10> workGraphList;
+        if (SUCCEEDED(result)) {
+            const HRESULT workGraphInterface = list.As(&workGraphList);
+            if (FAILED(workGraphInterface) && (workGraphInterface != E_NOINTERFACE ||
+                gCtx.caps.workGraphsTier >= D3D12_WORK_GRAPHS_TIER_1_0)) result = workGraphInterface;
+        }
         if (FAILED(result))
             return mcdr::err("abortDisplayFrame", "Could not replace rejected recording: " + formatBackendResult(result));
         {
             std::lock_guard recordingLock(gRecordingContextsMutex);
             gRecordingContexts.erase(context->commandList);
             context->commandList = nullptr;
+            context->workGraphCommandList = nullptr;
             context->commandLists[context->currentListSlot].Reset();
+            context->workGraphCommandLists[context->currentListSlot].Reset();
             context->allocators[context->currentListSlot] = std::move(allocator);
             context->commandLists[context->currentListSlot] = std::move(list);
+            context->workGraphCommandLists[context->currentListSlot] = std::move(workGraphList);
             context->commandList = context->commandLists[context->currentListSlot].Get();
+            context->workGraphCommandList = context->workGraphCommandLists[context->currentListSlot].Get();
             gRecordingContexts.emplace(context->commandList, context);
         }
         if (context->listOpen && gOpenListCount > 0) --gOpenListCount;
@@ -10141,7 +10883,6 @@ mcdr::Result<void> abortDisplayFrame(void* opaqueContext) {
         context->rasterMotionLeases.clear();
         context->rasterMotionSelected = false;
         context->vanillaDepthSeedState = nullptr;
-        context->vanillaDepthSeedBind = nullptr;
         context->vanillaDepthSeedClear = nullptr;
         context->vanillaDepthSeedDraw = nullptr;
         context->vanillaDepthSeedOrdinal = 0;

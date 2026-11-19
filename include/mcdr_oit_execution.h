@@ -163,6 +163,8 @@ typedef struct mcdr_oit_execution_operation_receipt_v1 {
 #define MCDR_OIT_OPERATION_ADAPTER_UNSUPPORTED_BINDING 3u
 #define MCDR_OIT_OPERATION_ADAPTER_UNSUPPORTED_ADDRESSING 4u
 
+// A texture OBJECT_ONLY row can use the backing object handle as
+// resourceIdentity and leave ownerIdentity/ownerGeneration/contentVersion zero.
 typedef struct mcdr_oit_execution_resource_v2 {
     uint32_t schemaVersion, structSize, role, roleIndex;
     uint32_t access, contentRequirement, firstSubresource, subresourceCount;
@@ -337,6 +339,8 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12OitQueryExecutionTerrainReceiptV2(mcdr_comma
 MCDR_API int32_t MCDR_CALL mcdr_dx12OitSealExecutionStreamV2(mcdr_command_ctx* context, void* stream,
     const mcdr_oit_execution_manifest_v2* input, void** sealedStream, mcdr_oit_execution_seal_result_v2* result);
 MCDR_API int32_t MCDR_CALL mcdr_dx12OitAbortExecutionStreamV2(mcdr_command_ctx* context, void* stream);
+MCDR_API int32_t MCDR_CALL mcdr_dx12OitExecuteTileStreamV2(mcdr_command_ctx* context, void* stream,
+    const void* fourLaneBatches, mcdr_object* corrected);
 
 #ifdef __cplusplus
 static_assert(sizeof(mcdr_oit_execution_operation_begin_v1) == 144);

@@ -9,6 +9,7 @@ module;
 #include <numbers>
 #include <array>
 #include <cstring>
+#include <optional>
 #include "mcdr_abi.h"
 #include "mcdr_graphics_recording.h"
 #include "mcdr_oit_budget.h"
@@ -24,6 +25,7 @@ struct DeclaredPassToken;
 namespace {
 
 struct WorldDepthSeedJournal : WorldDepthSeedJournalV1 {
+    enum class DrawState { Idle, Prepared, PreparedEmpty, Confirmed, ConfirmedEmpty };
     uint64_t totalBudgetBytes = 0;
     uint32_t maxEvents = 0;
     uint64_t sequence = 0;
@@ -31,6 +33,8 @@ struct WorldDepthSeedJournal : WorldDepthSeedJournalV1 {
     bool incomplete = false;
     WorldDepthSeedStatus status = WorldDepthSeedStatus::Ready;
     mcdr::graphics_recording::Observer observer;
+    DrawState drawState = DrawState::Idle;
+    std::shared_ptr<const void> pendingDraw;
     std::shared_ptr<mcdr::oit_budget::Reservation> budget;
     std::shared_ptr<mcdr::oit_budget::Reservation> eventBudget;
 
@@ -60,6 +64,10 @@ struct WorldDepthSeedJournal : WorldDepthSeedJournalV1 {
 struct WorldDepthSeedRecording {
     void* context = nullptr;
     Dx12Object* worldDepth = nullptr;
+    std::shared_ptr<void> depthOwner;
+    std::shared_ptr<const void> recordingIdentity;
+    ComPtr<ID3D12Fence> fence;
+    uint64_t submission = 0;
     bool depthCommandSeen = false;
     uint64_t clearCount = 0;
     uint64_t writeCount = 0;
@@ -68,7 +76,6 @@ struct WorldDepthSeedRecording {
     std::shared_ptr<WorldDepthSeedJournal> capture;
 };
 
-void depthSeedBind(void* opaqueState, CommandContext* context, Dx12Object* target);
 void depthSeedClear(void* opaqueState, CommandContext* context, Dx12Object* target,
                     uint32_t subresource, double depth, const D3D12_RECT* rect,
                     D3D12_CPU_DESCRIPTOR_HANDLE dsv);
@@ -77,6 +84,12 @@ void depthSeedDraw(void* opaqueState, CommandContext* context, Dx12Object* targe
                    const std::shared_ptr<const void>& packet);
 
 struct FrameState {
+    struct ResourceLayout {
+        ComPtr<ID3D12Resource> resource;
+        uint32_t subresources = 0;
+        D3D12_RESOURCE_FLAGS flags{};
+        std::optional<D3D12_HEAP_TYPE> rawHeap;
+    };
     void* context = nullptr;
     FrameInput frame{};
     mcdr_vanilla_frame_input inputs{};
@@ -94,7 +107,7 @@ struct FrameState {
     std::shared_ptr<DeclaredPassToken> rasterInputToken;
     std::vector<scheduler::ResourceUse> rasterDeclarations;
     std::vector<PassResourceUse> rasterAttachmentUses;
-    std::unordered_map<ID3D12Resource*, uint32_t> resourceSubresources;
+    std::unordered_map<ID3D12Resource*, ResourceLayout> resourceLayouts;
     WorldDepthSeedRecording depthSeed;
 };
 
@@ -110,7 +123,6 @@ static_assert(sizeof(mcdr_reconstruction_request) == 64);
 void detachDepthSeedJournal(CommandContext* context) {
     if (!context) return;
     context->vanillaDepthSeedState = nullptr;
-    context->vanillaDepthSeedBind = nullptr;
     context->vanillaDepthSeedClear = nullptr;
     context->vanillaDepthSeedDraw = nullptr;
 }
@@ -128,34 +140,101 @@ bool matchesDepthSeedRecordingIdentity(const WorldDepthSeedJournal& journal, con
         journal.frame.resourceVersion == state.inputs.identity.resourceVersion;
 }
 
-bool validDepthSeedRecording(WorldDepthSeedJournal& journal, CommandContext* context) {
-    if (!matchesDepthSeedRecordingIdentity(journal, context) || journal.closed ||
-        context->submissionFailed.load(std::memory_order_acquire) ||
-        context->recordingFailed.load(std::memory_order_acquire)) return false;
+bool ownsDepthSeedObserver(const WorldDepthSeedJournal& journal, const CommandContext* context) {
     const auto& bound = context->graphicsCommandObserver;
     auto owner = journal.observer.owner.lock();
     return owner && owner == bound.owner.lock() && journal.observer.prepare == bound.prepare &&
         journal.observer.confirm == bound.confirm && journal.observer.complete == bound.complete &&
         journal.observer.totalBudgetBytes == bound.totalBudgetBytes &&
-        journal.observer.contentPolicy == bound.contentPolicy;
+        journal.observer.contentPolicy == bound.contentPolicy &&
+        journal.observer.depthWriteTarget == bound.depthWriteTarget &&
+        journal.observer.budgetExceeded == bound.budgetExceeded;
+}
+
+bool validDepthSeedRecording(const WorldDepthSeedJournal& journal, const CommandContext* context) {
+    return matchesDepthSeedRecordingIdentity(journal, context) && !journal.closed &&
+        !context->submissionFailed.load(std::memory_order_acquire) &&
+        !context->recordingFailed.load(std::memory_order_acquire) && ownsDepthSeedObserver(journal, context);
+}
+
+int prepareDepthSeedDraw(void* owner, void* opaqueContext, const mcdr::graphics_recording::PacketFacts& facts,
+                         std::shared_ptr<const void> packet) {
+    auto& journal = *static_cast<WorldDepthSeedJournal*>(owner);
+    const auto* context = static_cast<const CommandContext*>(opaqueContext);
+    if (!validDepthSeedRecording(journal, context) || journal.drawState != WorldDepthSeedJournal::DrawState::Idle ||
+        !packet || !facts.packetIdentity || !facts.readSetIdentity ||
+        context->activeDepthTarget != journal.worldDepth || !context->currentPipeline ||
+        facts.pipelineIdentity != reinterpret_cast<uintptr_t>(context->currentPipeline))
+        return -1;
+    journal.pendingDraw = std::move(packet);
+    journal.drawState = facts.empty ? WorldDepthSeedJournal::DrawState::PreparedEmpty : WorldDepthSeedJournal::DrawState::Prepared;
+    return 1;
+}
+
+int confirmDepthSeedDraw(void* owner, void* opaqueContext, const void* packet) {
+    auto& journal = *static_cast<WorldDepthSeedJournal*>(owner);
+    const auto* context = static_cast<const CommandContext*>(opaqueContext);
+    using DrawState = WorldDepthSeedJournal::DrawState;
+    if (!validDepthSeedRecording(journal, context) || journal.pendingDraw.get() != packet ||
+        (journal.drawState != DrawState::Prepared && journal.drawState != DrawState::PreparedEmpty)) return -1;
+    journal.drawState = journal.drawState == DrawState::PreparedEmpty ? DrawState::ConfirmedEmpty : DrawState::Confirmed;
+    return 1;
+}
+
+int completeDepthSeedDraws(void* owner, void* opaqueContext, mcdr::graphics_recording::Completion completion) {
+    auto& journal = *static_cast<WorldDepthSeedJournal*>(owner);
+    const auto* context = static_cast<const CommandContext*>(opaqueContext);
+    if (completion == mcdr::graphics_recording::Completion::Failed) {
+        journal.pendingDraw.reset();
+        journal.drawState = WorldDepthSeedJournal::DrawState::Idle;
+        journal.incomplete = true;
+        journal.status = WorldDepthSeedStatus::RecordingFailed;
+        return 1;
+    }
+    return validDepthSeedRecording(journal, context) &&
+        (journal.drawState == WorldDepthSeedJournal::DrawState::Idle ||
+            journal.drawState == WorldDepthSeedJournal::DrawState::Confirmed ||
+            journal.drawState == WorldDepthSeedJournal::DrawState::ConfirmedEmpty) ? 1 : -1;
 }
 
 void failDepthSeedRecording(CommandContext* context, WorldDepthSeedJournal& journal) {
     journal.incomplete = true;
-    if (journal.status == WorldDepthSeedStatus::Ready) journal.status = WorldDepthSeedStatus::Incomplete;
+    journal.status = WorldDepthSeedStatus::RecordingFailed;
     if (context) context->recordingFailed.store(true, std::memory_order_release);
 }
 
-void depthSeedBind(void* opaqueState, CommandContext* context, Dx12Object* target) {
-    if (!opaqueState || !target) return;
-    auto& recording = *static_cast<WorldDepthSeedRecording*>(opaqueState);
-    if (recording.closed) return;
-    if (recording.capture && (!validDepthSeedRecording(*recording.capture, context) ||
-        recording.capture->worldDepth != target)) {
-        failDepthSeedRecording(context, *recording.capture);
+void retireDepthSeedCapture(CommandContext* context, WorldDepthSeedJournal& journal,
+                            WorldDepthSeedStatus status) noexcept {
+    if (!matchesDepthSeedRecordingIdentity(journal, context) ||
+        context->submissionFailed.load(std::memory_order_acquire) ||
+        context->recordingFailed.load(std::memory_order_acquire) || !ownsDepthSeedObserver(journal, context)) {
+        failDepthSeedRecording(context, journal);
         return;
     }
-    recording.worldDepth = target;
+    if (ownsDepthSeedObserver(journal, context)) unbindGraphicsCommandObserver(context);
+    cancelOpaqueSeedPacketCapture(journal.pendingDraw);
+    for (const auto& event : journal.events) cancelOpaqueSeedPacketCapture(event.packet);
+    journal.pendingDraw.reset();
+    journal.drawState = WorldDepthSeedJournal::DrawState::Idle;
+    journal.incomplete = true;
+    journal.closed = true;
+    journal.status = status;
+    auto& recording = static_cast<FrameState*>(context->vanillaFrameState.get())->depthSeed;
+    recording.closed = true;
+    detachDepthSeedJournal(context);
+}
+
+void retireDepthSeedBudget(void* owner, void* opaqueContext) noexcept {
+    retireDepthSeedCapture(static_cast<CommandContext*>(opaqueContext),
+        *static_cast<WorldDepthSeedJournal*>(owner), WorldDepthSeedStatus::BudgetExceeded);
+}
+
+WorldDepthSeedStatus retireUnconsumedDepthSeedCapture(CommandContext* context, WorldDepthSeedJournal& journal) {
+    if (journal.observer.contentPolicy == mcdr::graphics_recording::ContentPolicy::FactsOnly && !journal.pendingDraw) {
+        retireDepthSeedCapture(context, journal, WorldDepthSeedStatus::Incomplete);
+        return journal.status;
+    }
+    return cancelWorldDepthSeedCaptureV1(context);
 }
 
 void depthSeedClear(void* opaqueState, CommandContext* context, Dx12Object* target,
@@ -192,10 +271,10 @@ void depthSeedClear(void* opaqueState, CommandContext* context, Dx12Object* targ
         event.hasClearRect = true;
     }
     try {
-        if (!journal.append(std::move(event))) failDepthSeedRecording(context, journal);
+        if (!journal.append(std::move(event)))
+            retireDepthSeedCapture(context, journal, WorldDepthSeedStatus::BudgetExceeded);
     } catch (const std::bad_alloc&) {
-        journal.status = WorldDepthSeedStatus::BudgetExceeded;
-        failDepthSeedRecording(context, journal);
+        retireDepthSeedCapture(context, journal, WorldDepthSeedStatus::BudgetExceeded);
     }
 }
 
@@ -215,13 +294,20 @@ void depthSeedDraw(void* opaqueState, CommandContext* context, Dx12Object* targe
         failDepthSeedRecording(context, journal);
         return;
     }
-    if (journal.worldDepth != target || !pipeline || !context->cachedPso || !packet ||
+    using DrawState = WorldDepthSeedJournal::DrawState;
+    if (journal.pendingDraw != packet ||
+        (journal.drawState != DrawState::Confirmed && journal.drawState != DrawState::ConfirmedEmpty) ||
+        journal.worldDepth != target || !pipeline || !context->cachedPso || !packet ||
         context->activePassDsv.ptr == 0 ||
         !graphicsCommandPacketMatchesObserver(context, packet, journal.observer, commandFamily) ||
         context->currentPipeline != pipeline || context->cachedPso != pipeline->withDepth.Get()) {
         failDepthSeedRecording(context, journal);
         return;
     }
+    const bool empty = journal.drawState == DrawState::ConfirmedEmpty;
+    journal.pendingDraw.reset();
+    journal.drawState = DrawState::Idle;
+    if (empty) return;
     const auto depthRange = std::find_if(context->activeAttachmentRanges.begin(),
         context->activeAttachmentRanges.end(), [target](const auto& range) { return range.object == target; });
     if (depthRange == context->activeAttachmentRanges.end() || depthRange->firstSubresource != 0 ||
@@ -246,10 +332,13 @@ void depthSeedDraw(void* opaqueState, CommandContext* context, Dx12Object* targe
     event.commandOrdinal = commandOrdinal;
     event.packet = packet;
     try {
-        if (!journal.append(std::move(event))) failDepthSeedRecording(context, journal);
+        if (!journal.append(std::move(event))) {
+            cancelOpaqueSeedPacketCapture(packet);
+            retireDepthSeedCapture(context, journal, WorldDepthSeedStatus::BudgetExceeded);
+        }
     } catch (const std::bad_alloc&) {
-        journal.status = WorldDepthSeedStatus::BudgetExceeded;
-        failDepthSeedRecording(context, journal);
+        cancelOpaqueSeedPacketCapture(packet);
+        retireDepthSeedCapture(context, journal, WorldDepthSeedStatus::BudgetExceeded);
     }
 }
 
@@ -367,8 +456,7 @@ Dx12Object* resourceObject(void* object) {
                        texture->kind == Dx12Object::Kind::Buffer) && texture->resource ? texture : nullptr;
 }
 
-bool subresourceCount(ID3D12Resource* resource, uint32_t& count) {
-    const auto desc = resource->GetDesc();
+bool subresourceCount(const D3D12_RESOURCE_DESC& desc, uint32_t& count) {
     if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         count = 1;
         return true;
@@ -384,24 +472,33 @@ bool subresourceCount(ID3D12Resource* resource, uint32_t& count) {
     return true;
 }
 
-bool compatibleResourceState(ID3D12Resource* resource, D3D12_HEAP_TYPE heapType,
+bool compatibleResourceState(D3D12_RESOURCE_FLAGS flags, D3D12_HEAP_TYPE heapType,
                              uint32_t required, uint32_t finalState) {
-    const auto desc = resource->GetDesc();
     const auto compatible = [&](uint32_t state) {
         if (state == UINT32_MAX) return true;
         if (heapType == D3D12_HEAP_TYPE_UPLOAD) return state == D3D12_RESOURCE_STATE_GENERIC_READ;
         if (heapType == D3D12_HEAP_TYPE_READBACK) return state == D3D12_RESOURCE_STATE_COPY_DEST;
         if ((state & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) != 0 &&
-            (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) return false;
+            (flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) return false;
         if ((state & D3D12_RESOURCE_STATE_RENDER_TARGET) != 0 &&
-            (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) == 0) return false;
+            (flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) == 0) return false;
         if ((state & (D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_DEPTH_WRITE)) != 0 &&
-            (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) == 0) return false;
+            (flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) == 0) return false;
         if ((state & (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)) != 0 &&
-            (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0) return false;
+            (flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0) return false;
         return true;
     };
     return compatible(required) && compatible(finalState);
+}
+
+FrameState::ResourceLayout* resourceLayout(FrameState& state, ID3D12Resource* resource) {
+    if (const auto found = state.resourceLayouts.find(resource); found != state.resourceLayouts.end())
+        return &found->second;
+    const auto desc = resource->GetDesc();
+    uint32_t subresources = 0;
+    if (!subresourceCount(desc, subresources)) return nullptr;
+    return &state.resourceLayouts.try_emplace(resource,
+        FrameState::ResourceLayout{ComPtr<ID3D12Resource>(resource), subresources, desc.Flags, std::nullopt}).first->second;
 }
 
 void retainNativeResource(CommandContext& context, FrameState& state, ID3D12Resource* resource) {
@@ -479,7 +576,7 @@ bool matchesFrozenFrame(void* context, const void* opaqueIdentity, uint64_t hist
         state.inputs.historyGeneration==historyGeneration;
 }
 
-WorldDepthSeedStatus armWorldDepthSeedCaptureV1(void* opaqueContext, const WorldDepthSeedCaptureV1& input) {
+WorldDepthSeedStatus armWorldDepthSeedCaptureV1(void* opaqueContext, uint32_t maxEvents, uint64_t totalBudgetBytes) {
     auto* context = static_cast<CommandContext*>(opaqueContext);
     if (!context || !context->vanillaFrameState || !context->listOpen || !context->commandList ||
         !context->recordingIdentity || !context->fence || context->inRenderPass ||
@@ -488,45 +585,37 @@ WorldDepthSeedStatus armWorldDepthSeedCaptureV1(void* opaqueContext, const World
     auto& state = *static_cast<FrameState*>(context->vanillaFrameState.get());
     auto& recording = state.depthSeed;
     if (state.context != context || state.phase != Phase::Recording || recording.context != context ||
-        input.frame.schemaVersion != state.frame.schemaVersion || input.frame.width != state.frame.width ||
-        input.frame.height != state.frame.height || input.frame.worldEpoch != state.frame.worldEpoch ||
-        input.frame.realFrameId != state.frame.realFrameId || input.frame.configVersion != state.frame.configVersion ||
-        input.frame.resourceVersion != state.frame.resourceVersion ||
-        input.recordingIdentity != context->recordingIdentity || input.fence != context->fence.Get() ||
-        input.submission != context->fenceValue + 1) return WorldDepthSeedStatus::StaleRecording;
+        recording.recordingIdentity != context->recordingIdentity || recording.fence != context->fence ||
+        recording.submission != context->fenceValue + 1) return WorldDepthSeedStatus::StaleRecording;
     if (recording.closed || recording.depthCommandSeen || recording.missedRegistration)
         return WorldDepthSeedStatus::LateArm;
     if (recording.capture || context->graphicsCommandObserver.prepare) return WorldDepthSeedStatus::Busy;
-    const auto& observer = input.observer;
-    auto consumer = observer.owner.lock();
-    if (!input.programGeneration || input.programGeneration != context->frameProgramGeneration ||
-        !input.maxEvents || !input.totalBudgetBytes ||
-        input.totalBudgetBytes > mcdr::oit_budget::limit || observer.totalBudgetBytes != input.totalBudgetBytes ||
-        !consumer || !observer.prepare || !observer.confirm || !observer.complete || !input.worldDepth ||
-        input.worldDepth != recording.worldDepth || input.worldDepth != context->rasterMotionWorldDepth)
+    if (!context->frameProgramGeneration || !maxEvents || !totalBudgetBytes ||
+        totalBudgetBytes > mcdr::oit_budget::limit || !deviceContext().device ||
+        !matchesWorldDepthRegistrationV1(context, recording.worldDepth))
         return WorldDepthSeedStatus::InvalidRequest;
-    auto* depth = static_cast<Dx12Object*>(input.worldDepth);
-    if (depth->kind != Dx12Object::Kind::Texture || !depth->resource || !deviceContext().device)
-        return WorldDepthSeedStatus::InvalidRequest;
-    const auto description = depth->resource->GetDesc();
-    if (description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-        description.MipLevels != 1 || description.DepthOrArraySize != 1 || description.SampleDesc.Count != 1 ||
-        depth->dxgiFormat != DXGI_FORMAT_D32_FLOAT) return WorldDepthSeedStatus::InvalidRequest;
+    auto* depth = recording.worldDepth;
     try {
-        auto budget = mcdr::oit_budget::reserve(sizeof(WorldDepthSeedJournal) + 65536 + 512, input.totalBudgetBytes);
+        auto budget = mcdr::oit_budget::reserve(sizeof(WorldDepthSeedJournal) + 65536 + 512, totalBudgetBytes);
         if (!budget) return WorldDepthSeedStatus::BudgetExceeded;
         auto journal = std::make_shared<WorldDepthSeedJournal>();
         journal->context = context;
         journal->frame = state.frame;
         journal->recordingIdentity = context->recordingIdentity;
         journal->fence = context->fence;
-        journal->submission = input.submission;
+        journal->submission = recording.submission;
         journal->worldDepth = depth;
-        journal->depthOwner = retainObjectLease(depth);
-        journal->programGeneration = input.programGeneration;
-        journal->totalBudgetBytes = input.totalBudgetBytes;
-        journal->maxEvents = input.maxEvents;
-        journal->observer = observer;
+        journal->depthOwner = recording.depthOwner;
+        journal->programGeneration = context->frameProgramGeneration;
+        journal->totalBudgetBytes = totalBudgetBytes;
+        journal->maxEvents = maxEvents;
+        journal->observer.owner = journal;
+        journal->observer.totalBudgetBytes = totalBudgetBytes;
+        journal->observer.depthWriteTarget = depth;
+        journal->observer.prepare = &prepareDepthSeedDraw;
+        journal->observer.confirm = &confirmDepthSeedDraw;
+        journal->observer.complete = &completeDepthSeedDraws;
+        journal->observer.budgetExceeded = &retireDepthSeedBudget;
         journal->budget = std::move(budget);
         D3D12_DESCRIPTOR_HEAP_DESC heap{};
         heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
@@ -539,9 +628,8 @@ WorldDepthSeedStatus armWorldDepthSeedCaptureV1(void* opaqueContext, const World
         view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
         deviceContext().device->CreateDepthStencilView(depth->resource.Get(), &view, journal->retainedDsv);
         auto& leases = context->recordingLeases[context->currentListSlot];
-        leases.reserve(leases.size() + 2);
-        if (bindGraphicsCommandObserver(context, observer) != 1) return WorldDepthSeedStatus::Busy;
-        leases.push_back(std::move(consumer));
+        leases.reserve(leases.size() + 1);
+        if (bindGraphicsCommandObserver(context, journal->observer) != 1) return WorldDepthSeedStatus::Busy;
         leases.push_back(journal);
         recording.capture = std::move(journal);
         return WorldDepthSeedStatus::Ready;
@@ -554,9 +642,18 @@ WorldDepthSeedStatus sealWorldDepthSeedCaptureV1(void* opaqueContext,
     std::shared_ptr<const WorldDepthSeedJournalV1>* output) {
     if (output) output->reset();
     auto* context = static_cast<CommandContext*>(opaqueContext);
-    if (!context || !context->vanillaFrameState) return WorldDepthSeedStatus::StaleRecording;
+    if (!context || !context->vanillaFrameState || !context->listOpen || !context->commandList ||
+        !context->recordingIdentity || !context->fence) return WorldDepthSeedStatus::StaleRecording;
     auto& state = *static_cast<FrameState*>(context->vanillaFrameState.get());
     auto& recording = state.depthSeed;
+    if (recording.context != context || recording.recordingIdentity != context->recordingIdentity ||
+        recording.fence != context->fence || recording.submission != context->fenceValue + 1)
+        return WorldDepthSeedStatus::StaleRecording;
+    if (context->submissionFailed.load(std::memory_order_acquire) ||
+        context->recordingFailed.load(std::memory_order_acquire)) {
+        if (recording.capture) failDepthSeedRecording(context, *recording.capture);
+        return WorldDepthSeedStatus::RecordingFailed;
+    }
     if (!recording.capture) {
         recording.closed = true;
         detachDepthSeedJournal(context);
@@ -564,27 +661,20 @@ WorldDepthSeedStatus sealWorldDepthSeedCaptureV1(void* opaqueContext,
     }
     auto& journal = *recording.capture;
     if (!matchesDepthSeedRecordingIdentity(journal, context)) return WorldDepthSeedStatus::StaleRecording;
-    if (journal.worldDepth != context->rasterMotionWorldDepth ||
+    if (!matchesWorldDepthRegistrationV1(context, journal.worldDepth) ||
         journal.programGeneration != context->frameProgramGeneration) return WorldDepthSeedStatus::StaleRecording;
-    if (context->submissionFailed.load(std::memory_order_acquire) ||
-        context->recordingFailed.load(std::memory_order_acquire)) {
+    if (journal.closed) return readWorldDepthSeedCaptureV1(context, output);
+    if (context->inRenderPass || state.activeToken) return WorldDepthSeedStatus::Busy;
+    const bool ownsObserver = ownsDepthSeedObserver(journal, context);
+    if (!validDepthSeedRecording(journal, context) || journal.pendingDraw)
         failDepthSeedRecording(context, journal);
+    else if (journal.events.empty()) {
+        retireDepthSeedCapture(context, journal, WorldDepthSeedStatus::Incomplete);
         return journal.status;
-    }
-    if (!journal.closed) {
-        auto expected = journal.observer.owner.lock();
-        const auto& bound = context->graphicsCommandObserver;
-        const bool ownsObserver = expected && expected == bound.owner.lock() &&
-            journal.observer.prepare == bound.prepare && journal.observer.confirm == bound.confirm &&
-            journal.observer.complete == bound.complete && journal.observer.totalBudgetBytes == bound.totalBudgetBytes &&
-            journal.observer.contentPolicy == bound.contentPolicy;
-        if (!validDepthSeedRecording(journal, context) || !ownsObserver || journal.events.empty())
-            failDepthSeedRecording(context, journal);
-        else if (completeGraphicsCommandRecording(context, mcdr::graphics_recording::Completion::Succeeded) != 1)
-            failDepthSeedRecording(context, journal);
-        if (ownsObserver) unbindGraphicsCommandObserver(context);
-        journal.closed = true;
-    }
+    } else if (completeGraphicsCommandRecording(context, mcdr::graphics_recording::Completion::Succeeded) != 1)
+        failDepthSeedRecording(context, journal);
+    if (ownsObserver) unbindGraphicsCommandObserver(context);
+    journal.closed = true;
     recording.closed = true;
     detachDepthSeedJournal(context);
     if (journal.incomplete || journal.status != WorldDepthSeedStatus::Ready) return journal.status;
@@ -600,7 +690,7 @@ WorldDepthSeedStatus readWorldDepthSeedCaptureV1(void* opaqueContext,
     if (!recording.capture) return WorldDepthSeedStatus::NotArmed;
     const auto& journal = *recording.capture;
     if (!matchesDepthSeedRecordingIdentity(journal, context) ||
-        journal.worldDepth != context->rasterMotionWorldDepth ||
+        !matchesWorldDepthRegistrationV1(context, journal.worldDepth) ||
         journal.programGeneration != context->frameProgramGeneration) return WorldDepthSeedStatus::StaleRecording;
     if (context->submissionFailed.load(std::memory_order_acquire) ||
         context->recordingFailed.load(std::memory_order_acquire)) return WorldDepthSeedStatus::RecordingFailed;
@@ -618,12 +708,12 @@ WorldDepthSeedStatus cancelWorldDepthSeedCaptureV1(void* opaqueContext) {
     auto& recording = state.depthSeed;
     if (recording.capture && !recording.capture->closed) {
         auto& journal = *recording.capture;
-        const auto& bound = context->graphicsCommandObserver;
-        auto owner = journal.observer.owner.lock();
-        if (owner && owner == bound.owner.lock() && journal.observer.prepare == bound.prepare &&
-            journal.observer.confirm == bound.confirm && journal.observer.complete == bound.complete &&
-            journal.observer.totalBudgetBytes == bound.totalBudgetBytes &&
-            journal.observer.contentPolicy == bound.contentPolicy) {
+        if (journal.observer.contentPolicy == mcdr::graphics_recording::ContentPolicy::FactsOnly &&
+            !journal.pendingDraw) {
+            retireDepthSeedCapture(context, journal, WorldDepthSeedStatus::Cancelled);
+            return journal.status;
+        }
+        if (ownsDepthSeedObserver(journal, context)) {
             completeGraphicsCommandRecording(context, mcdr::graphics_recording::Completion::Failed);
             unbindGraphicsCommandObserver(context);
         }
@@ -665,17 +755,75 @@ int beginFrame(void* context, const void* rawInput, uint32_t byteCount) {
     state.executedPasses = 0;
     state.nextPass = 1;
     state.resources.reset();
+    state.resourceLayouts.clear();
     state.resourceLeases.clear();
     detachDepthSeedJournal(recording);
     state.depthSeed = {};
     state.depthSeed.context = context;
+    state.depthSeed.recordingIdentity = recording->recordingIdentity;
+    state.depthSeed.fence = recording->fence;
+    state.depthSeed.submission = recording->fenceValue + 1;
     recording->vanillaDepthSeedState = &state.depthSeed;
-    recording->vanillaDepthSeedBind = &depthSeedBind;
     recording->vanillaDepthSeedClear = &depthSeedClear;
     recording->vanillaDepthSeedDraw = &depthSeedDraw;
     recording->vanillaDepthSeedOrdinal = 0;
     postFailure.clear();
     return 1;
+}
+
+int registerWorldDepthV1(void* opaqueContext, void* opaqueDepth) {
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    auto* depth = static_cast<Dx12Object*>(opaqueDepth);
+    if (!context || !context->vanillaFrameState || !context->listOpen || !context->commandList ||
+        !context->recordingIdentity || !context->fence || context->fenceValue == UINT64_MAX || context->inRenderPass ||
+        context->submissionFailed.load(std::memory_order_acquire) ||
+        context->recordingFailed.load(std::memory_order_acquire))
+        return reject("world depth registration has no live recording");
+    auto& state = *static_cast<FrameState*>(context->vanillaFrameState.get());
+    auto& recording = state.depthSeed;
+    if (state.context != context || state.phase != Phase::Recording || recording.context != context ||
+        recording.recordingIdentity != context->recordingIdentity || recording.fence != context->fence ||
+        recording.submission != context->fenceValue + 1)
+        return reject("world depth registration belongs to another recording");
+    if (recording.closed || recording.depthCommandSeen || recording.missedRegistration)
+        return reject("world depth registration follows depth commands");
+    if (!depth || depth->kind != Dx12Object::Kind::Texture || !depth->resource ||
+        depth->closeRequested.load(std::memory_order_acquire) || !(depth->usage & 8) ||
+        depth->dxgiFormat != DXGI_FORMAT_D32_FLOAT)
+        return reject("world depth registration requires a live D32 texture");
+    const auto description = depth->resource->GetDesc();
+    if (description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        description.Width != state.frame.width || description.Height != state.frame.height ||
+        description.MipLevels != 1 || description.DepthOrArraySize != 1 || description.SampleDesc.Count != 1 ||
+        !(description.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
+        (description.Format != DXGI_FORMAT_R32_TYPELESS && description.Format != DXGI_FORMAT_D32_FLOAT))
+        return reject("world depth dimensions or format are incompatible");
+    if (recording.worldDepth) {
+        if (recording.worldDepth != depth)
+            return reject("world depth registration changed its target");
+        return 1;
+    }
+    try {
+        auto owner = retainObjectLease(depth);
+        if (!owner) return reject("world depth registration could not retain its target");
+        context->recordingLeases[context->currentListSlot].push_back(owner);
+        recording.depthOwner = std::move(owner);
+        recording.worldDepth = depth;
+        return 1;
+    } catch (const std::bad_alloc&) {
+        return reject("world depth registration could not retain its target");
+    }
+}
+
+bool matchesWorldDepthRegistrationV1(const void* opaqueContext, const void* depth) {
+    const auto* context = static_cast<const CommandContext*>(opaqueContext);
+    if (!context || !depth || !context->vanillaFrameState || !context->listOpen || !context->commandList ||
+        !context->recordingIdentity || !context->fence) return false;
+    const auto& state = *static_cast<const FrameState*>(context->vanillaFrameState.get());
+    const auto& recording = state.depthSeed;
+    return state.context == context && recording.context == context && recording.worldDepth == depth &&
+        recording.depthOwner && recording.submission && recording.recordingIdentity == context->recordingIdentity &&
+        recording.fence == context->fence && recording.submission == context->fenceValue + 1;
 }
 
 int markWorldReady(void* context, const void* rawInput, uint32_t byteCount) {
@@ -698,10 +846,11 @@ int markWorldReady(void* context, const void* rawInput, uint32_t byteCount) {
         state.phase = Phase::WorldReady;
     }
     if (state.depthSeed.capture && !state.depthSeed.closed) {
-        cancelWorldDepthSeedCaptureV1(context);
-        static_cast<CommandContext*>(context)->recordingFailed.store(true, std::memory_order_release);
-        state.phase = Phase::Failed;
-        return reject("world depth seed capture missed OIT begin");
+        if (retireUnconsumedDepthSeedCapture(static_cast<CommandContext*>(context),
+                *state.depthSeed.capture) != WorldDepthSeedStatus::Incomplete) {
+            state.phase = Phase::Failed;
+            return reject("world depth seed capture missed OIT begin");
+        }
     }
     state.depthSeed.closed = true;
     detachDepthSeedJournal(static_cast<CommandContext*>(context));
@@ -958,8 +1107,9 @@ int prepareWorldOutput(void* context, const void* rawInput, uint32_t byteCount) 
         ? provider ? 2u : frame.settings.antiAliasing == 2 ? 1u : 0u : 0u;
     if (input.sourceStage == MCDR_WORLD_SOURCE_OPAQUE_BEFORE_COMPOSITE) {
         if (state.depthSeed.capture && !state.depthSeed.closed) {
-            cancelWorldDepthSeedCaptureV1(context);
-            return failed("world depth seed capture missed OIT begin");
+            if (retireUnconsumedDepthSeedCapture(static_cast<CommandContext*>(context),
+                    *state.depthSeed.capture) != WorldDepthSeedStatus::Incomplete)
+                return failed("world depth seed capture missed OIT begin");
         }
         state.phase = Phase::OpaqueReady;
     }
@@ -1116,11 +1266,13 @@ int executeDeclaredWorldPost(void* context, const PassInput& input,
     for (uint32_t index = 0; index < useCount; ++index) {
         const auto& use = uses[index];
         auto* object = resourceObject(use.object);
-        uint32_t total = 0;
-        if (!object || use.version != state.frame.resourceVersion || !subresourceCount(object->resource.Get(), total)) {
+        if (!object || use.version != state.frame.resourceVersion) {
             return reject("invalid resource handle, frozen version, or subresource metadata");
         }
-        if (!compatibleResourceState(object->resource.Get(), object->heapType, use.requiredState, use.finalState)) {
+        const auto* layout = resourceLayout(state, object->resource.Get());
+        if (!layout) return reject("invalid resource handle, frozen version, or subresource metadata");
+        const auto total = layout->subresources;
+        if (!compatibleResourceState(layout->flags, object->heapType, use.requiredState, use.finalState)) {
             return reject("declared resource state conflicts with heap type or resource flags");
         }
         const uint32_t first = use.firstSubresource == UINT32_MAX ? 0 : use.firstSubresource;
@@ -1278,21 +1430,33 @@ int beginDeclaredPass(void* context, uint32_t pass, const PassResourceUse* uses,
             return reject("declared pass object and raw resource disagree");
         }
         auto* resource = object ? object->resource.Get() : rawResource;
-        uint32_t total = 0;
-        if (!resource || use.version != state.frame.resourceVersion || !subresourceCount(resource, total)) {
+        if (!resource || use.version != state.frame.resourceVersion) {
             state.resources.fail(); state.phase = Phase::Failed;
             return reject("invalid declared pass resource identity, version, or layout");
         }
+        auto* layout = resourceLayout(state, resource);
+        if (!layout) {
+            state.resources.fail(); state.phase = Phase::Failed;
+            return reject("invalid declared pass resource identity, version, or layout");
+        }
+        const auto total = layout->subresources;
         D3D12_HEAP_TYPE heapType = object ? object->heapType : D3D12_HEAP_TYPE_DEFAULT;
         if (!object) {
-            D3D12_HEAP_PROPERTIES heap{};
-            if (use.initialState == UINT32_MAX || FAILED(resource->GetHeapProperties(&heap, nullptr))) {
+            if (use.initialState == UINT32_MAX) {
                 state.resources.fail(); state.phase = Phase::Failed;
                 return reject("raw declared resources require known heap properties and an initial state");
             }
-            heapType = heap.Type;
+            if (!layout->rawHeap) {
+                D3D12_HEAP_PROPERTIES heap{};
+                if (FAILED(resource->GetHeapProperties(&heap, nullptr))) {
+                    state.resources.fail(); state.phase = Phase::Failed;
+                    return reject("raw declared resources require known heap properties and an initial state");
+                }
+                layout->rawHeap = heap.Type;
+            }
+            heapType = *layout->rawHeap;
         }
-        if (!compatibleResourceState(resource, heapType, use.requiredState, use.finalState)) {
+        if (!compatibleResourceState(layout->flags, heapType, use.requiredState, use.finalState)) {
             state.resources.fail(); state.phase = Phase::Failed;
             return reject("declared resource state conflicts with its heap or resource flags");
         }
@@ -1310,7 +1474,7 @@ int beginDeclaredPass(void* context, uint32_t pass, const PassResourceUse* uses,
         if (heapType == D3D12_HEAP_TYPE_UPLOAD) initial = D3D12_RESOURCE_STATE_GENERIC_READ;
         if (heapType == D3D12_HEAP_TYPE_READBACK) initial = D3D12_RESOURCE_STATE_COPY_DEST;
         if (!object) initial = use.initialState;
-        if (!compatibleResourceState(resource, heapType, initial, UINT32_MAX)) {
+        if (!compatibleResourceState(layout->flags, heapType, initial, UINT32_MAX)) {
             state.resources.fail(); state.phase = Phase::Failed;
             return reject("declared initial resource state conflicts with its heap or resource flags");
         }
@@ -1516,14 +1680,13 @@ int beginRasterInputPass(void* context, uint32_t indexed, void* indirectCommands
     declarations.clear();
     for (const auto& range : nativeContext->graphicsInputRanges) {
         auto* object = resourceObject(range.object);
-        if (!object || !compatibleResourceState(object->resource.Get(), object->heapType, range.state, range.state))
+        if (!object)
             return failed("raster input has an invalid resource or fixed heap state");
-        auto known = state.resourceSubresources.find(object->resource.Get());
-        uint32_t total = 0;
-        if (known == state.resourceSubresources.end()) {
-            if (!subresourceCount(object->resource.Get(), total)) return failed("raster input subresource metadata is invalid");
-            state.resourceSubresources.emplace(object->resource.Get(), total);
-        } else total = known->second;
+        const auto* layout = resourceLayout(state, object->resource.Get());
+        if (!layout) return failed("raster input subresource metadata is invalid");
+        if (!compatibleResourceState(layout->flags, object->heapType, range.state, range.state))
+            return failed("raster input has an invalid resource or fixed heap state");
+        const auto total = layout->subresources;
         if (range.firstSubresource >= total || range.subresourceCount == 0 ||
             range.subresourceCount > total - range.firstSubresource)
             return failed("raster input range exceeds the actual resource layout");
@@ -1603,6 +1766,8 @@ void reset(void* context) {
             state.activeToken = nullptr;
         }
         if (!state.depthSeed.closed) cancelWorldDepthSeedCaptureV1(context);
+        if (const auto& capture = state.depthSeed.capture)
+            for (const auto& event : capture->events) cancelOpaqueSeedPacketCapture(event.packet);
     }
     if (!completed || !fgDisplayFrameQueued(context)) fgAbortDisplayFrame(context);
     detachDepthSeedJournal(nativeContext);

@@ -21,6 +21,8 @@ module;
 
 #include "_d3d12_module_prelude.h"
 #include "mcdr_graphics_recording.h"
+#include "mcdr_oit_budget.h"
+#include <span>
 
 // RTX（DLSS/NGX + NRD）可用性探测结果类型 mcdr::RtxSupport。接口单元必须自己
 // 包含它：模块 purview 外的声明不会自动传给 import 方，而且这个头同时被实现单元
@@ -650,7 +652,30 @@ void unmapBuffer(Dx12Object* buffer);
 // Dx12Pipeline 的完整定义提前到这里：CommandContext / BundleRecorder 都按值或
 // 按名引用它，且不应各自前向声明（模块内前向声明会得到另一个模块归属的类型，
 // 链接期报 LNK2001）。原本它在 PipelineDesc 之前，现前移到 CommandContext 之前。
+struct OitLaneOperationProvenance {
+    uint32_t kind = 0;
+    uint32_t projectionBinding = UINT32_MAX;
+    uint64_t programGeneration = 0;
+};
+
 struct Dx12Pipeline {
+    struct TileRoute {
+        ComPtr<ID3D12RootSignature> root;
+        ComPtr<ID3D12PipelineState> pso;
+        uint64_t programGeneration = 0;
+        UINT drawParam = UINT_MAX;
+        UINT batchParam = UINT_MAX;
+        UINT pushConstantParam = UINT_MAX;
+        uint32_t bindingCount = 0;
+        uint32_t tileStage = UINT32_MAX;
+        UINT laneDescriptorParam = UINT_MAX;
+        std::array<uint32_t, 5> laneRegisters{};
+        std::array<uint32_t, 5> laneBindingSlots{};
+        ComPtr<ID3D12DescriptorHeap> lanePlaceholderHeap;
+        Dx12Object lanePlaceholder;
+        std::array<UINT, 16> vertexStepRates{};
+        bool instanceTileBatch = false;
+    };
     std::atomic<uint32_t> lifetimeReferences{1};
     ComPtr<ID3D12RootSignature> rootSignature;
     ComPtr<ID3D12PipelineState> withDepth;  // 总是创建；DSV=D32_FLOAT（镜像官方 depthAttachmentFormat=126）
@@ -682,6 +707,8 @@ struct Dx12Pipeline {
     uint64_t shaderGeneration = 0;
     std::shared_ptr<void> captureBudget;
     std::shared_ptr<const void> normalizationProvenance;
+    OitLaneOperationProvenance oitLaneOperation{};
+    std::shared_ptr<TileRoute> tileRoute;
     std::vector<uint8_t> graphicsBindingTypes;
     std::vector<uint8_t> graphicsBindingRegisters;
     bool graphicsBindingLayoutKnown = false;
@@ -764,6 +791,7 @@ struct PacketContentTextureView {
 };
 struct PacketContentLease {
     PacketContentStatus status = PacketContentStatus::Unfrozen;
+    std::shared_ptr<mcdr::oit_budget::Reservation> budget;
     std::shared_ptr<const void> recordingIdentity;
     ComPtr<ID3D12Fence> fence;
     uint64_t submission = 0;
@@ -772,7 +800,8 @@ struct PacketContentLease {
     std::shared_ptr<void> frozenOwner;
     std::vector<PacketContentTextureView> frozenViews;
 };
-std::shared_ptr<const void> retainPacketContent(void* context, void* ranges, uint32_t count);
+std::shared_ptr<const void> retainPacketContent(void* context, void* ranges, uint32_t count,
+    uint64_t budgetLimit = UINT64_MAX);
 PacketContentStatus packetContentStatus(void* context, const std::shared_ptr<const void>& content);
 struct GraphicsCommandContentView {
     PacketContentStatus status = PacketContentStatus::Unfrozen;
@@ -793,15 +822,29 @@ struct GraphicsPacketInspection {
     bool depthWrite = false;
     bool depthTargetBound = false;
     bool routeBound = false;
+    uint64_t opaqueSeedProgramGeneration = 0;
+    uint32_t tileStage = UINT32_MAX;
     void* depthObject = nullptr;
     uintptr_t pipelineIdentity = 0;
     uint64_t shaderGeneration = 0;
     uint32_t commandFamily = 0;
+    OitLaneOperationProvenance oitLaneOperation{};
+    D3D12_VIEWPORT viewport{};
+    D3D12_RECT scissor{};
+    bool fullScreenTriangle = false;
+    std::shared_ptr<const void> laneProjection;
     D3D12_CPU_DESCRIPTOR_HANDLE depthTarget{};
     ComPtr<ID3D12PipelineState> pso;
 };
 GraphicsPacketInspection inspectGraphicsCommandPacket(void* context,
     const std::shared_ptr<const void>& packet);
+void cancelOpaqueSeedPacketCapture(const std::shared_ptr<const void>& packet);
+mcdr::Result<void> recordTileGraphicsPacket(void* context, const std::shared_ptr<const void>& packet,
+    std::span<const D3D12_VIEWPORT> viewports, std::span<const D3D12_RECT> scissors,
+    D3D12_GPU_VIRTUAL_ADDRESS batchConstants, std::span<Dx12Object* const> laneReads = {});
+enum class GraphicsCommandTextureBinding { Sampled, ColorTarget, DepthTarget, DepthAttachment };
+bool matchesGraphicsCommandTexture(const std::shared_ptr<const void>& packet, const void* texture,
+    uint32_t subresource, GraphicsCommandTextureBinding binding, uint32_t colorIndex = UINT32_MAX);
 
 enum class SampledTextureContentStatus : uint32_t {
     Ready, UnsupportedView, OrderingUnavailable, BudgetExceeded, StaleRecording, RecordingFailed
@@ -893,6 +936,7 @@ struct CommandContext {
     // 实测 GPU 仅 33%、CPU 仅 29% 却只跑到 ~680 FPS）。现在 list 与 allocator 一一
     // 对应同一槽位，主线程录制帧 N 时用的是与帧 N-3 相同的槽位，只需等该槽位的 fence。
     ComPtr<ID3D12GraphicsCommandList> commandLists[3];
+    ComPtr<ID3D12GraphicsCommandList10> workGraphCommandLists[3];
     ComPtr<ID3D12Fence> fence;
     UINT64 fenceValue = 0;              // 最近一次 Signal 的值（从 1 开始递增）
     HANDLE fenceEvent = nullptr;        // SetEventOnCompletion 用
@@ -935,6 +979,7 @@ struct CommandContext {
     // P55：指向 commandLists[currentListSlot] 的裸指针，供全部录制调用点直接使用
     // （保持原有 `ctx->commandList->Foo()` 写法不变）。由 beginCommandListWithWait 指向当前槽位。
     ID3D12GraphicsCommandList* commandList = nullptr;
+    ID3D12GraphicsCommandList10* workGraphCommandList = nullptr;
 
     // P11：当前渲染 pass 的活跃附件。endRenderPass 必须把它们从
     // RENDER_TARGET/DEPTH_WRITE 显式回切 COMMON——这两种状态属"非可提升状态"，
@@ -951,6 +996,8 @@ struct CommandContext {
     std::vector<GraphicsResourceRange> graphicsInputRanges;
     std::vector<GraphicsResourceRange> activeAttachmentRanges;
     std::vector<GraphicsResourceRange> graphicsBindingReadScratch;
+    std::vector<GraphicsResourceRange> graphicsBindingReadCache;
+    bool graphicsBindingReadCacheValid = false;
     std::vector<GraphicsResourceRange> graphicsBindingPendingScratch;
     std::vector<GraphicsResourceRange> graphicsCollectScratch;
     GraphicsDrawState graphicsDrawState;
@@ -962,6 +1009,7 @@ struct CommandContext {
     Dx12Object* graphicsVertexBuffers[16]{};
     Dx12Object* graphicsIndexBuffer = nullptr;
     D3D12_VERTEX_BUFFER_VIEW graphicsVertexViews[16]{};
+    std::array<bool, 16> graphicsVertexSlices{};
     D3D12_INDEX_BUFFER_VIEW graphicsIndexView{};
     Dx12Object* rasterMotionWorldColor = nullptr;
     Dx12Object* rasterMotionWorldDepth = nullptr;
@@ -977,7 +1025,6 @@ struct CommandContext {
     UINT activePassBoundColorCount = UINT_MAX;
 
     void* vanillaDepthSeedState = nullptr;
-    void (*vanillaDepthSeedBind)(void*, CommandContext*, Dx12Object*) = nullptr;
     void (*vanillaDepthSeedClear)(void*, CommandContext*, Dx12Object*, UINT, double,
                                   const D3D12_RECT*, D3D12_CPU_DESCRIPTOR_HANDLE) = nullptr;
     void (*vanillaDepthSeedDraw)(void*, CommandContext*, Dx12Object*, Dx12Pipeline*, uint32_t,
@@ -1285,6 +1332,13 @@ DXGI_FORMAT toDxgiVertexFormat(int gpuFormat);
 // ---------------------------------------------------------------------------
 // Java 侧 dx12CreateGraphicsPipeline 的 desc 解析产物（字段语义见 Dx12Native Javadoc）。
 struct PipelineDesc {
+    struct OpaqueSeedShaders {
+        std::string_view vertex;
+        std::string_view fragment;
+        uint64_t programGeneration = 0;
+        uint32_t tileStage = UINT32_MAX;
+        std::array<uint32_t, 5> laneRegisters{};
+    } opaqueSeed;
     uint32_t pushConstantBytes = 0;
     uint64_t captureHash = 0;
     uint64_t captureGeneration = 0;
@@ -1808,7 +1862,7 @@ mcdr::Result<void> setScissor(CommandContext* ctx, int x, int y, int w, int h);
 mcdr::Result<void> setViewport(CommandContext* ctx, int x, int y, int w, int h);
 // IASetVertexBuffers：slot 0..15；stride 来自管线的 vertex format。
 mcdr::Result<void> setVertexBuffer(CommandContext* ctx, int slot, Dx12Object* buffer, long long offset,
-                                   int stride);
+                                   int stride, long long length = 0);
 // IASetIndexBuffer（indexType：0=SHORT(R16_UINT)，1=INT(R32_UINT)）。
 mcdr::Result<void> setIndexBuffer(CommandContext* ctx, Dx12Object* buffer, int indexType);
 // 瞬时描述符绑定（对应官方 pushDescriptors）：
@@ -1817,7 +1871,9 @@ mcdr::Result<void> setIndexBuffer(CommandContext* ctx, Dx12Object* buffer, int i
 //   type 2 = SRV（texel buffer，按 texelFormat 建 Buffer SRV）
 // B（拆根签名）：CBV 走 root descriptor（SetGraphicsRootConstantBufferView，不占堆
 // 槽位），SRV 写入本帧 drawHeap 瞬时槽位并 SetGraphicsRootDescriptorTable(cbvCount)。
-mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindings);
+enum class DescriptorBindPoint { Graphics, Compute, GraphicsDeclared };
+mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindings,
+    DescriptorBindPoint bindPoint = DescriptorBindPoint::Graphics);
 struct DrawDescriptorRange {
     D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
     D3D12_GPU_DESCRIPTOR_HANDLE gpu{};

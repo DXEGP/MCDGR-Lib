@@ -18,6 +18,9 @@
 #include "mcdr_oit_budget.h"
 #include "mcdr_terrain_tile.h"
 #include <algorithm>
+#include <cmath>
+#include <limits>
+#include <span>
 
 #include "mcdr_abi.h"   // mcdr::abi::* 之外只需要它的存在性（保持包含顺序与其它 TU 一致）
 
@@ -798,7 +801,7 @@ mcdr::Result<uint64_t> createMeshRootSignature(const std::vector<PipelineDesc::B
     const UINT constantParam = static_cast<UINT>(params.size());
     const size_t rootDwords = cbvRegs.size() * 2 + (srvRanges.empty() ? 0 : 1) +
         (meshExtras ? (visibleWork ? 9 : 3) : 0) + pushConstantBytes / 4 + (captureHash ? 4 : 0) +
-        (tileExtras ? 7 : 0);
+        (tileExtras ? 14 : 0);
     if (pushConstantBytes > 128 || pushConstantBytes % 4 != 0 || rootDwords > 64) {
         return mcdr::err("createMeshRootSignature", "root constant size or root DWORD budget exceeded");
     }
@@ -839,6 +842,18 @@ mcdr::Result<uint64_t> createMeshRootSignature(const std::vector<PipelineDesc::B
         descriptors.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         tileDescriptorParam = static_cast<UINT>(params.size());
         params.push_back(descriptors);
+
+        D3D12_ROOT_PARAMETER chunk{};
+        chunk.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        chunk.Constants = {2, 3, 5};
+        chunk.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params.push_back(chunk);
+
+        D3D12_ROOT_PARAMETER envelopes{};
+        envelopes.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        envelopes.Descriptor = {4, 3};
+        envelopes.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params.push_back(envelopes);
     }
     D3D12_ROOT_SIGNATURE_DESC rsDesc{};
     rsDesc.NumParameters = static_cast<UINT>(params.size());
@@ -895,6 +910,9 @@ struct TerrainTileRoute {
     };
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12CommandSignature> signature;
+    ComPtr<ID3D12PipelineState> envelopePipeline;
+    ComPtr<ID3D12DescriptorHeap> lanePlaceholderHeap;
+    Dx12Object lanePlaceholder;
     uint64_t captureHash = 0;
     uint64_t captureGeneration = 0;
     UINT constantsParam = UINT_MAX;
@@ -905,8 +923,10 @@ struct TerrainTileRoute {
     uint32_t commandStride = 0;
     std::shared_ptr<void> tilePipeline;
     std::optional<mcdr_terrain_tile_stage_v2> stageContract;
+    std::array<uint32_t, 5> laneBindingSlots{UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
     uint64_t tileGeneration = 0;
-    std::array<SourceBinding, 2> sources{};
+    // Original, record capture, and two guide variants with and without motion.
+    std::array<SourceBinding, 6> sources{};
     uint32_t sourceCount = 0;
 };
 
@@ -992,8 +1012,28 @@ mcdr::Result<void> bindTerrainTilePipeline(void* opaqueRoute, void* opaquePipeli
     return {};
 }
 
-mcdr::Result<void> bindTerrainTileStageV2(void* opaqueSource, void* opaqueRoute,
-    const mcdr_terrain_tile_stage_v2& contract) {
+mcdr::Result<void> bindTerrainTileEnvelopeV1(void* opaqueRoute, const void* dxil, uint32_t bytes) {
+    auto* handle = static_cast<TerrainTileRouteHandle*>(opaqueRoute);
+    if (!handle || !handle->route || !handle->route->root || !dxil || !bytes)
+        return mcdr::err("terrain.tile.envelope", "Tile envelope pipeline input is invalid");
+    auto& route = *handle->route;
+    if (route.envelopePipeline || route.sourceCount != 0)
+        return mcdr::err("terrain.tile.envelope", "Tile envelope registration is closed");
+    auto* device = deviceContext().device.Get();
+    if (!device) return mcdr::err("terrain.tile.envelope", "Tile envelope device is unavailable");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC description{};
+    description.pRootSignature = route.root.Get();
+    description.CS = {dxil, bytes};
+    const auto result = device->CreateComputePipelineState(&description, IID_PPV_ARGS(&route.envelopePipeline));
+    if (FAILED(result))
+        return mcdr::err("terrain.tile.envelope", "Tile envelope PSO creation failed hr=" + hrHex(result));
+    return {};
+}
+
+namespace {
+
+mcdr::Result<void> bindTerrainTileStage(void* opaqueSource, void* opaqueRoute,
+    const mcdr_terrain_tile_stage_v2& contract, std::span<const uint32_t> laneRegisters) {
     auto* source = static_cast<Dx12Pipeline*>(opaqueSource);
     auto* route = static_cast<TerrainTileRouteHandle*>(opaqueRoute);
     if (!source || !route || !route->route || !source->rootSignature || !source->withDepth ||
@@ -1005,7 +1045,7 @@ mcdr::Result<void> bindTerrainTileStageV2(void* opaqueSource, void* opaqueRoute,
         contract.shaderContractHash != mcdr::oit_shader::contractHash ||
         contract.shaderContractHash != owner.captureHash || !contract.programGeneration ||
         contract.programGeneration != owner.captureGeneration ||
-        contract.stage > 2 || (contract.quadsPerMeshlet != 16 && contract.quadsPerMeshlet != 32 &&
+        contract.stage > terrainOpaqueSeedStage || (contract.quadsPerMeshlet != 16 && contract.quadsPerMeshlet != 32 &&
             contract.quadsPerMeshlet != 64) || contract.addressingVersion != 1)
         return mcdr::err("terrain.tile.stage", "Tile stage contract is invalid");
     const auto* tile = static_cast<const Dx12Pipeline*>(owner.tilePipeline.get());
@@ -1028,22 +1068,61 @@ mcdr::Result<void> bindTerrainTileStageV2(void* opaqueSource, void* opaqueRoute,
     if (source->captureHash && (source->captureHash != contract.shaderContractHash ||
         source->captureGeneration != contract.programGeneration))
         return mcdr::err("terrain.tile.stage", "Tile stage capture source generation differs");
+    const bool opaqueSeed = contract.stage == terrainOpaqueSeedStage;
+    const bool compatibleTargets = opaqueSeed
+        ? source->depthWrite && tile->depthWrite && !source->captureHash && !tile->rasterMotion &&
+            tile->colorTargetCount == 0 && owner.envelopePipeline && laneRegisters.empty()
+        : contract.stage == 1
+            ? tile->colorTargetCount == 1 || tile->colorTargetCount == 2 || tile->colorTargetCount == 4
+            : tile->colorTargetCount == 1;
     if (tile->captureHash || tile->depthTargetFormat != DXGI_FORMAT_D32_FLOAT ||
         source->depthTargetFormat != DXGI_FORMAT_D32_FLOAT ||
         source->colorTargetCount < tile->colorTargetCount ||
         source->colorTargetFormats.size() < tile->colorTargetCount ||
         tile->colorTargetFormats.size() != tile->colorTargetCount ||
-        (contract.stage == 1 ? (tile->colorTargetCount != 1 && tile->colorTargetCount != 2 &&
-            tile->colorTargetCount != 4) : tile->colorTargetCount != 1))
+        !compatibleTargets)
         return mcdr::err("terrain.tile.stage", "Tile stage depth or target count is incompatible");
     for (uint32_t target = 0; target < tile->colorTargetCount; ++target)
         if (tile->colorTargetFormats[target] == DXGI_FORMAT_UNKNOWN ||
             source->colorTargetFormats[target] != tile->colorTargetFormats[target])
             return mcdr::err("terrain.tile.stage", "Tile stage source and replay target formats differ");
+    std::array<uint32_t, 5> laneBindingSlots;
+    laneBindingSlots.fill(UINT32_MAX);
+    if (!laneRegisters.empty()) {
+        using mcdr::terrain_tile::ReplayStage;
+        if (laneRegisters.size() != laneBindingSlots.size())
+            return mcdr::err("terrain.tile.stage", "Tile lane binding count is invalid");
+        const bool bounds = laneRegisters.front() != UINT32_MAX;
+        const auto coefficients = laneRegisters.subspan(1);
+        const auto coefficientCount = std::ranges::count_if(coefficients, [](uint32_t reg) { return reg != UINT32_MAX; });
+        const auto stage = static_cast<ReplayStage>(contract.stage);
+        if (bounds != (stage != ReplayStage::DepthBounds) ||
+            (stage == ReplayStage::Accumulate
+                ? coefficientCount != 1 && coefficientCount != 2 && coefficientCount != 4
+                : coefficientCount != 0) ||
+            std::ranges::any_of(coefficients.first(static_cast<size_t>(coefficientCount)),
+                [](uint32_t reg) { return reg == UINT32_MAX; }))
+            return mcdr::err("terrain.tile.stage", "Tile lane bindings differ from the stage inputs");
+        for (size_t laneBinding = 0; laneBinding < laneRegisters.size(); ++laneBinding) {
+            const auto reg = laneRegisters[laneBinding];
+            if (reg == UINT32_MAX) continue;
+            uint32_t slot = UINT32_MAX;
+            for (uint32_t binding = 0; binding < source->graphicsBindingRegisters.size(); ++binding) {
+                if (source->graphicsBindingTypes[binding] != 1 || source->graphicsBindingRegisters[binding] != reg)
+                    continue;
+                if (slot != UINT32_MAX)
+                    return mcdr::err("terrain.tile.stage", "Tile lane binding is ambiguous");
+                slot = binding;
+            }
+            if (slot == UINT32_MAX || std::ranges::contains(laneBindingSlots, slot))
+                return mcdr::err("terrain.tile.stage", "Tile lane binding is missing or repeated");
+            laneBindingSlots[laneBinding] = slot;
+        }
+    }
     if (source->terrainTileRoute && source->terrainTileRoute != route->route)
         return mcdr::err("terrain.tile.stage", "Source pipeline already belongs to another tile route");
     if (owner.stageContract && (std::memcmp(&*owner.stageContract, &contract, sizeof(contract)) != 0 ||
-        owner.tileGeneration != tile->shaderGeneration))
+        owner.tileGeneration != tile->shaderGeneration || owner.laneBindingSlots != laneBindingSlots))
         return mcdr::err("terrain.tile.stage", "Tile stage contract is immutable after registration");
     const auto sourceIdentity = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(source));
     for (uint32_t index = 0; index < owner.sourceCount; ++index)
@@ -1053,11 +1132,54 @@ mcdr::Result<void> bindTerrainTileStageV2(void* opaqueSource, void* opaqueRoute,
         }
     if (owner.sourceCount == owner.sources.size())
         return mcdr::err("terrain.tile.stage", "Tile route source registry is full");
+    if (!owner.lanePlaceholderHeap &&
+        std::ranges::any_of(laneBindingSlots, [](uint32_t slot) { return slot != UINT32_MAX; })) {
+        auto* device = deviceContext().device.Get();
+        if (!device) return mcdr::err("terrain.tile.stage", "Tile stage device is unavailable");
+        D3D12_DESCRIPTOR_HEAP_DESC heap{};
+        heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heap.NumDescriptors = 1;
+        const HRESULT result = device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&owner.lanePlaceholderHeap));
+        if (FAILED(result))
+            return mcdr::err("terrain.tile.stage", "Tile stage descriptor allocation failed hr=" + hrHex(result));
+        auto& placeholder = owner.lanePlaceholder;
+        placeholder.kind = Dx12Object::Kind::TextureView;
+        placeholder.packetContentOwner = route->route;
+        placeholder.cpuHandle = owner.lanePlaceholderHeap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(nullptr, &view, placeholder.cpuHandle);
+    }
     owner.stageContract = contract;
+    owner.laneBindingSlots = laneBindingSlots;
     owner.tileGeneration = tile->shaderGeneration;
     owner.sources[owner.sourceCount++] = {sourceIdentity, source->shaderGeneration};
     source->terrainTileRoute = route->route;
     return {};
+}
+
+}
+
+mcdr::Result<void> bindTerrainTileStageV2(void* source, void* route,
+    const mcdr_terrain_tile_stage_v2& contract, std::span<const uint32_t> laneRegisters) {
+    if (contract.stage >= terrainOpaqueSeedStage)
+        return mcdr::err("terrain.tile.stage", "Tile stage contract is invalid");
+    return bindTerrainTileStage(source, route, contract, laneRegisters);
+}
+
+mcdr::Result<void> bindTerrainOpaqueSeedV1(void* source, void* route, uint64_t programGeneration,
+    uint32_t quadsPerMeshlet) {
+    const mcdr_terrain_tile_stage_v2 contract{2, sizeof(contract), mcdr::oit_shader::abiVersion,
+        terrainOpaqueSeedStage, quadsPerMeshlet, 1, mcdr::oit_shader::contractHash, programGeneration};
+    return bindTerrainTileStage(source, route, contract, {});
+}
+
+std::span<const uint32_t> terrainTileLaneBindingSlots(const void* opaqueRoute) {
+    const auto* route = static_cast<const TerrainTileRoute*>(opaqueRoute);
+    return route ? std::span<const uint32_t>{route->laneBindingSlots} : std::span<const uint32_t>{};
 }
 
 mcdr::terrain_tile::StageAdapterDescription describeTerrainTileStageAdapter(
@@ -1088,131 +1210,201 @@ mcdr::terrain_tile::StageAdapterDescription describeTerrainTileStageAdapter(
 namespace {
 
 void createTileTextureSrv(Dx12Object* object, D3D12_CPU_DESCRIPTOR_HANDLE destination) {
-    const auto description = object->resource->GetDesc();
     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
-    view.Format = object->dxgiFormat;
+    view.Format = object ? object->dxgiFormat : DXGI_FORMAT_R32G32B32A32_FLOAT;
     view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
     view.Texture2DArray.MostDetailedMip = 0;
-    view.Texture2DArray.MipLevels = description.MipLevels;
+    view.Texture2DArray.MipLevels = 1;
     view.Texture2DArray.FirstArraySlice = 0;
-    view.Texture2DArray.ArraySize = description.DepthOrArraySize;
+    view.Texture2DArray.ArraySize = object ? object->resource->GetDesc().DepthOrArraySize : 1u;
     view.Texture2DArray.PlaneSlice = 0;
     view.Texture2DArray.ResourceMinLODClamp = 0.0f;
-    deviceContext().device->CreateShaderResourceView(object->resource.Get(), &view, destination);
+    deviceContext().device->CreateShaderResourceView(object ? object->resource.Get() : nullptr, &view, destination);
 }
 
 mcdr::Result<DrawDescriptorRange> createTileReplayDescriptors(CommandContext* context,
-    const mcdr::terrain_tile::BatchV2& batch, UINT residentCount) {
+    const mcdr::terrain_tile::BatchV2& batch, mcdr::terrain_tile::ReplayStage stage) {
+    using mcdr::terrain_tile::ReplayStage;
     auto descriptors = allocateDrawDescriptors(context, 5);
     if (!descriptors) return std::unexpected<mcdr::Error>(descriptors.error());
     auto cpu = descriptors->cpu;
-    for (uint32_t index = 0; index < 5; ++index) {
-        const auto& reference = index == 0 ? batch.bounds : batch.coefficients[index - 1];
-        auto* object = static_cast<Dx12Object*>(reference.object);
-        const auto resourceDescription = object->resource->GetDesc();
-        if (resourceDescription.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-            resourceDescription.Width != mcdr::terrain_tile::scratchSize ||
-            resourceDescription.Height != mcdr::terrain_tile::scratchSize ||
-            resourceDescription.DepthOrArraySize < residentCount)
-            return mcdr::err("terrain.tile.replay", "Tile attachment array does not match the resident batch");
-        createTileTextureSrv(object, cpu);
+    createTileTextureSrv(stage == ReplayStage::DepthBounds ? nullptr :
+        static_cast<Dx12Object*>(batch.culledBounds.object), cpu);
+    const auto coefficientCount = stage == ReplayStage::Accumulate
+        ? batch.stages[static_cast<uint32_t>(ReplayStage::Transmittance)].renderTargetCount : 0u;
+    for (uint32_t index = 0; index < std::size(batch.coefficients); ++index) {
         cpu.ptr += deviceContext().srvInc;
+        createTileTextureSrv(index < coefficientCount ?
+            static_cast<Dx12Object*>(batch.coefficients[index].object) : nullptr, cpu);
     }
     return descriptors;
 }
 
 }
 
-mcdr::Result<void> validateTerrainTileReplay(void* opaqueRoute,
-    const mcdr::terrain_tile::BatchV2& batch) {
-    auto* route = static_cast<TerrainTileRoute*>(opaqueRoute);
-    if (!route || !route->root || !route->signature)
-        return mcdr::err("terrain.tile.replay", "Tile replay route is incomplete");
-    Dx12Pipeline* pipelines[3]{};
-    for (uint32_t index = 0; index < 3; ++index) {
-        const auto& stage = batch.stages[index];
-        if (stage.stage != index || stage.flags != 0 || stage.reserved != 0 || stage.renderTargetCount == 0 ||
-            stage.renderTargetCount > 5 || !stage.pipeline)
-            return mcdr::err("terrain.tile.replay", "Tile replay stages are incomplete or unordered");
-        auto* pipeline = static_cast<Dx12Pipeline*>(stage.pipeline);
-        if (!pipeline->isMesh || !pipeline->meshVisibleWork || !pipeline->rootSignature ||
-            pipeline->rootSignature.Get() != route->root.Get() || !pipeline->withDepth)
-            return mcdr::err("terrain.tile.replay", "Tile replay stage root or mesh PSO is incompatible");
-        if (pipeline->colorTargetCount != stage.renderTargetCount ||
-            pipeline->colorTargetFormats.size() != stage.renderTargetCount)
-            return mcdr::err("terrain.tile.replay", "Tile replay stage attachment count differs from its PSO");
-        if (pipeline->depthTargetFormat != DXGI_FORMAT_D32_FLOAT)
-            return mcdr::err("terrain.tile.replay", "Tile replay stage PSO has no D32 depth target");
-        auto* depth = static_cast<Dx12Object*>(stage.depth.object);
-        if (!depth || depth->kind != Dx12Object::Kind::Texture || !depth->resource ||
-            depth->dxgiFormat != DXGI_FORMAT_D32_FLOAT)
-            return mcdr::err("terrain.tile.replay", "Tile replay stage depth format is incompatible");
-        for (uint32_t target = 0; target < stage.renderTargetCount; ++target) {
-            auto* color = static_cast<Dx12Object*>(stage.renderTargets[target].object);
-            if (!color || color->kind != Dx12Object::Kind::Texture || !color->resource ||
-                !(color->usage & 8) || color->dxgiFormat != pipeline->colorTargetFormats[target])
-                return mcdr::err("terrain.tile.replay", "Tile replay stage color format is incompatible");
-        }
-        if (pipelines[0] == pipeline || pipelines[1] == pipeline)
-            return mcdr::err("terrain.tile.replay", "Tile replay stages must use distinct PSOs");
-        pipelines[index] = pipeline;
-    }
-    const std::array<std::array<void*, 4>, 3> stageOutputSets = {{
-        {{batch.bounds.object, nullptr, nullptr, nullptr}},
-        {{batch.coefficients[0].object, batch.coefficients[1].object,
-            batch.coefficients[2].object, batch.coefficients[3].object}},
-        {{batch.q.object, nullptr, nullptr, nullptr}},
-    }};
-    const uint32_t coefficientTargets = batch.stages[1].renderTargetCount;
-    if (coefficientTargets != 1 && coefficientTargets != 2 && coefficientTargets != 4)
-        return mcdr::err("terrain.tile.replay", "Tile coefficient target count is invalid");
-    const std::array<uint32_t, 3> expectedOutputCounts = {1, coefficientTargets, 1};
-    for (uint32_t stageIndex = 0; stageIndex < 3; ++stageIndex) {
-        const auto& stage = batch.stages[stageIndex];
-        if (stage.renderTargetCount != expectedOutputCounts[stageIndex])
-            return mcdr::err("terrain.tile.replay", "Tile replay stage output mapping is incomplete");
-        for (uint32_t target = 0; target < stage.renderTargetCount; ++target) {
-            const auto object = stage.renderTargets[target].object;
-            if (object != stageOutputSets[stageIndex][target])
-                return mcdr::err("terrain.tile.replay", "Tile replay stage output mapping is unavailable");
-        }
-    }
-    return mcdr::err("terrain.tile.execution", "Tile V2 lacks sealed depth/cull/normalization events");
-}
+namespace {
 
-mcdr::Result<void> recordTerrainTileReplay(void* opaqueContext, void* opaqueRoute,
-    const mcdr::terrain_tile::BatchV2& batch, const TerrainTileGeometryV2& geometry,
-    const TerrainTileReplayInputsV2& inputs, uint32_t stageIndex,
-    TerrainTileAttachmentMode attachmentMode) {
-    auto* context = static_cast<CommandContext*>(opaqueContext);
+mcdr::Result<void> validateTerrainReplay(void* opaqueRoute,
+    const mcdr::terrain_tile::BatchV2& batch, const mcdr::terrain_tile::StageBindingV2& stage,
+    const TerrainTileReplayInputsV2& inputs) {
     auto* route = static_cast<TerrainTileRoute*>(opaqueRoute);
-    if (!context || !context->listOpen || !context->commandList || !route ||
-        stageIndex >= 3 || geometry.segmentAddress == 0 || geometry.vertexAddress == 0 ||
-        geometry.visibleAddress == 0 || geometry.atlasAddress == 0 || geometry.batchConstantsAddress == 0)
-        return mcdr::err("terrain.tile.replay", "Tile replay context or geometry is incomplete");
-    const auto& stage = batch.stages[stageIndex];
-    auto* pipeline = static_cast<Dx12Pipeline*>(stage.pipeline);
-    if (!pipeline || !pipeline->isMesh || !pipeline->meshVisibleWork || !pipeline->rootSignature ||
+    const uint32_t stageIndex = stage.stage;
+    const bool opaqueSeed = stageIndex == terrainOpaqueSeedStage;
+    if (!route || !route->root || !route->signature || !route->stageContract ||
+        stageIndex > terrainOpaqueSeedStage || route->stageContract->stage != stageIndex ||
+        route->stageContract->programGeneration != batch.programGeneration ||
+        route->captureGeneration != batch.programGeneration)
+        return mcdr::err("terrain.tile.replay", "Tile replay route is incomplete");
+    if (stage.flags != 0 || stage.reserved != 0 ||
+        stage.renderTargetCount > 4 || !stage.pipeline)
+        return mcdr::err("terrain.tile.replay", "Tile replay stage is incomplete");
+    const bool validTargetCount = stageIndex == static_cast<uint32_t>(mcdr::terrain_tile::ReplayStage::Transmittance)
+        ? (stage.renderTargetCount == 1 || stage.renderTargetCount == 2 || stage.renderTargetCount == 4)
+        : stage.renderTargetCount == (opaqueSeed ? 0u : 1u);
+    if (!validTargetCount)
+        return mcdr::err("terrain.tile.replay", "Tile replay target count is incompatible");
+    const auto* pipeline = static_cast<const Dx12Pipeline*>(stage.pipeline);
+    if (route->tilePipeline.get() != pipeline || pipeline->shaderGeneration != route->tileGeneration ||
+        !pipeline->isMesh || !pipeline->meshVisibleWork || !pipeline->rootSignature ||
         pipeline->rootSignature.Get() != route->root.Get() || !pipeline->withDepth)
         return mcdr::err("terrain.tile.replay", "Tile replay PSO is incompatible with its route");
     if (route->segmentParam == UINT_MAX || route->geometryParam == UINT_MAX ||
-        route->batchParam == UINT_MAX || route->descriptorParam == UINT_MAX)
+        route->batchParam == UINT_MAX || route->descriptorParam == UINT_MAX ||
+        pipeline->segmentParam != route->segmentParam || pipeline->geometryParam != route->geometryParam)
         return mcdr::err("terrain.tile.replay", "Tile replay root parameter metadata is incomplete");
+    const auto& viewport = inputs.sourceViewport;
+    const auto& scissor = inputs.sourceScissor;
+    if (!std::isfinite(viewport.TopLeftX) || !std::isfinite(viewport.TopLeftY) ||
+        !std::isfinite(viewport.Width) || !std::isfinite(viewport.Height) || viewport.Width <= 0.0f ||
+        viewport.Height <= 0.0f ||
+        viewport.TopLeftX != batch.sourceViewport[0] || viewport.TopLeftY != batch.sourceViewport[1] ||
+        viewport.Width != batch.sourceViewport[2] || viewport.Height != batch.sourceViewport[3] ||
+        !std::isfinite(viewport.MinDepth) || !std::isfinite(viewport.MaxDepth) || viewport.MinDepth < 0.0f ||
+        viewport.MaxDepth > 1.0f || viewport.MinDepth > viewport.MaxDepth ||
+        scissor.left > scissor.right || scissor.top > scissor.bottom)
+        return mcdr::err("terrain.tile.replay", "Tile viewport or scissor differs from the captured draw");
     if (!pipeline->graphicsBindingLayoutKnown || pipeline->graphicsBindingTypes.size() != inputs.bindings.size() ||
         pipeline->pushConstantBytes != inputs.pushConstantBytes || !inputs.pushConstantsValid ||
-        inputs.pushConstantBytes > inputs.pushConstants.size() ||
+        inputs.pushConstantBytes > inputs.pushConstants.size() || inputs.pushConstantBytes % 4 != 0 ||
         (inputs.pushConstantBytes != 0 && pipeline->pushConstantParam == UINT_MAX))
         return mcdr::err("terrain.tile.replay", "Tile replay material layout differs from captured inputs");
-    std::vector<DrawBinding> materialBindings;
-    materialBindings.reserve(inputs.bindings.size());
     for (uint32_t index = 0; index < inputs.bindings.size(); ++index) {
         const auto& binding = inputs.bindings[index];
-        if (pipeline->graphicsBindingTypes[index] != binding.type)
+        if (pipeline->graphicsBindingTypes[index] != binding.type ||
+            binding.laneAttachment != std::ranges::contains(route->laneBindingSlots, index) ||
+            (binding.laneAttachment && (binding.type != 1 || !route->lanePlaceholderHeap)))
             return mcdr::err("terrain.tile.replay", "Tile replay material binding type changed");
-        materialBindings.push_back({binding.type, static_cast<Dx12Object*>(binding.buffer),
-            binding.offset, binding.length, binding.texelFormat, static_cast<Dx12Object*>(binding.view)});
     }
+    using mcdr::terrain_tile::ReplayStage;
+    if (stageIndex == static_cast<uint32_t>(ReplayStage::Accumulate)) {
+        const auto coefficientCount = std::ranges::count_if(std::span{route->laneBindingSlots}.subspan(1),
+            [](uint32_t slot) { return slot != UINT32_MAX; });
+        if (coefficientCount != 0 && coefficientCount != batch.stages[1].renderTargetCount)
+            return mcdr::err("terrain.tile.replay", "Tile coefficient layout differs from the producer");
+    }
+    return {};
+}
+
+mcdr::terrain_tile::StageBindingV2 opaqueSeedStageBinding(const TerrainTileRoute* route,
+    const mcdr::terrain_tile::ResourceRef& depth) {
+    mcdr::terrain_tile::StageBindingV2 stage{};
+    stage.stage = terrainOpaqueSeedStage;
+    stage.pipeline = route ? route->tilePipeline.get() : nullptr;
+    stage.depth = depth;
+    return stage;
+}
+
+std::vector<DrawBinding> terrainTileMaterialBindings(const TerrainTileReplayInputsV2& inputs, Dx12Object& lanePlaceholder) {
+    std::vector<DrawBinding> bindings;
+    bindings.reserve(inputs.bindings.size());
+    for (const auto& binding : inputs.bindings)
+        bindings.push_back({binding.type, static_cast<Dx12Object*>(binding.buffer),
+            binding.offset, binding.length, binding.texelFormat,
+            binding.laneAttachment ? &lanePlaceholder : static_cast<Dx12Object*>(binding.view)});
+    return bindings;
+}
+}
+
+mcdr::Result<void> validateTerrainTileReplay(void* opaqueRoute, const mcdr::terrain_tile::BatchV2& batch,
+    const TerrainTileReplayInputsV2& inputs, uint32_t stageIndex) {
+    if (stageIndex >= std::size(batch.stages) || batch.stages[stageIndex].stage != stageIndex)
+        return mcdr::err("terrain.tile.replay", "Tile replay stage is incomplete");
+    return validateTerrainReplay(opaqueRoute, batch, batch.stages[stageIndex], inputs);
+}
+
+mcdr::Result<void> validateTerrainOpaqueSeedReplay(void* opaqueRoute, const mcdr::terrain_tile::BatchV2& batch,
+    const TerrainTileReplayInputsV2& inputs, const mcdr::terrain_tile::ResourceRef& depth) {
+    const auto* target = static_cast<const Dx12Object*>(depth.object);
+    if (!target || target->kind != Dx12Object::Kind::Texture || !target->resource ||
+        target->dxgiFormat != DXGI_FORMAT_D32_FLOAT || depth.offset || depth.bytes)
+        return mcdr::err("terrain.seed.replay", "Terrain seed depth is invalid");
+    const auto desc = target->resource->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Format != DXGI_FORMAT_R32_TYPELESS ||
+        desc.Width != mcdr::terrain_tile::scratchSize || desc.Height != mcdr::terrain_tile::scratchSize ||
+        desc.DepthOrArraySize != batch.residentTileCount || desc.MipLevels != 1 || desc.SampleDesc.Count != 1 ||
+        !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+        return mcdr::err("terrain.seed.replay", "Terrain seed depth layout is invalid");
+    const auto stage = opaqueSeedStageBinding(static_cast<TerrainTileRoute*>(opaqueRoute), depth);
+    return validateTerrainReplay(opaqueRoute, batch, stage, inputs);
+}
+
+bool hasTerrainTileEnvelopePipeline(const void* opaqueRoute) {
+    const auto* route = static_cast<const TerrainTileRoute*>(opaqueRoute);
+    return route && route->envelopePipeline;
+}
+
+mcdr::Result<void> recordTerrainTileEnvelopes(void* opaqueContext, const void* opaqueRoute,
+    const mcdr::terrain_tile::BatchV2& batch, const TerrainTileGeometryV2& geometry,
+    const TerrainTileReplayInputsV2& inputs, const TerrainTileEnvelopeChunk& chunk) {
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    auto* route = const_cast<TerrainTileRoute*>(static_cast<const TerrainTileRoute*>(opaqueRoute));
+    if (!context || !route || !route->envelopePipeline || !route->tilePipeline ||
+        !context->listOpen || !context->commandList || context->inRenderPass ||
+        !chunk.destination || chunk.destination % 4)
+        return mcdr::err("terrain.tile.envelope", "Tile envelope recording is invalid");
+    auto* commandList = context->commandList;
+    commandList->SetComputeRootSignature(route->root.Get());
+    restoreDrawHeap(context);
+    if (auto result = pushDescriptors(context, terrainTileMaterialBindings(inputs, route->lanePlaceholder),
+            DescriptorBindPoint::Compute);
+        !result)
+        return result;
+    commandList->SetComputeRootConstantBufferView(route->segmentParam, geometry.segmentAddress);
+    commandList->SetComputeRootShaderResourceView(route->geometryParam, geometry.vertexAddress);
+    commandList->SetComputeRootShaderResourceView(route->geometryParam + 1, geometry.visibleAddress);
+    commandList->SetComputeRootShaderResourceView(route->geometryParam + 2, geometry.atlasAddress);
+    commandList->SetComputeRootConstantBufferView(route->batchParam, geometry.batchConstantsAddress);
+    const auto* pipeline = static_cast<const Dx12Pipeline*>(route->tilePipeline.get());
+    if (inputs.pushConstantBytes)
+        commandList->SetComputeRoot32BitConstants(pipeline->pushConstantParam,
+            inputs.pushConstantBytes / 4u, inputs.pushConstants.data(), 0);
+    const uint32_t constants[] = {batch.primitiveCount, batch.refCapacity,
+        batch.commandKind, batch.commandStride, chunk.firstVisible};
+    commandList->SetComputeRoot32BitConstants(route->descriptorParam + 1, 5, constants, 0);
+    commandList->SetComputeRootUnorderedAccessView(route->descriptorParam + 2, chunk.destination);
+    commandList->SetPipelineState(route->envelopePipeline.Get());
+    commandList->Dispatch((batch.primitiveCount + 63u) / 64u, 1, 1);
+    context->cachedPso = nullptr;
+    return {};
+}
+
+namespace {
+
+mcdr::Result<void> recordTerrainReplay(void* opaqueContext, void* opaqueRoute,
+    const mcdr::terrain_tile::BatchV2& batch, const mcdr::terrain_tile::StageBindingV2& stage,
+    const TerrainTileGeometryV2& geometry, const TerrainTileReplayInputsV2& inputs,
+    TerrainTileAttachmentMode attachmentMode) {
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    auto* route = static_cast<TerrainTileRoute*>(opaqueRoute);
+    if (!context || !context->listOpen || !context->commandList ||
+        geometry.segmentAddress == 0 || geometry.vertexAddress == 0 ||
+        geometry.visibleAddress == 0 || geometry.atlasAddress == 0 || geometry.batchConstantsAddress == 0)
+        return mcdr::err("terrain.tile.replay", "Tile replay context or geometry is incomplete");
+    const uint32_t stageIndex = stage.stage;
+    const bool opaqueSeed = stageIndex == terrainOpaqueSeedStage;
+    auto* pipeline = static_cast<Dx12Pipeline*>(stage.pipeline);
+    const auto materialBindings = terrainTileMaterialBindings(inputs, route->lanePlaceholder);
     std::array<Dx12Object*, 5> targets{};
     for (uint32_t index = 0; index < stage.renderTargetCount; ++index)
         targets[index] = static_cast<Dx12Object*>(stage.renderTargets[index].object);
@@ -1237,8 +1429,8 @@ mcdr::Result<void> recordTerrainTileReplay(void* opaqueContext, void* opaqueRout
         declarations.push_back({object, batch.resourceVersion, UINT32_MAX, 0,
             vanilla::ResourceAccess::ReadWrite, state, D3D12_RESOURCE_STATE_COMMON});
     };
-    if (stageIndex != 0)
-        declareRead(batch.bounds.object, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (!opaqueSeed && stageIndex != 0)
+        declareRead(batch.culledBounds.object, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     if (stageIndex == 2)
         for (uint32_t index = 0; index < batch.stages[1].renderTargetCount; ++index)
             declareRead(batch.coefficients[index].object, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -1257,20 +1449,31 @@ mcdr::Result<void> recordTerrainTileReplay(void* opaqueContext, void* opaqueRout
         vanilla::failRasterInputPass(context);
         return pass;
     }
-    std::vector<D3D12_VIEWPORT> viewports(batch.residentTileCount);
-    const float laneX = (batch.laneIndex & 1u) != 0 ? 0.25f : -0.25f;
-    const float laneY = (batch.laneIndex & 2u) != 0 ? 0.25f : -0.25f;
+    std::array<D3D12_VIEWPORT, mcdr::terrain_tile::maximumResidentTiles> viewports{};
+    std::array<D3D12_RECT, mcdr::terrain_tile::maximumResidentTiles> scissors{};
+    const auto& lane = mcdr::terrain_tile::laneOffsets[batch.laneIndex];
+    const auto& sourceViewport = inputs.sourceViewport;
+    const auto& sourceScissor = inputs.sourceScissor;
+    constexpr auto guard = static_cast<int64_t>(mcdr::terrain_tile::guardPixels);
     for (uint32_t index = 0; index < batch.residentTileCount; ++index) {
         const auto& tile = batch.tiles[index];
-        viewports[index] = {batch.sourceViewport[0] - static_cast<float>(tile.originX) +
-                static_cast<float>(mcdr::terrain_tile::guardPixels) - laneX,
-            batch.sourceViewport[1] - static_cast<float>(tile.originY) +
-                static_cast<float>(mcdr::terrain_tile::guardPixels) - laneY,
-            batch.sourceViewport[2], batch.sourceViewport[3], 0.0f, 1.0f};
+        const int64_t shiftX = guard - tile.originX;
+        const int64_t shiftY = guard - tile.originY;
+        viewports[index] = {sourceViewport.TopLeftX + static_cast<float>(shiftX) - lane[0],
+            sourceViewport.TopLeftY + static_cast<float>(shiftY) - lane[1],
+            sourceViewport.Width, sourceViewport.Height, sourceViewport.MinDepth, sourceViewport.MaxDepth};
+        const int64_t guardedWidth = tile.effectiveWidth + guard * 2;
+        const int64_t guardedHeight = tile.effectiveHeight + guard * 2;
+        scissors[index] = {
+            static_cast<LONG>(std::clamp(sourceScissor.left + shiftX, int64_t{0}, guardedWidth)),
+            static_cast<LONG>(std::clamp(sourceScissor.top + shiftY, int64_t{0}, guardedHeight)),
+            static_cast<LONG>(std::clamp(sourceScissor.right + shiftX, int64_t{0}, guardedWidth)),
+            static_cast<LONG>(std::clamp(sourceScissor.bottom + shiftY, int64_t{0}, guardedHeight)),
+        };
     }
-    context->commandList->RSSetViewports(static_cast<UINT>(viewports.size()), viewports.data());
-    const D3D12_RECT scissor{0, 0, renderWidth, renderHeight};
-    context->commandList->RSSetScissorRects(1, &scissor);
+    context->commandList->RSSetViewports(batch.residentTileCount, viewports.data());
+    context->commandList->RSSetScissorRects(batch.residentTileCount, scissors.data());
+    restoreDrawHeap(context);
     context->commandList->SetPipelineState(pipeline->withDepth.Get());
     context->commandList->SetGraphicsRootSignature(pipeline->rootSignature.Get());
     context->graphicsBindingRoot = pipeline->rootSignature.Get();
@@ -1284,19 +1487,31 @@ mcdr::Result<void> recordTerrainTileReplay(void* opaqueContext, void* opaqueRout
     if (inputs.pushConstantBytes != 0)
         context->commandList->SetGraphicsRoot32BitConstants(pipeline->pushConstantParam,
             inputs.pushConstantBytes / 4u, inputs.pushConstants.data(), 0);
-    if (const auto bindings = pushDescriptors(context, materialBindings); !bindings) {
+    if (const auto bindings = pushDescriptors(context, materialBindings, DescriptorBindPoint::GraphicsDeclared); !bindings) {
         static_cast<void>(endRenderPass(context));
         vanilla::failRasterInputPass(context);
         return bindings;
     }
-    restoreDrawHeap(context);
-    auto descriptorsResult = createTileReplayDescriptors(context, batch, batch.residentTileCount);
-    if (!descriptorsResult) {
-        static_cast<void>(endRenderPass(context));
-        vanilla::failRasterInputPass(context);
-        return std::unexpected<mcdr::Error>(descriptorsResult.error());
+    if (!opaqueSeed) {
+        const auto* materialHeap = context->resourceDrawHeap.Get();
+        auto descriptorsResult = createTileReplayDescriptors(context, batch,
+            static_cast<mcdr::terrain_tile::ReplayStage>(stageIndex));
+        if (!descriptorsResult) {
+            static_cast<void>(endRenderPass(context));
+            vanilla::failRasterInputPass(context);
+            return std::unexpected<mcdr::Error>(descriptorsResult.error());
+        }
+        // A descriptor heap change invalidates the previously bound material table.
+        if (materialHeap != context->resourceDrawHeap.Get()) {
+            if (const auto bindings = pushDescriptors(context, materialBindings,
+                    DescriptorBindPoint::GraphicsDeclared); !bindings) {
+                static_cast<void>(endRenderPass(context));
+                vanilla::failRasterInputPass(context);
+                return bindings;
+            }
+        }
+        context->commandList->SetGraphicsRootDescriptorTable(route->descriptorParam, descriptorsResult->gpu);
     }
-    context->commandList->SetGraphicsRootDescriptorTable(route->descriptorParam, descriptorsResult->gpu);
     auto* commands = static_cast<Dx12Object*>(batch.commands.object);
     auto* control = static_cast<Dx12Object*>(batch.control.object);
     if (prepareSampledRenderPassWrites(context) != SampledTextureContentStatus::Ready) {
@@ -1308,7 +1523,7 @@ mcdr::Result<void> recordTerrainTileReplay(void* opaqueContext, void* opaqueRout
     context->cachedPso = nullptr;
     for (size_t index = 0; index < context->activeColorTargetsTouched.size(); ++index)
         context->activeColorTargetsTouched[index] = true;
-    context->colorTargetsWritten = true;
+    context->colorTargetsWritten = stage.renderTargetCount != 0;
     if (auto ended = endRenderPass(context); !ended) {
         vanilla::failRasterInputPass(context);
         return ended;
@@ -1316,6 +1531,64 @@ mcdr::Result<void> recordTerrainTileReplay(void* opaqueContext, void* opaqueRout
     if (vanilla::finishDeclaredPass(context, declaration) != 1)
         return mcdr::err("terrain.tile.replay", vanilla::lastFailureText());
     return {};
+}
+
+}
+
+mcdr::Result<void> initializeTerrainTileLane(void* opaqueContext, const mcdr::terrain_tile::BatchV2& batch) {
+    auto* context = static_cast<CommandContext*>(opaqueContext);
+    if (!context || !context->listOpen || !context->commandList || context->inRenderPass)
+        return mcdr::err("terrain.tile.initialize", "Tile lane clear requires an open command list outside a pass");
+    constexpr auto transmittanceStage = static_cast<uint32_t>(mcdr::terrain_tile::ReplayStage::Transmittance);
+    const auto coefficientCount = batch.stages[transmittanceStage].renderTargetCount;
+    if (coefficientCount != 1 && coefficientCount != 2 && coefficientCount != 4)
+        return mcdr::err("terrain.tile.initialize", "Tile lane coefficient count is invalid");
+
+    // LevelRenderer clears these targets on acquisition. Its full-screen blits initialize culled bounds and depth copies.
+    const mcdr::terrain_tile::ResourceRef targets[] = {
+        batch.bounds, batch.q, batch.coefficients[0], batch.coefficients[1],
+        batch.coefficients[2], batch.coefficients[3],
+    };
+    vanilla::PassResourceUse declarations[std::size(targets)]{};
+    const uint32_t targetCount = coefficientCount + 2;
+    for (uint32_t index = 0; index < targetCount; ++index) {
+        const auto* texture = static_cast<const Dx12Object*>(targets[index].object);
+        const auto format = index == 0 ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R16G16B16A16_FLOAT;
+        if (!texture || texture->kind != Dx12Object::Kind::Texture || !texture->resource ||
+            texture->dxgiFormat != format)
+            return mcdr::err("terrain.tile.initialize", "Tile lane clear target format is invalid");
+        declarations[index] = {targets[index].object, batch.resourceVersion, UINT32_MAX, 0,
+            vanilla::ResourceAccess::Write, D3D12_RESOURCE_STATE_RENDER_TARGET};
+    }
+    vanilla::DeclaredPassToken* declaration = nullptr;
+    if (vanilla::beginDeclaredPass(context, 0x214u, declarations, targetCount, 0, &declaration) != 1)
+        return mcdr::err("terrain.tile.initialize", vanilla::lastFailureText());
+    for (uint32_t index = 0; index < targetCount; ++index) {
+        const float red = index == 0 ? std::numeric_limits<float>::lowest() : 0.0f;
+        if (auto cleared = clearColorTexture(context, static_cast<Dx12Object*>(targets[index].object),
+                red, 0.0f, 0.0f, 0.0f); !cleared) {
+            vanilla::failRasterInputPass(context);
+            return cleared;
+        }
+    }
+    if (vanilla::finishDeclaredPass(context, declaration) != 1)
+        return mcdr::err("terrain.tile.initialize", vanilla::lastFailureText());
+    return {};
+}
+
+mcdr::Result<void> recordTerrainTileReplay(void* context, void* route,
+    const mcdr::terrain_tile::BatchV2& batch, const TerrainTileGeometryV2& geometry,
+    const TerrainTileReplayInputsV2& inputs, uint32_t stageIndex, TerrainTileAttachmentMode attachmentMode) {
+    if (auto valid = validateTerrainTileReplay(route, batch, inputs, stageIndex); !valid) return valid;
+    return recordTerrainReplay(context, route, batch, batch.stages[stageIndex], geometry, inputs, attachmentMode);
+}
+
+mcdr::Result<void> recordTerrainOpaqueSeedReplay(void* context, void* route,
+    const mcdr::terrain_tile::BatchV2& batch, const TerrainTileGeometryV2& geometry,
+    const TerrainTileReplayInputsV2& inputs, const mcdr::terrain_tile::ResourceRef& depth) {
+    if (auto valid = validateTerrainOpaqueSeedReplay(route, batch, inputs, depth); !valid) return valid;
+    const auto stage = opaqueSeedStageBinding(static_cast<TerrainTileRoute*>(route), depth);
+    return recordTerrainReplay(context, route, batch, stage, geometry, inputs, TerrainTileAttachmentMode::Load);
 }
 
 mcdr::Result<void*> createMeshPipeline(const MeshPipelineDesc& desc) {

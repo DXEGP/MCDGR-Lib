@@ -6,6 +6,7 @@ module;
 #include <vector>
 #include <string>
 #include "mcdr_graphics_recording.h"
+#include "mcdr_abi.h"
 
 export module mcdr.render.vanilla;
 
@@ -52,18 +53,6 @@ enum class WorldDepthSeedStatus : uint32_t {
     Incomplete, BudgetExceeded, RecordingFailed
 };
 
-struct WorldDepthSeedCaptureV1 {
-    FrameInput frame;
-    void* worldDepth = nullptr;
-    uint64_t programGeneration = 0;
-    std::shared_ptr<const void> recordingIdentity;
-    void* fence = nullptr;
-    uint64_t submission = 0;
-    uint64_t totalBudgetBytes = 0;
-    uint32_t maxEvents = 0;
-    mcdr::graphics_recording::Observer observer;
-};
-
 enum class WorldDepthSeedEventKind : uint8_t { Clear, Draw };
 
 struct WorldDepthSeedEventV1 {
@@ -101,7 +90,7 @@ struct WorldDepthSeedJournalV1 {
     std::vector<WorldDepthSeedEventV1> events;
 };
 
-WorldDepthSeedStatus armWorldDepthSeedCaptureV1(void* context, const WorldDepthSeedCaptureV1& input);
+WorldDepthSeedStatus armWorldDepthSeedCaptureV1(void* context, uint32_t maxEvents, uint64_t totalBudgetBytes);
 WorldDepthSeedStatus sealWorldDepthSeedCaptureV1(void* context, std::shared_ptr<const WorldDepthSeedJournalV1>* journal);
 WorldDepthSeedStatus readWorldDepthSeedCaptureV1(void* context, std::shared_ptr<const WorldDepthSeedJournalV1>* journal);
 WorldDepthSeedStatus cancelWorldDepthSeedCaptureV1(void* context);
@@ -122,7 +111,8 @@ using PostAdapter = int (*)(void* context, void* payload);
 std::string lastFailureText();
 uint64_t frozenResourceVersion(void* context);
 bool matchesFrozenFrame(void* context, const void* identity, uint64_t historyGeneration);
-int prepareFramePrograms(void* context, uint64_t generation, uint32_t flags, void** candidate);
+int prepareFramePrograms(void* context, uint64_t generation, uint32_t flags, void** candidate,
+    const mcdr_oit_normalization_program_v1 (*normalization)[3] = nullptr);
 int commitFramePrograms(void* context, void* candidate);
 void abortFramePrograms(void* candidate) noexcept;
 std::string frameProgramsFailureText();
@@ -153,6 +143,8 @@ struct DeclaredPassToken;
 // graphics bindings, bit1 invalidates descriptor heap/tables. Provider internals
 // and history remain adapter-owned, outside these outer resource declarations.
 int beginFrame(void* context, const void* input, uint32_t byteCount);
+int registerWorldDepthV1(void* context, void* depth);
+bool matchesWorldDepthRegistrationV1(const void* context, const void* depth);
 int markWorldReady(void* context, const void* identity, uint32_t byteCount);
 int markGuiReady(void* context, const void* identity, uint32_t byteCount);
 int publishPreparedFrame(void* context, const void* input, uint32_t byteCount);

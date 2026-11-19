@@ -165,6 +165,14 @@ int32_t MCDR_CALL mcdr_dx12SetVertexBuffer(mcdr_command_ctx* ctx, int32_t slot, 
     return 1;
 }
 
+int32_t MCDR_CALL mcdr_dx12SetVertexBufferRangeV1(mcdr_command_ctx* ctx, int32_t slot, mcdr_object* buffer,
+    int64_t offset, int64_t length, int32_t stride) {
+    if (length <= 0) return mcdr::abi::failWith("mcdr_dx12SetVertexBufferRangeV1", "Vertex range is empty");
+    if (const auto result = d3d12_mc::setVertexBuffer(ctx, slot, buffer, offset, stride, length); !result)
+        return mcdr::abi::failWith("mcdr_dx12SetVertexBufferRangeV1", result.error().message);
+    return 1;
+}
+
 int32_t MCDR_CALL mcdr_dx12SetIndexBuffer(mcdr_command_ctx* ctx, mcdr_object* buffer, int32_t indexType) {
     if (const auto r = d3d12_mc::setIndexBuffer(ctx, buffer, indexType); !r) {
         return mcdr::abi::failWith("mcdr_dx12SetIndexBuffer", r.error().message);
