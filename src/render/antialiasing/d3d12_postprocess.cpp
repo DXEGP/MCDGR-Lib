@@ -12,7 +12,6 @@ import mcdr.error;
 namespace d3d12_mc {
 namespace {
 
-// VS: 把 2D 位置直接作为 SV_Position 输出；texcoord 透传给 PS。
 static const char kBlitVS[] = "struct VS_OUT { float4 pos : SV_Position; float2 tc : TEXCOORD0; };\n"
                               "VS_OUT main(float2 pos : POSITION, float2 tc : TEXCOORD0) {\n"
                               "    VS_OUT o;\n"
@@ -21,8 +20,6 @@ static const char kBlitVS[] = "struct VS_OUT { float4 pos : SV_Position; float2 
                               "    return o;\n"
                               "}\n";
 
-// PS: 对源纹理线性采样，输出到 backbuffer；GPU 光栅器自动处理格式转换。
-// 注意：'sampler' 是 HLSL 保留字，不能作变量名；PS 单独编译，须自带 VS_OUT 定义。
 static const char kBlitPS[] = "struct VS_OUT { float4 pos : SV_Position; float2 tc : TEXCOORD0; };\n"
                               "Texture2D<float4> srcTex : register(t0, space0);\n"
                               "SamplerState blitSampler : register(s0, space0);\n"
@@ -30,10 +27,6 @@ static const char kBlitPS[] = "struct VS_OUT { float4 pos : SV_Position; float2 
                               "    return srcTex.Sample(blitSampler, IN.tc);\n"
                               "}\n";
 
-// P197（HDR）：同一份 blit 几何，像素着色器把 SDR 主渲染目标（RGBA8，内容按 sRGB 编码）
-// 解码成线性、乘上「SDR 白 = 多少 scRGB 单位」，写进 R16G16B16A16_FLOAT 的交换链。
-// scRGB 的 1.0 定义为 80 nits，所以 sdrWhiteScale = SDRWhiteLevel(nits) / 80。
-// hdrEnabled 走 root constants：SDR 呈现时同一个 PSO 传 0 也能用（只是多一次分支）。
 static const char kBlitPSHdr[] =
     "struct VS_OUT { float4 pos : SV_Position; float2 tc : TEXCOORD0; };\n"
     "Texture2D<float4> srcTex : register(t0, space0);\n"
@@ -53,17 +46,16 @@ static const char kBlitPSHdr[] =
     "    return float4(srgbToLinear(c.rgb) * sdrWhiteScale, c.a);\n"
     "}\n";
 
-}  // namespace
+}
 
 mcdr::Result<void> initBlitPipeline() {
     if (auto d = ensureDevice(); !d) return mcdr::err("initBlitPipeline", errorMessage(d.error()));
-    if (deviceContext().blitPipeline) return {};  // 已初始化
+    if (deviceContext().blitPipeline) return {};
 
     auto bp = std::make_unique<BlitPipeline>();
 
     ComPtr<ID3D12RootSignature> rootSig;
     {
-        // 单个 descriptor table：SRV(t0) + static sampler(s0)
         D3D12_DESCRIPTOR_RANGE srvRange{};
         srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         srvRange.NumDescriptors = 1;
@@ -82,8 +74,6 @@ mcdr::Result<void> initBlitPipeline() {
         param.DescriptorTable = table;
         param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-        // P197：blit 的 HDR 参数（sdrWhiteScale / hdrEnabled）。SDR PSO 不声明这个 cbuffer，
-        // 但根签名里的参数必须一致，所以两个 PSO 共用同一份根签名，SDR 路径设成 (1,0) 即可。
         D3D12_ROOT_PARAMETER hdrParam{};
         hdrParam.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         hdrParam.Constants.ShaderRegister = 0;
@@ -127,8 +117,6 @@ mcdr::Result<void> initBlitPipeline() {
         }
     }
 
-    // 编译 VS / PS。与主图形管线同一策略：硬要求 SM 6.9 + DXC，**没有 5.1(DXBC) 兜底**
-    // （2026-10-25）—— 不满足就直接报错，blit 不通就等于 Present 不通，必须当场可见。
     const std::string smProfile = graphicsShaderModelProfile();
     if (smProfile.empty()) {
         return mcdr::err("initBlitPipeline", "initBlitPipeline: " + sm69RequirementText());
@@ -151,7 +139,6 @@ mcdr::Result<void> initBlitPipeline() {
     dbgLogInfo("initBlitPipeline: blit pipeline compiled with DXC SM %s (DXIL vs=%zuB ps=%zuB)", smProfile.c_str(),
                vsDxil.size(), psDxil.size());
 
-    // P197：HDR 变体的像素着色器（几何与 VS 不变，只有 RTV 格式和 PS 不同）。
     std::vector<uint8_t> hdrPsDxil;
     const std::string hdrSrc(kBlitPSHdr, sizeof(kBlitPSHdr) - 1);
     auto hdrDxc = compileHlslToDxil(hdrSrc, "main", "ps_" + smProfile, hdrPsDxil);
@@ -161,7 +148,6 @@ mcdr::Result<void> initBlitPipeline() {
     const void* hdrPsCode = hdrPsDxil.data();
     SIZE_T hdrPsCodeSize = hdrPsDxil.size();
 
-    // 创建 PSO（P197：SDR 用 RGBA8、HDR 用 RGBA16F，共用同一份根签名与输入布局）
     auto createBlitPso = [&](const void* pixCode, SIZE_T pixSize, DXGI_FORMAT rtvFormat,
                              ComPtr<ID3D12PipelineState>& outPso) -> mcdr::Result<void> {
         D3D12_INPUT_ELEMENT_DESC ie[2] = {};
@@ -200,7 +186,7 @@ mcdr::Result<void> initBlitPipeline() {
 
         D3D12_RASTERIZER_DESC rasterDesc{};
         rasterDesc.FillMode = D3D12_FILL_MODE_SOLID;
-        rasterDesc.CullMode = D3D12_CULL_MODE_NONE;  // 全屏 quad，无背面剔除
+        rasterDesc.CullMode = D3D12_CULL_MODE_NONE;
         rasterDesc.FrontCounterClockwise = FALSE;
         rasterDesc.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
         rasterDesc.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
@@ -224,8 +210,7 @@ mcdr::Result<void> initBlitPipeline() {
         psoDesc.RTVFormats[0] = rtvFormat;
         psoDesc.DSVFormat = DXGI_FORMAT_UNKNOWN;
         psoDesc.SampleDesc.Count = 1;
-        psoDesc.SampleMask = UINT_MAX;  // P25 fix：漏设 SampleMask → 0 → sample-mask 测试
-        // 丢弃所有片元（dx12-native.log 632 行 WARNING）
+        psoDesc.SampleMask = UINT_MAX;
         psoDesc.BlendState = blendDesc;
         psoDesc.RasterizerState = rasterDesc;
         psoDesc.DepthStencilState = dsDesc;
@@ -250,17 +235,16 @@ mcdr::Result<void> initBlitPipeline() {
         return cr;
     }
 
-    // 顶点缓冲：4 顶点，R32G32(position) + R32G32(texcoord)，upload heap
     {
         struct Vertex {
             float x, y;
             float u, v;
         };
         Vertex verts[4] = {
-            {-1.0f, -1.0f, 0.0f, 1.0f},  // bottom-left
-            {1.0f, -1.0f, 1.0f, 1.0f},  // bottom-right
-            {-1.0f, 1.0f, 0.0f, 0.0f},  // top-left
-            {1.0f, 1.0f, 1.0f, 0.0f},  // top-right
+            {-1.0f, -1.0f, 0.0f, 1.0f},
+            {1.0f, -1.0f, 1.0f, 1.0f},
+            {-1.0f, 1.0f, 0.0f, 0.0f},
+            {1.0f, 1.0f, 1.0f, 0.0f},
         };
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = D3D12_HEAP_TYPE_UPLOAD;
@@ -292,7 +276,6 @@ mcdr::Result<void> initBlitPipeline() {
         bp->vbView.StrideInBytes = sizeof(Vertex);
     }
 
-    // 索引缓冲：2 个三角形（顺时针，CullMode=NONE，顺序无关）
     {
         uint16_t idxs[6] = {0, 1, 2, 1, 3, 2};
         D3D12_HEAP_PROPERTIES hp{};
@@ -335,8 +318,6 @@ mcdr::Result<void> initBlitPipeline() {
 
 const BlitPipeline* getBlitPipeline() { return deviceContext().blitPipeline.get(); }
 
-// P121：锐化 PS —— 5-tap unsharp（中心 + 上下左右），参数走 32-bit 根常量 b1：
-// {rcpSize.x, rcpSize.y, amount, pad}。alpha 恒 1（目标是 RGBA8 世界层/呈现目标）。
 static const char kSharpenPS[] =
     "struct VS_OUT { float4 pos : SV_Position; float2 tc : TEXCOORD0; };\n"
     "Texture2D<float4> srcTex : register(t0, space0);\n"
@@ -359,7 +340,6 @@ mcdr::Result<void> initSharpenPipeline() {
     if (auto d = ensureDevice(); !d) return mcdr::err("initSharpenPipeline", errorMessage(d.error()));
     if (deviceContext().sharpenPipeline) return {};
 
-    // 顶点/索引缓冲与 blit 共用：先确保 blit 管线建好，再把 view 抄过来。
     if (auto b = initBlitPipeline(); !b) {
         return mcdr::err("initSharpenPipeline", errorMessage(b.error()));
     }
@@ -371,7 +351,6 @@ mcdr::Result<void> initSharpenPipeline() {
     auto sp = std::make_unique<SharpenPipeline>();
     ComPtr<ID3D12RootSignature> rootSig;
     {
-        // 参数 0：SRV 描述符表（t0）；参数 1：4 个 32-bit 根常量（b1）。
         D3D12_DESCRIPTOR_RANGE srvRange{};
         srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         srvRange.NumDescriptors = 1;
@@ -388,7 +367,7 @@ mcdr::Result<void> initSharpenPipeline() {
         params[0].DescriptorTable = table;
         params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[1].Constants.ShaderRegister = 1;  // b1
+        params[1].Constants.ShaderRegister = 1;
         params[1].Constants.RegisterSpace = 0;
         params[1].Constants.Num32BitValues = 4;
         params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
@@ -429,7 +408,6 @@ mcdr::Result<void> initSharpenPipeline() {
         }
     }
 
-    // 编译 VS（复用 blit 的）/ PS：与主图形管线同一策略 —— 硬要求 SM 6.9 + DXC，无 5.1 兜底。
     const std::string smProfile = graphicsShaderModelProfile();
     if (smProfile.empty()) {
         return mcdr::err("initSharpenPipeline", "initSharpenPipeline: " + sm69RequirementText());
@@ -451,7 +429,6 @@ mcdr::Result<void> initSharpenPipeline() {
     SIZE_T psCodeSize = psDxil.size();
     dbgLogInfo("initSharpenPipeline: compiled with DXC SM %s", smProfile.c_str());
 
-    // PSO：与 blit 完全同状态（noDepth / noBlend / noCull），只是 PS 不同。
     ComPtr<ID3D12PipelineState> pso;
     {
         D3D12_INPUT_ELEMENT_DESC ie[2] = {};
@@ -578,25 +555,8 @@ mcdr::Result<void> blitBindSourceTexture(CommandContext* ctx, Dx12Object* srcTex
     return bindPostprocessTextures(ctx, cmd, {{srcTex->resource.Get(), viewFmt, 0}});
 }
 
-// ---------------------------------------------------------------------------
-// P104: SMAA（Subpixel Morphological Antialiasing）
-// ---------------------------------------------------------------------------
-// 插入点：blitSurface 把主颜色目标（源纹理）拷到 back buffer **之前**（见 d3d12_surface.cpp）。
-// blit 本身就是"采样全屏四边形"（P22），所以这里天然能插后处理；SMAA 只看最终 LDR 颜色
-// （亮度边检测），不需要深度/法线/运动矢量。
-// 三个阶段，全部在**源分辨率**上跑，第三步顺带线性放大到窗口尺寸（⇒ 与分辨率解耦兼容）：
-//   ① 边检测   source            → edges   (R8G8_UNORM，.r=与左邻有边 .g=与上邻有边)
-//   ② 混合权重 edges + LUTs      → weights (R8G8_UNORM，.r=沿 x 混 .g=沿 y 混)
-//   ③ 邻域混合 source + weights  → back buffer（写进 back buffer ⇒ 调用方跳过纯 blit）
-// ② 用的是**官方算法**：把上游 SMAA.hlsl 的 SMAABlendingWeightCalculationPS（含斜向搜索、
-// 拐角修正）整段搬进来，权重由 AreaTex(160x560 RG8) / SearchTex(64x16 R8) 两张 LUT 查表得出
-// （数据见 include\mcdr_smaa_luts.h，字节级等于上游 Textures\AreaTexDX10.dds / SearchTex.dds）。
-// LUT 初始化失败时②退回 kSmaaWeightPS 的解析式近似（WARN 一行，功能不降级为崩溃/黑屏）。
-// TAA（模式 2）的实现见本文件末尾的 P152 分节（applyTaaToTexture，历史乒乓由 native 持有）；
-// DLAA（3）仍由 DLSS 特性实现，setAntiAliasing 收到 3 时只记一条 WARN。
 namespace {
 
-// ① 边检测：亮度差超阈值即在 .r（与左邻）/ .g（与上邻）打标记。
 const char kSmaaEdgePS[] =
     "struct VS_OUT { float4 pos : SV_Position; float2 tc : TEXCOORD0; };\n"
     "Texture2D<float4> srcTex : register(t0, space0);\n"
@@ -614,8 +574,6 @@ const char kSmaaEdgePS[] =
     "    return float4(e, 0.0f, 0.0f);\n"
     "}\n";
 
-// ② 混合权重：沿边往上下（垂直边）或左右（水平边）找最近的"台阶转折"，越近权重越大。
-// 找不到转折（直边）⇒ 权重 0，直边不会被糊。
 const char kSmaaWeightPS[] =
     "struct VS_OUT { float4 pos : SV_Position; float2 tc : TEXCOORD0; };\n"
     "Texture2D<float2> edgesTex : register(t0, space0);\n"
@@ -626,7 +584,7 @@ const char kSmaaWeightPS[] =
     "    float2 texel = float2(1.0f / (float)w, 1.0f / (float)h);\n"
     "    float2 e = edgesTex.SampleLevel(smaaSampler, IN.tc, 0).rg;\n"
     "    float wx = 0.0f, wy = 0.0f;\n"
-    "    if (e.r > 0.5f) {\n"          // 本像素左侧有垂直边 → 沿 y 找台阶
+    "    if (e.r > 0.5f) {\n"
     "        int up = 0, down = 0;\n"
     "        for (int k = 1; k <= kMaxSearch; ++k) {\n"
     "            float2 n = edgesTex.SampleLevel(smaaSampler, IN.tc - float2(0.0f, texel.y * k), 0).rg;\n"
@@ -639,7 +597,7 @@ const char kSmaaWeightPS[] =
     "        int near = (up == 0) ? down : ((down == 0) ? up : min(up, down));\n"
     "        if (near > 0) wx = saturate(0.5f / (float)near);\n"
     "    }\n"
-    "    if (e.g > 0.5f) {\n"          // 本像素上方有水平边 → 沿 x 找台阶
+    "    if (e.g > 0.5f) {\n"
     "        int left = 0, right = 0;\n"
     "        for (int k = 1; k <= kMaxSearch; ++k) {\n"
     "            float2 n = edgesTex.SampleLevel(smaaSampler, IN.tc - float2(texel.x * k, 0.0f), 0).rg;\n"
@@ -655,46 +613,25 @@ const char kSmaaWeightPS[] =
     "    return float4(wx, wy, 0.0f, 1.0f);\n"
     "}\n";
 
-// ②′ 混合权重（**官方 LUT 算法**）：与上游 SMAA.hlsl 的 SMAABlendingWeightCalculationPS 同一
-// 算法与同一套常量（中等预设），只做了三处移植改动（都不改数学）：
-//   - 上游 tex2D/tex2Dlod 宏 → 本工程写法：edges 用传进来的 smaaSampler，两张 LUT 用
-//     smaaLutSampler（静态采样器 s1）；三张纹理都只写 SampleLevel(..., 0)。
-//     上游的常量缓冲 smaa_rt_metrics / subsampleIndices / smaa_area_search_texel_size 换成
-//     两个局部量 + 逐层传参：rt = float4(texelSize.xy, 1/texelSize)（对应上游 SMAA_RT_METRICS，
-//     用 edges 的 texel size 在 main 里算出）、areaTexel/searchTexel = LUT 的 1/尺寸
-//     （对应上游 SMAA_AREATEX_PIXEL_SIZE = 1/float2(160,560)、1/SMAA_SEARCHTEX_PACKED_SIZE
-//     = 1/float2(64,16)）。之所以不照抄全局量：HLSL 的全局变量是隐式 const，不能像上游那样
-//     在 ps 里赋值。SMAA 1x 的 subsampleIndices 恒 0。
-//   - 上游的提前 return（SMAASearchXLeft 等函数体内的 while 循环）改成单出口：
-//     循环体内 `if (!cond) break;` 等价于原 `while(cond)` 的退出条件，返回表达式逐字不变。
-//     这样 SM 5.1 与 SM 6.x（DXC）都能编过，不依赖 fxc 的循环推断。
-//   - 上游 r/g 与 b/a 的通道含义保持不变（r=沿 x 混、g=沿 y 混；b/a 是斜向权重，③ 本来就不用），
-//     所以第 ③ 趟的读取约定一个字都不用改。
 const char kSmaaWeightLutPS[] =
     "struct VS_OUT { float4 pos : SV_Position; float2 tc : TEXCOORD0; };\n"
     "Texture2D<float2> edgesTex : register(t0, space0);\n"
     "Texture2D<float2> areaTex  : register(t1, space0);\n"
     "Texture2D<float>  searchTex: register(t2, space0);\n"
-    "SamplerState smaaSampler    : register(s0, space0);\n"  // MIN_MAG_MIP_LINEAR + CLAMP（原样保留）
-    "SamplerState smaaLutSampler : register(s1, space0);\n"  // MIN_MAG_LINEAR_MIP_POINT + CLAMP
-    // ---- 上游 SMAA.hlsl 的非可配置常量 ----
-    "#define SMAA_THRESHOLD 0.10\n"                      // = 本工程既有 kThreshold（中等预设）
-    "#define SMAA_MAX_SEARCH_STEPS 16\n"                // 中等预设
-    "#define SMAA_MAX_SEARCH_STEPS_DIAG 8\n"            // 中等预设
-    "#define SMAA_CORNER_ROUNDING 25\n"                 // 中等预设
-    "#define SMAA_CORNER_ROUNDING_NORM 0.25\n"          // 25/100，常量折叠后避免隐式转换告警
+    "SamplerState smaaSampler    : register(s0, space0);\n"
+    "SamplerState smaaLutSampler : register(s1, space0);\n"
+    "#define SMAA_THRESHOLD 0.10\n"
+    "#define SMAA_MAX_SEARCH_STEPS 16\n"
+    "#define SMAA_MAX_SEARCH_STEPS_DIAG 8\n"
+    "#define SMAA_CORNER_ROUNDING 25\n"
+    "#define SMAA_CORNER_ROUNDING_NORM 0.25\n"
     "#define SMAA_AREATEX_MAX_DISTANCE 16\n"
     "#define SMAA_AREATEX_MAX_DISTANCE_DIAG 20\n"
     "#define SMAA_AREATEX_SUBTEX_SIZE (1.0 / 7.0)\n"
     "#define SMAA_SEARCHTEX_SIZE float2(66.0, 33.0)\n"
     "#define SMAA_SEARCHTEX_PACKED_SIZE float2(64.0, 16.0)\n"
-    // 两张 LUT 的 1/尺寸：上游写成 float2(1.0/160.0, 1.0/560.0) 与 float2(1.0/64.0, 1.0/16.0)。
-    // 它们在 main 里由 areaTex / searchTex 的 GetDimensions 算出后逐层传参，数值完全一致
-    // （HLSL 的全局变量是隐式 const，不能像上游那样在 ps 里赋值给全局，所以改成参数）。
-    // 上游的两个宏在 HLSL4/5 下就是 smaaLutSampler + SampleLevel(..., 0)。
     "#define SMAASampleLevelZero(tex, coord) tex.SampleLevel(smaaLutSampler, coord, 0)\n"
     "#define SMAASampleLevelZeroOffset(tex, coord, offset) tex.SampleLevel(smaaLutSampler, coord, 0, offset)\n"
-    // ---- 上游 Diagonal Search Functions（SMAA.hlsl :831-985）----
     "float2 SMAADecodeDiagBilinearAccess(float2 e) {\n"
     "    e.r = e.r * abs(5.0 * e.r - 5.0 * 0.75);\n"
     "    return round(e);\n"
@@ -720,7 +657,7 @@ const char kSmaaWeightLutPS[] =
     "}\n"
     "float2 SMAASearchDiag2(float2 rt, float2 texcoord, float2 dir, out float2 e) {\n"
     "    float4 coord = float4(texcoord, -1.0, 1.0);\n"
-    "    coord.x += 0.25 * rt.x;\n"  // @SearchDiag2Optimization
+    "    coord.x += 0.25 * rt.x;\n"
     "    float3 t = float3(rt.xy, 1.0);\n"
     "    for (;;) {\n"
     "        if (!(coord.z < (float)(SMAA_MAX_SEARCH_STEPS_DIAG - 1) && coord.w > 0.9)) break;\n"
@@ -734,7 +671,7 @@ const char kSmaaWeightLutPS[] =
     "float2 SMAAAreaDiag(float2 areaTexel, float2 dist, float2 e, float offset) {\n"
     "    float2 texcoord = mad(float2(SMAA_AREATEX_MAX_DISTANCE_DIAG, SMAA_AREATEX_MAX_DISTANCE_DIAG), e, dist);\n"
     "    texcoord = mad(areaTexel, texcoord, 0.5 * areaTexel);\n"
-    "    texcoord.x += 0.5;\n"  // 斜向区域在 AreaTex 的右半边
+    "    texcoord.x += 0.5;\n"
     "    texcoord.y += SMAA_AREATEX_SUBTEX_SIZE * offset;\n"
     "    return SMAASampleLevelZero(areaTex, texcoord).rg;\n"
     "}\n"
@@ -780,13 +717,12 @@ const char kSmaaWeightLutPS[] =
     "    }\n"
     "    return weights;\n"
     "}\n"
-    // ---- 上游 Horizontal/Vertical Search Functions（SMAA.hlsl :997-1103）----
     "float SMAASearchLength(float2 searchTexel, float2 e, float offset) {\n"
     "    float2 scale = SMAA_SEARCHTEX_SIZE * float2(0.5, -1.0);\n"
     "    float2 bias = SMAA_SEARCHTEX_SIZE * float2(offset, 1.0);\n"
     "    scale += float2(-1.0, 1.0);\n"
     "    bias += float2(0.5, -0.5);\n"
-    "    scale *= searchTexel;\n"  // 上游 *= 1.0/SMAA_SEARCHTEX_PACKED_SIZE
+    "    scale *= searchTexel;\n"
     "    bias *= searchTexel;\n"
     "    return SMAASampleLevelZero(searchTex, mad(scale, e, bias)).r;\n"
     "}\n"
@@ -837,7 +773,6 @@ const char kSmaaWeightLutPS[] =
     "    texcoord.y = mad(SMAA_AREATEX_SUBTEX_SIZE, offset, texcoord.y);\n"
     "    return SMAASampleLevelZero(areaTex, texcoord).rg;\n"
     "}\n"
-    // ---- 上游 Corner Detection（SMAA.hlsl :1108-1140）----
     "void SMAADetectHorizontalCornerPattern(inout float2 weights, float4 texcoord, float2 d) {\n"
     "    float2 leftRight = step(d.xy, d.yx);\n"
     "    float2 rounding = (1.0 - SMAA_CORNER_ROUNDING_NORM) * leftRight;\n"
@@ -860,7 +795,6 @@ const char kSmaaWeightLutPS[] =
     "    factor.y -= rounding.y * SMAASampleLevelZeroOffset(edgesTex, texcoord.zw, int2(-2, 1)).g;\n"
     "    weights *= saturate(factor);\n"
     "}\n"
-    // ---- 上游 Blending Weight Calculation（SMAA.hlsl :1145-1247），子采样索引恒 0（SMAA 1x）----
     "float4 main(VS_OUT IN) : SV_Target {\n"
     "    uint w, h; edgesTex.GetDimensions(w, h);\n"
     "    float2 texelSize = float2(1.0 / (float)w, 1.0 / (float)h);\n"
@@ -897,7 +831,7 @@ const char kSmaaWeightLutPS[] =
     "            coords.y = IN.tc.y;\n"
     "            SMAADetectHorizontalCornerPattern(weights.rg, coords.xyzy, d);\n"
     "        } else {\n"
-    "            e.r = 0.0;\n"  // 命中斜向 ⇒ 跳过竖直方向的搜索
+    "            e.r = 0.0;\n"
     "        }\n"
     "    }\n"
     "    [branch]\n"
@@ -920,8 +854,6 @@ const char kSmaaWeightLutPS[] =
     "    return weights;\n"
     "}\n";
 
-// ③ 邻域混合：取四邻权重里最大的那个，朝该方向做半像素偏移采样后按权重插值。
-// 源色用同一个线性采样器 ⇒ 源分辨率 < 窗口时这一步同时完成升采样。
 const char kSmaaBlendPS[] =
     "struct VS_OUT { float4 pos : SV_Position; float2 tc : TEXCOORD0; };\n"
     "Texture2D<float4> colorTex : register(t0, space0);\n"
@@ -946,10 +878,8 @@ const char kSmaaBlendPS[] =
     "    return float4(lerp(center, blended, saturate(best)), 1.0f);\n"
     "}\n";
 
-// SMAA 中间纹理当前是否停在 PIXEL_SHADER_RESOURCE（刚创建时是 COMMON）。
 bool gSmaaTargetsInSrvState = false;
 
-// 建/取中间纹理（尺寸变化时重建）。
 mcdr::Result<void> smaaEnsureTargets(UINT64 w, UINT64 h) {
     if (deviceContext().smaaEdges && deviceContext().smaaWidth == w && deviceContext().smaaHeight == h) {
         return {};
@@ -957,7 +887,6 @@ mcdr::Result<void> smaaEnsureTargets(UINT64 w, UINT64 h) {
     if (!deviceContext().smaaRtvHeap) {
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        // P104b：edges / weights / worldResult（就地 SMAA 的第三趟输出）三张。
         hd.NumDescriptors = 3;
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
         HRESULT hr = deviceContext().device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&deviceContext().smaaRtvHeap));
@@ -1008,25 +937,8 @@ mcdr::Result<void> smaaEnsureTargets(UINT64 w, UINT64 h) {
     return {};
 }
 
-// ---------------------------------------------------------------------------
-// P104：官方 LUT（AreaTex 160x560 RG8 / SearchTex 64x16 R8）
-// ---------------------------------------------------------------------------
-// 数据来自 include\mcdr_smaa_luts.h（定义在 src\advanced\smaa_luts.cpp，字节级等于上游
-// Textures\AreaTexDX10.dds / SearchTex.dds，见该头文件里的来源与 SHA-1）。
-//
-// 只需 **一次** 上传，所以走 createCommandList + 队列 fence 的一次性提交（与
-// dbgReadbackTexturePixels 同一手法），而不是挂在每帧的 CommandContext 上：
-// 初始化发生在 applySmaaToTexture 里「世界帧尚未开始录制」的时刻（Java 侧在画世界之前
-// 就调 setAntiAliasing + 绑定世界目标），且提交后立刻 deviceWaitIdle，GPU 侧资源一定
-// 已经落地，后续每帧只读。
-//
-// 失败语义：**任何一步失败都只返回错误，绝不让 SMAA 变黑/崩溃** —— 调用方
-// （smaaEnsureLuts 的调用点，见 applySmaaToTexture）会把权重趟退回既有的解析式
-// kSmaaWeightPS 并 WARN 一行。
 constexpr D3D12_RESOURCE_STATES kSmaaLutReadyState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 
-// 建一张只读 LUT 纹理并把它 copy 到 DEFAULT heap。srcRowBytes = 每行真实字节数
-// （2 或 1），行距按 D3D12_TEXTURE_DATA_PITCH_ALIGNMENT 向上取整。
 mcdr::Result<void> smaaCreateLutTexture(const unsigned char* data, UINT width, UINT height, UINT srcRowBytes,
                                         DXGI_FORMAT format, ComPtr<ID3D12Resource>& out) {
     if (data == nullptr || width == 0 || height == 0 || srcRowBytes == 0) {
@@ -1126,7 +1038,6 @@ mcdr::Result<void> smaaCreateLutTexture(const unsigned char* data, UINT width, U
     }
     ID3D12CommandList* lists[] = {list.Get()};
     deviceContext().queue->ExecuteCommandLists(1, lists);
-    // 等 GPU 真正写完再返回：upload 与 list 都是局部对象，离开作用域即释放。
     if (auto waited = deviceWaitIdle(); !waited) {
         return mcdr::err("smaaCreateLutTexture", "deviceWaitIdle: " + errorMessage(waited.error()));
     }
@@ -1158,8 +1069,6 @@ mcdr::Result<void> smaaEnsureLuts() {
     return {};
 }
 
-// P104b：就地路径的第三趟输出（与**源**同尺寸同格式），尺寸或格式变化时重建。
-// 每帧用完都回 COMMON，所以本资源的稳定态就是 COMMON（与 transitionTo 的初始锚点一致）。
 mcdr::Result<void> smaaEnsureWorldResult(const D3D12_RESOURCE_DESC& srcDesc) {
     if (!deviceContext().smaaRtvHeap) {
         return mcdr::err("smaaEnsureWorldResult", "RTV heap not created (smaaEnsureTargets must run first)");
@@ -1169,9 +1078,9 @@ mcdr::Result<void> smaaEnsureWorldResult(const D3D12_RESOURCE_DESC& srcDesc) {
         return {};
     }
 
-    D3D12_RESOURCE_DESC desc = srcDesc;  // 宽高 / mip / array / 格式全部对齐，CopyResource 才合法
+    D3D12_RESOURCE_DESC desc = srcDesc;
     desc.Alignment = 0;
-    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;  // 只要 RTV；COPY_SOURCE 无需 flag
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     desc.SampleDesc.Count = 1;
     desc.SampleDesc.Quality = 0;
 
@@ -1193,7 +1102,6 @@ mcdr::Result<void> smaaEnsureWorldResult(const D3D12_RESOURCE_DESC& srcDesc) {
     return {};
 }
 
-// 编译一个 SMAA / TAA 像素着色器：硬要求 SM 6.9 + DXC，没有 5.1(DXBC) 兜底（2026-10-25）。
 mcdr::Result<void> smaaCompilePs(const char* src, const char* debugName, const std::string& smProfile,
                                  std::vector<uint8_t>& dxilOut, const void*& code, SIZE_T& size) {
     code = nullptr;
@@ -1211,7 +1119,6 @@ mcdr::Result<void> smaaCompilePs(const char* src, const char* debugName, const s
     return {};
 }
 
-// 用 SMAA 的根签名 + 给定 PS 建 PSO（输入布局/混合/光栅状态与 blit 完全一致）。
 mcdr::Result<ComPtr<ID3D12PipelineState>> smaaCreatePso(const ComPtr<ID3D12RootSignature>& rootSig,
                                                        const void* vsCode, SIZE_T vsCodeSize,
                                                        const void* psCode, SIZE_T psCodeSize,
@@ -1284,43 +1191,22 @@ mcdr::Result<ComPtr<ID3D12PipelineState>> smaaCreatePso(const ComPtr<ID3D12RootS
     ComPtr<ID3D12PipelineState> pso;
     HRESULT hr = deviceContext().device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&pso));
     if (FAILED(hr)) {
-        // P104 fix：E_INVALIDARG 这类失败光看 HRESULT 无法定位。调试层开着时 InfoQueue 里会有
-        // 一条明确指出「着色器用到的某个寄存器没被根签名覆盖」之类的消息，dump 出来便于下一次定位。
         dumpDeviceMessages();
         return mcdr::err("smaaCreatePso", "CreateGraphicsPipelineState hr=0x" + formatBackendResult(hr));
     }
     return pso;
 }
 
-// 懒初始化 SMAA 的三条管线（rootSig 一张，PSO 三条）。
 mcdr::Result<void> smaaEnsurePipelines(DXGI_FORMAT rtFormat) {
     if (deviceContext().smaaPipelinesReady && deviceContext().smaaBlendFormat == rtFormat) {
         return {};
     }
 
-    // 三张 SRV 表：t0 / t1 / t2，各占一个根参数（0 / 1 / 2）。
-    //
-    // P104 fix（E_INVALIDARG）：**必须是 3 个**，这是本次运行期回归的根因。
-    // 权重趟的 kSmaaWeightLutPS 声明了三张 SRV（dxc 反射：
-    // `edgesTex t0 / areaTex t1 / searchTex t2`，另加 `smaaSampler s0 / smaaLutSampler s1`），
-    // 而原实现只序列化了 t0/t1 两个描述符表。D3D12 要求 PSO 里着色器用到的**每一个**
-    // 寄存器（t/s/b/u）都被根签名覆盖，缺 t2 ⇒ 该 PSO 的着色器/根签名组合非法 ⇒
-    // CreateGraphicsPipelineState 返回 0x80070057（E_INVALIDARG）。
-    // 表现就是 smaaEnsurePipelines 里**第一条** PSO（edges，用的是同一张根签名）创建失败、
-    // `P104: SMAA pipelines ready …` 永远不打印、SMAA 被一次性关掉 —— 与实机日志一致。
-    //
-    // 槽位对应表（= 反射实测值）：
-    //   ① 边检测 kSmaaEdgePS      : t0=srcTex              s0=smaaSampler
-    //   ② 解析权重 kSmaaWeightPS  : t0=edgesTex            s0=smaaSampler
-    //   ②′ LUT 权重 kSmaaWeightLutPS: t0=edgesTex t1=areaTex t2=searchTex  s0=smaaSampler s1=smaaLutSampler
-    //   ③ 邻域混合 kSmaaBlendPS   : t0=colorTex t1=weightsTex s0=smaaSampler
-    // 只有②′用到 t2；① ② ③ 不用的表保持未绑定（与本次改动前 t1 在 ① ② 未绑定的既有行为一致，
-    // 未绑定的根参数在 D3D12 里合法，只是不能是「着色器用了但根签名没有」）。
     D3D12_DESCRIPTOR_RANGE ranges[3] = {};
     for (UINT i = 0; i < 3; ++i) {
         ranges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         ranges[i].NumDescriptors = 1;
-        ranges[i].BaseShaderRegister = i;  // t0 = 源色 / t1 = 辅助纹理 / t2 = SearchTex
+        ranges[i].BaseShaderRegister = i;
         ranges[i].RegisterSpace = 0;
         ranges[i].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
     }
@@ -1347,9 +1233,6 @@ mcdr::Result<void> smaaEnsurePipelines(DXGI_FORMAT rtFormat) {
     staticSam[0].RegisterSpace = 0;
     staticSam[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-    // P104 LUT 采样器（s1）：上游 SMAA.hlsl 的 LinearSampler 就是
-    // MIN_MAG_LINEAR_MIP_POINT + Clamp —— AreaTex 按 texel 中心采样、SearchTex 查表，
-    // 只有 mip 级别的插值被关掉。改成纯 LINEAR 会破坏 SearchTex 的查表结果。
     staticSam[1].Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
     staticSam[1].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     staticSam[1].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -1383,7 +1266,6 @@ mcdr::Result<void> smaaEnsurePipelines(DXGI_FORMAT rtFormat) {
         return mcdr::err("smaaEnsurePipelines", "CreateRootSignature hr=0x" + formatBackendResult(hr));
     }
 
-    // VS 与 blit 同一份 HLSL（全屏四边形 + 透传 texcoord）。硬要求 SM 6.9 + DXC，无 5.1 兜底。
     const std::string smProfile = graphicsShaderModelProfile();
     if (smProfile.empty()) {
         return mcdr::err("smaaEnsurePipelines", "smaaEnsurePipelines: " + sm69RequirementText());
@@ -1397,7 +1279,6 @@ mcdr::Result<void> smaaEnsurePipelines(DXGI_FORMAT rtFormat) {
     const void* vsCode = vsDxil.data();
     SIZE_T vsCodeSize = vsDxil.size();
 
-    // 三个 PS：DXIL 缓冲必须活到 PSO 建完（不再有 ID3DBlob 那条路）。
     std::vector<uint8_t> edgeDxil, weightDxil, blendDxil, weightLutDxil;
     const void* edgeCode = nullptr;
     const void* weightCode = nullptr;
@@ -1411,7 +1292,6 @@ mcdr::Result<void> smaaEnsurePipelines(DXGI_FORMAT rtFormat) {
         !r) {
         return mcdr::err("smaaEnsurePipelines", errorMessage(r.error()));
     }
-    // P104：官方 LUT 版权重趟。这是本条路径的主算法；下面的解析版只是 LUT 初始化失败时的回退。
     if (auto r = smaaCompilePs(kSmaaWeightLutPS, "smaa_weight_lut_ps", smProfile, weightLutDxil, weightLutCode,
                                weightLutSize);
         !r) {
@@ -1440,13 +1320,10 @@ mcdr::Result<void> smaaEnsurePipelines(DXGI_FORMAT rtFormat) {
     deviceContext().smaaPipelinesReady = true;
     dbgLogInfo("SMAA pipelines ready (blend RTV fmt=%d, SM=%s)", static_cast<int>(rtFormat),
                smProfile.c_str());
-    // 两条权重管线只有一条会被用到，但两条都建好 ⇒ 任何时候都不需要重建、不需要重试。
-    // 「官方 LUT」那行日志**不能**放在这里：smaaEnsurePipelines 先于 smaaEnsureLuts 执行，
-    // 此刻 smaaLutsReady 一定是 false。它现在打在 applySmaaToTexture 选路之后。
     return {};
 }
 
-}  // namespace
+}
 
 const char* antiAliasingName(int mode) {
     switch (mode) {
@@ -1473,14 +1350,8 @@ int setAntiAliasing(int mode) {
         dbgLogError("invalid anti-aliasing mode %d (valid: 0=OFF 1=SMAA 2=TAA 3=DLAA)", mode);
         return -1;
     }
-    // P77/P152：TAA（2）不再降级，且从 P152 起它的 resolve 也在 native 侧
-    // （applyTaaToTexture：历史纹理乒乓 + jitter + 管线都由本模块持有），JVM 只送参数。
-    // `applySmaaToTexture` 的闸门是 `aaMode != 1`，所以 TAA 模式下 SMAA 自动让路。
-    // DLAA（3）仍然由 DLSS 特性实现：JVM 侧会把它映射成 OFF 再传下来，真收到 3 说明另有
-    // 调用方，同样按"无 native 后处理"处理，不该再用"未实现"把用户的选项踢回 OFF。
     const int prev = deviceContext().aaMode;
     deviceContext().aaMode = mode;
-    // 换模式时把两条路径的"一次性失败"闸门都复位：用户可以靠改设置再试一次。
     if (mode != prev) {
         gAntiAliasingLastFailure.clear();
         deviceContext().smaaDisabled = false;
@@ -1490,7 +1361,6 @@ int setAntiAliasing(int mode) {
         deviceContext().taaUnavailableLogged = false;
         deviceContext().taaSharpenFallbackWarned = false;
         deviceContext().taaAppliedFrames = 0;
-        // 历史内容属于上一种模式下的画面，切回来时不可信（下一帧以 reset=1 开始）。
         deviceContext().taaHistoryValid = false;
     }
     if (mode != prev) {
@@ -1499,17 +1369,10 @@ int setAntiAliasing(int mode) {
                    : mode == 2 ? "TAA, resolved natively after the world layer (RGBA16F history)"
                                : "no post-processing; plain blit");
     }
-    // 契约（JVM 的 `D3D12AntiAliasing.push` 用 `status == pushed` 判成功）：成功时返回**生效的
-    // 模式本身**，0 是合法成功值（OFF）。旧实现恒返回 1，于是 OFF 被误报成"返回值异常"。
     return mode;
 }
 
-
 int applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
-    // P104：只有 1(SMAA) 才走三趟；0/2/3 一律跳过（语义与 P104 时一致）。
-    // P108（用户 m10920）：DLSS 已从抗锯齿枚举里拆出去，**不再**在这里判 DLSS —— SMAA 与
-    // DLSS 现在是独立开关，两者都开时这一趟先跑（在低分辨率世界层上），再由
-    // applyDlssToTexture 把它升采样到窗口尺寸。
     if (deviceContext().aaMode != 1) {
         return 0;
     }
@@ -1546,8 +1409,6 @@ int applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
         srcFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
     }
 
-    // 任何一步失败都彻底关掉 SMAA，避免每帧重试刷日志 /
-    // 把中间纹理留在与预期不符的状态上继续用。
     auto fail = [](const char* where, const std::string& what) {
         deviceContext().smaaDisabled = true;
         gAntiAliasingLastFailure = std::string("SMAA failed in ") + where + ": " + firstLine(what);
@@ -1558,10 +1419,6 @@ int applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
         deviceContext().smaaUnavailableLogged = true;
         return fail("smaaEnsurePipelines", r.error().message);
     }
-    // 官方 LUT：两条权重管线都已建好，这里只是初始化两张 LUT（一次，幂等）并选一条。
-    // 失败**不是**致命错误：退回解析式权重趟（kSmaaWeightPS），只 WARN 一行、只报一次。
-    // 注意用独立的 smaaLutFallbackWarned，别占用 smaaUnavailableLogged（那是
-    // 「目标不是单采样 2D 纹理」的一次性提示，两者是不同的语义）。
     if (!deviceContext().smaaLutsReady) {
         auto lut = smaaEnsureLuts();
         if (!lut && !deviceContext().smaaLutFallbackWarned) {
@@ -1577,11 +1434,6 @@ int applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
             dbgLogWarn("SMAA falling back to the analytic blending-weight shader (official LUTs unavailable)");
         }
     } else if (deviceContext().smaaAppliedFrames == 0 && !deviceContext().smaaLutReadyLogged) {
-        // P104 fix：这一行原来挂在 smaaEnsurePipelines 里的 `if (deviceContext().smaaLutsReady)` 分支上，
-        // 但**调用顺序是 pipelines → LUTs**，那一刻 smaaLutsReady 必然还是 false ⇒ 永远打不出来。
-        // 挪到这里（LUT 刚初始化完）才反映真实状态。
-        // 必须用一次性闸门：applySmaaToTexture **每帧**都会走到这里，没有闸门就会逐帧刷屏
-        // （实测 18:09:53–18:10:08 刷了 15 秒）。smaaAppliedFrames==0 表示「首帧之前」。
         deviceContext().smaaLutReadyLogged = true;
         dbgLogInfo("SMAA using the official AreaTex/SearchTex LUTs (160x560 RG8, 64x16 R8)");
     }
@@ -1610,7 +1462,6 @@ int applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
     const D3D12_RESOURCE_STATES targetsPrev =
         gSmaaTargetsInSrvState ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COMMON;
 
-    // ① 边检测：source → edges
     transitionTextureTo(ctx, tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     transitionTo(ctx, deviceContext().smaaEdges.Get(), targetsPrev, D3D12_RESOURCE_STATE_RENDER_TARGET);
     cmd->OMSetRenderTargets(1, &deviceContext().smaaEdgesRtv, FALSE, nullptr);
@@ -1622,7 +1473,6 @@ int applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
     }
     cmd->DrawIndexedInstanced(6, 1, 0, 0, 0);
 
-    // ② 混合权重：edges (+ AreaTex/SearchTex) → weights
     transitionTo(ctx, deviceContext().smaaEdges.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     transitionTo(ctx, deviceContext().smaaWeights.Get(), targetsPrev, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -1639,7 +1489,6 @@ int applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
     if (!weightBindings) return fail("pass2.bind", weightBindings.error().message);
     cmd->DrawIndexedInstanced(6, 1, 0, 0, 0);
 
-    // ③ 邻域混合：source + weights → scratch（**源纹理本身正在被采样，不能同时当 RTV**）
     transitionTo(ctx, deviceContext().smaaWeights.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     gSmaaTargetsInSrvState = true;
@@ -1656,9 +1505,6 @@ int applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
     }
     cmd->DrawIndexedInstanced(6, 1, 0, 0, 0);
 
-    // ④ 拷回并交还：scratch(COPY_SOURCE) → 源纹理(COPY_DEST) → 源纹理回 RENDER_TARGET，
-    // 这样紧跟着的 GUI render pass 可以照常把主渲染目标当附件用；scratch 回 COMMON
-    // （它的稳定态就是 COMMON，与 transitionTo 的初始锚点一致）。
     transitionTo(ctx, deviceContext().smaaWorldResult.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                  D3D12_RESOURCE_STATE_COPY_SOURCE);
     const auto targetDescription = tex->resource->GetDesc();
@@ -1681,38 +1527,14 @@ int applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
     return 1;
 }
 
-// ---------------------------------------------------------------------------
-// P152：TAA（时域抗锯齿）—— 历史与管线都在 native 侧
-// ---------------------------------------------------------------------------
-// 与 SMAA 的区别不只是"又一个后处理"，而是**状态归属**：SMAA 是单帧形态学，三趟只借自身的
-// 中间纹理；TAA 需要跨帧状态（历史纹理乒乓、jitter、历史代），此前全部由 JVM 的 D3D12TAA
-// 持有，并且每帧要录一趟 beginRenderPass + draw + 回填 blit。这里把整条链路搬进 native：
-// JVM 每帧只调一次 applyTaaToTexture，不再跨语言搬运 GPU 资源句柄。
-//
-// 两趟：
-//   ① resolve  scene(t1) + history[read](t2) + motion(t3) → history[write]（RGBA16F）
-//   ② 回填    history[write] → 主目标（锐化量 > 0 走 5-tap unsharp，否则纯采样 blit）
-// 历史**不参与锐化**：把锐化结果写回历史，会随每帧的 lerp 递归叠加，几十帧后边缘出现振铃。
-// 历史也不是 RGBA8：混合权重是 1/16，8 位历史会把每帧 1/16 的增量就地量化掉，静止画面会
-// 出现缓慢漂移的时间性带状。
 namespace {
 
-// 历史纹理格式：16 位浮点。8 位历史会把每帧 1/16 的混合增量就地量化掉。
 constexpr DXGI_FORMAT kTaaHistoryFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
-// 参数块：10 个有效 float + 2 个对齐 pad。走 32-bit 根常量，不需要 CBV 与上传缓冲
-// （JVM 侧当年用 CBV，是因为它只能走通用的 pushDescriptors 路径）。
 constexpr UINT kTaaParam32BitCount = 12;
 
-// 上一帧结束时两张历史纹理是否都停在 PIXEL_SHADER_RESOURCE。首帧（刚创建）与
-// taaEnsureHistory 重建之后都是 COMMON，所以需要这个跨帧标记 —— 与 SMAA 的
-// gSmaaTargetsInSrvState 同一套理由（D3D12 不允许在同一个命令列表里显式回切 COMMON）。
 bool gTaaHistoryInSrvState = false;
 
-// resolve 的像素着色器：P152 起这是**唯一**实现（JVM 侧的 D3D12TAA 已删掉历史/管线/HLSL，
-// 只负责算出每帧参数再调本函数）。
-// 全部用 Load + 手算双线性 —— 静态采样器是点采样 + 环绕，点采样会丢掉亚像素精度，环绕取样
-// 在 UV 出界时会从屏幕另一侧拖内容进来，这两件事都必须变成显式行为。
 static const char kTaaPS[] =
     "struct VS_OUT { float4 pos : SV_Position; float2 tc : TEXCOORD0; };\n"
     "cbuffer Params : register(b0, space0) {\n"
@@ -1808,10 +1630,6 @@ static const char kTaaPS[] =
     "    return float4(resolved, currentA);\n"
     "}\n";
 
-// 建 TAA 的根签名 + resolve PSO（懒初始化，幂等）。
-// 根参数：0 = b0 的 12 个 32-bit 常量；1..3 = t1/t2/t3 各一张 SRV 表。三张表分开建，
-// 而不是塞进一张 NumDescriptors=3 的表，
-// 连续三张分开的表正好与它兼容（也就不需要再写一套堆槽位计算）。
 mcdr::Result<void> taaEnsurePipelines() {
     if (deviceContext().taaRootSig && deviceContext().taaPso) {
         return {};
@@ -1821,7 +1639,7 @@ mcdr::Result<void> taaEnsurePipelines() {
     for (UINT i = 0; i < 3; ++i) {
         ranges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         ranges[i].NumDescriptors = 1;
-        ranges[i].BaseShaderRegister = i + 1;  // t1 = scene / t2 = history / t3 = motion
+        ranges[i].BaseShaderRegister = i + 1;
         ranges[i].RegisterSpace = 0;
         ranges[i].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
     }
@@ -1857,8 +1675,6 @@ mcdr::Result<void> taaEnsurePipelines() {
         return mcdr::err("taaEnsurePipelines", "CreateRootSignature hr=0x" + formatBackendResult(hr));
     }
 
-    // VS 与 blit / SMAA 同一份全屏四边形 HLSL（POSITION + TEXCOORD，配合 blit 的顶点缓冲）。
-    // 硬要求 SM 6.9 + DXC，无 5.1(DXBC) 兜底。
     const std::string smProfile = graphicsShaderModelProfile();
     if (smProfile.empty()) {
         return mcdr::err("taaEnsurePipelines", "taaEnsurePipelines: " + sm69RequirementText());
@@ -1872,7 +1688,6 @@ mcdr::Result<void> taaEnsurePipelines() {
     const void* vsCode = vsDxil.data();
     SIZE_T vsCodeSize = vsDxil.size();
 
-    // PS：DXIL 缓冲必须活到 PSO 建完（不再有 ID3DBlob 那条路）。
     std::vector<uint8_t> psDxil;
     const void* psCode = nullptr;
     SIZE_T psCodeSize = 0;
@@ -1890,7 +1705,6 @@ mcdr::Result<void> taaEnsurePipelines() {
     return {};
 }
 
-// 懒创建两张 RGBA16F 历史纹理 + 2 槽 RTV 堆；尺寸变化时整组重建。
 mcdr::Result<void> taaEnsureHistory(UINT64 w, UINT64 h) {
     if (deviceContext().taaHistory[0] && deviceContext().taaHistory[1] && deviceContext().taaWidth == w && deviceContext().taaHeight == h) {
         return {};
@@ -1950,7 +1764,7 @@ mcdr::Result<void> taaEnsureHistory(UINT64 w, UINT64 h) {
     return {};
 }
 
-}  // namespace
+}
 int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion, float jitterX,
                       float jitterY, float prevJitterX, float prevJitterY, float blend, int reset,
                       float sharpenAmount) {
@@ -1967,9 +1781,6 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
         return reject("missing command context, scene, or motion texture");
     }
 
-    // 运动矢量按 TextureView 传进来（D3D12Velocity 的 view）：解包到底层纹理。
-    // 注意 view 对象自身的 resource 是空的（它只是底层纹理的一个视图），所以这里不能像
-    // scene 那样要求 !motion->resource —— 早期版本这么写过，结果 TAA 每帧静默返回 0。
     Dx12Object* motionTex = motion;
     if (motion->kind == Dx12Object::Kind::TextureView) {
         if (motion->sourceTexture == nullptr || !motion->sourceTexture->resource) {
@@ -2003,8 +1814,6 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
         }
         return reject("scene and motion dimensions do not match");
     }
-    // 回填走 blit / sharpen 两条现成管线，它们的 RTVFormats[0] 都写死 R8G8B8A8_UNORM ⇒ 场景
-    // 不是这个格式就没有可用的目标管线。UNKNOWN 按 SMAA 的既有约定视为 RGBA8。
     DXGI_FORMAT sceneFormat = sceneDesc.Format;
     if (sceneFormat == DXGI_FORMAT_UNKNOWN) {
         sceneFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -2018,7 +1827,6 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
         return reject("scene target is not RGBA8");
     }
 
-    // 任何一步失败都彻底关掉 TAA：避免每帧重试刷日志，也避免把历史留在与预期不符的状态上。
     auto fail = [](const char* where, const std::string& what) {
         deviceContext().taaDisabled = true;
         gAntiAliasingLastFailure = std::string("TAA failed in ") + where + ": " + firstLine(what);
@@ -2041,7 +1849,6 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
         return fail("getBlitPipeline", "blit pipeline unavailable");
     }
 
-    // 尺寸/格式变化后历史不可信：本帧必须以 reset 开始（JVM 侧 reset() 时同样会置 false）。
     const bool resetNow = reset != 0 || !deviceContext().taaHistoryValid;
     const int readIndex = deviceContext().taaReadIndex;
     const int writeIndex = deviceContext().taaWriteIndex;
@@ -2049,13 +1856,9 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
     const D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<FLOAT>(w), static_cast<FLOAT>(h), 0.0f, 1.0f};
     const D3D12_RECT sc{0, 0, static_cast<LONG>(w), static_cast<LONG>(h)};
 
-    // 历史在上一帧结束时**两张都停在 PIXEL_SHADER_RESOURCE**（见本节末尾的回切），所以本帧
-    // 的初始锚点是它；首帧（刚创建）是 COMMON。不用 transitionTo 的 COMMON 回落语义：
-    // D3D12 禁止在同一个命令列表里把已提升的资源显式回切 COMMON。
     const D3D12_RESOURCE_STATES historyPrev =
         gTaaHistoryInSrvState ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COMMON;
 
-    // ① resolve：scene + history[read] + motion → history[write]
     transitionTextureTo(ctx, scene, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     transitionTo(ctx, deviceContext().taaHistory[readIndex].Get(), historyPrev,
                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -2071,7 +1874,6 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
     cmd->RSSetViewports(1, &vp);
     cmd->RSSetScissorRects(1, &sc);
 
-    // b0 = {w, h, 1/w, 1/h, blend, reset, jitter, prevJitter, pad}（顺序与 kTaaPS 的 cbuffer 一致）
     const float params[kTaaParam32BitCount] = {static_cast<float>(w),
                                                static_cast<float>(h),
                                                w == 0 ? 0.0f : 1.0f / static_cast<float>(w),
@@ -2094,9 +1896,6 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
     }
     cmd->DrawIndexedInstanced(6, 1, 0, 0, 0);
 
-    // ② 回填：history[write] → 主目标。不能 CopyResource —— 历史是 16F、主目标是 8 位。
-    // 栈上临时包一层 Dx12Object，好复用 blitTextToTexture / sharpenTextureToTexture
-    // （它们按 ID3D12Resource* 追踪状态，所以这个包装不需要进 gCtx）。
     Dx12Object historyObj{};
     historyObj.kind = Dx12Object::Kind::Texture;
     historyObj.resource = deviceContext().taaHistory[writeIndex];
@@ -2117,13 +1916,10 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
         }
     }
 
-    // 历史回切到 PIXEL_SHADER_RESOURCE：两张都停在这里，下一帧的锚点就是常量
-    // （blit/sharpen 收尾会把源放回 RENDER_TARGET，这一步必须显式做）。
     transitionTo(ctx, deviceContext().taaHistory[writeIndex].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     gTaaHistoryInSrvState = true;
 
-    // 交换乒乓：本帧的写缓冲就是下一帧的历史。
     deviceContext().taaReadIndex = writeIndex;
     deviceContext().taaWriteIndex = readIndex;
     deviceContext().taaHistoryValid = true;
@@ -2136,6 +1932,5 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
     gAntiAliasingLastFailure.clear();
     return 1;
 }
-// ---------------------------------------------------------------------------
 
 }

@@ -1,4 +1,3 @@
-// P117：光追可见性分层的跨 TU 状态（纯 C，无 D3D12 依赖）。
 #include "mcdr_rt_state.h"
 
 #include <atomic>
@@ -8,7 +7,7 @@ std::atomic<int32_t> gRtMode{0};
 std::atomic<int32_t> gGbufferReady{0};
 std::atomic<int32_t> gGbufferWidth{0};
 std::atomic<int32_t> gGbufferHeight{0};
-}  // namespace
+}
 
 extern "C" void mcdr_rt_state_set_mode(int32_t mode) {
     gRtMode.store(mode, std::memory_order_relaxed);

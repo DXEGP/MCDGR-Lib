@@ -517,7 +517,7 @@ int reject(const char* reason) {
     return -1;
 }
 
-}  // namespace
+}
 
 struct DeclaredPassToken {
     FrameState* state = nullptr;
@@ -1775,4 +1775,4 @@ void reset(void* context) {
     postFailure.clear();
 }
 
-}  // namespace d3d12_mc::vanilla
+}

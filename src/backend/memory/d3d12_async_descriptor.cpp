@@ -18,7 +18,6 @@ mcdr::Result<void> PartitionedDescriptorAllocator::init(ID3D12Device* device, ID
                          "workerCount out of range (1.." + std::to_string(kMaxAsyncWorkers) +
                              "): " + std::to_string(workerCount));
 
-    // 帧槽与同步路径的 ring 段一一对应（均为 fenceValue % kAsyncFrameSlots）。
     const UINT sectionSize = heapSize / kAsyncFrameSlots;
     if (sectionSize == 0 || reservedPerSection >= sectionSize)
         return mcdr::err("PartitionedDescriptorAllocator::init",
@@ -26,7 +25,6 @@ mcdr::Result<void> PartitionedDescriptorAllocator::init(ID3D12Device* device, ID
                              " reservedPerSection=" + std::to_string(reservedPerSection) + ")");
 
     const UINT slotsPerRegion = (sectionSize - reservedPerSection) / workerCount;
-    // 堆太小，无法给每个 (frameSlot,worker) 划分区域
     if (slotsPerRegion == 0)
         return mcdr::err("PartitionedDescriptorAllocator::init",
                          "slotsPerRegion == 0 (descriptor heap too small for " + std::to_string(workerCount) +
@@ -60,7 +58,7 @@ UINT PartitionedDescriptorAllocator::allocate(UINT frameSlot, UINT worker, UINT 
     UINT cur = cursor.load(std::memory_order_relaxed);
     for (;;) {
         if (cur > m_slotsPerRegion || count > m_slotsPerRegion - cur) {
-            return UINT_MAX;  // 区域耗尽
+            return UINT_MAX;
         }
         if (cursor.compare_exchange_weak(cur, cur + count, std::memory_order_acq_rel,
                                          std::memory_order_relaxed)) {
@@ -98,9 +96,6 @@ bool PartitionedDescriptorAllocator::writeCBV(UINT slot, ID3D12Resource* buffer,
 
     D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
     cbv.BufferLocation = buffer->GetGPUVirtualAddress() + offset;
-    // D3D12_CONSTANT_BUFFER_VIEW_DESC.BufferLocation 必须 256 字节对齐。基址天然对齐，
-    // 所以能违反它的只有调用方给的 offset —— 宁可写不出描述符（调用方拿 0 去报错），
-    // 也不要交出一张会让 shader 读错位的视图。
     if (cbv.BufferLocation % 256ULL != 0) return false;
     if (size > UINT64_MAX - 255ULL) return false;
     UINT64 aligned = (size + 255) & ~255ULL;
@@ -118,4 +113,4 @@ bool PartitionedDescriptorAllocator::writeDescriptor(UINT slot, D3D12_CPU_DESCRI
     return true;
 }
 
-}  // namespace d3d12_mc
+}

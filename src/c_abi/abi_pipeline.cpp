@@ -1,8 +1,3 @@
-// abi_pipeline.cpp — graphics pipeline creation/destruction
-//
-// Group: graphics pipelines (originally abi_bridge_p4.cpp).
-// 合并自：abi_bridge_p4.cpp
-//
 module;
 
 #include "_d3d12_module_prelude.h"
@@ -10,7 +5,7 @@ module;
 
 module mcdr.abi.common;
 
-#include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
+#include "mcdr_abi.h"
 
 import mcdr.d3d12.device;
 import mcdr.d3d12.mesh;
@@ -22,34 +17,8 @@ import mcdr.render.oit;
 
 using namespace d3d12_mc;
 
-// ===========================================================================
-// 本文件是合并后的 C ABI 适配单元，按**功能**命名（不再按移植阶段 pX）。
-// 共享前言（prelude / mcdr_abi.h / 各模块 import）统一放在文件顶部，下面每一段
-// 保留原单元的文件头注释与代码本体，内容逐字节未改。
-// ===========================================================================
-
-// ---------------------------------------------------------------------------
-// 来源单元：abi_bridge_p4.cpp
-// ---------------------------------------------------------------------------
-
-// abi_pipeline.cpp — graphics pipeline creation/destruction.（合并自 abi_bridge_p4.cpp）
-//
-// Replaces jni_bridge_p4.cpp (172 lines). That file's entire body was a
-// hand-written little-endian unpacker for the packed descriptor ByteBuffer the
-// Java side built with putInt/putU8. Because the blob carried no field
-// identifiers, every offset was a magic number on both sides and a single
-// mis-ordered field silently produced a wrong pipeline; the semantic names even
-// had to travel in a separate trailing section and were re-associated with
-// their input elements by array index.
-//
-// Here the descriptor is a real struct (mcdr_pipeline_desc) whose layout the
-// Java side mirrors with MemoryLayout.structLayout and whose offsets are
-// verified at load time by mcdrABILayout(). There is nothing left to unpack.
-
 namespace {
 
-// Bounds the old unpacker enforced inline. Kept as named constants because they
-// are the contract with createGraphicsPipeline(), not incidental limits.
 constexpr int32_t kMaxColorTargets = 8;
 constexpr int32_t kMaxInputElements = 64;
 constexpr int32_t kMaxPipelineBindings = 64;
@@ -58,7 +27,7 @@ constexpr const char* kCreate = "mcdr_dx12CreateGraphicsPipeline";
 
 using PipelinePtr = d3d12_mc::Dx12Pipeline;
 
-}  // namespace
+}
 
 extern "C" {
 
@@ -94,10 +63,6 @@ static PipelinePtr* createGraphicsPipelineErased(const mcdr_pipeline_desc* desc,
     }
     d.rasterMotion = (desc->pipelineFlags & 1u) != 0u;
 
-    // --- shader bytecode ---------------------------------------------------
-    // The old path went through NewDirectByteBuffer + GetDirectBufferAddress,
-    // which rejected heap buffers with a bare stderr line. A null/length
-    // mismatch is now an explicit, reportable error.
     if (desc->vsLen < 0 || (desc->vsLen > 0 && desc->vsData == nullptr)) {
         return failWithPtr<PipelinePtr>(kCreate, "vsData/vsLen mismatch");
     }
@@ -113,7 +78,6 @@ static PipelinePtr* createGraphicsPipelineErased(const mcdr_pipeline_desc* desc,
         d.psBytes.assign(first, first + desc->psLen);
     }
 
-    // --- colour targets ----------------------------------------------------
     if (desc->colorCount < 0 || desc->colorCount > kMaxColorTargets) {
         setLastErrorf(kCreate, "bad colorCount %d", static_cast<int>(desc->colorCount));
         return nullptr;
@@ -137,7 +101,6 @@ static PipelinePtr* createGraphicsPipelineErased(const mcdr_pipeline_desc* desc,
         dst.alphaOp = src.alphaOp;
     }
 
-    // --- depth state -------------------------------------------------------
     d.hasDepth = desc->hasDepth != 0;
     if (d.hasDepth) {
         d.depthFormat = desc->depth.depthFormat;
@@ -149,7 +112,6 @@ static PipelinePtr* createGraphicsPipelineErased(const mcdr_pipeline_desc* desc,
     d.cullEnabled = desc->cullEnabled != 0;
     d.polygonMode = desc->polygonMode;
 
-    // --- input elements ----------------------------------------------------
     if (desc->inputElementCount < 0 || desc->inputElementCount > kMaxInputElements) {
         setLastErrorf(kCreate, "bad inputElementCount %d", static_cast<int>(desc->inputElementCount));
         return nullptr;
@@ -167,16 +129,11 @@ static PipelinePtr* createGraphicsPipelineErased(const mcdr_pipeline_desc* desc,
         dst.offset = src.offset;
         dst.stride = src.stride;
         dst.stepRate = src.stepRate;
-        // NULL or "" keeps std::string empty, which createGraphicsPipeline()
-        // already understands as "fall back to TEXCOORD". This is the field the
-        // packed Java blob could not express at all: it had to ship the names in
-        // a separate trailing section and hope the ordering matched.
         if (src.semanticName != nullptr && src.semanticName[0] != '\0') {
             dst.semanticName = src.semanticName;
         }
     }
 
-    // --- root bindings -----------------------------------------------------
     if (desc->bindingCount < 0 || desc->bindingCount > kMaxPipelineBindings) {
         setLastErrorf(kCreate, "bad bindingCount %d", static_cast<int>(desc->bindingCount));
         return nullptr;
@@ -192,8 +149,6 @@ static PipelinePtr* createGraphicsPipelineErased(const mcdr_pipeline_desc* desc,
 
     const auto r = d3d12_mc::createGraphicsPipeline(d);
     if (!r) {
-        // The old bridge printed err to stderr and returned 0, so Java only ever
-        // saw "pipeline handle is 0". The message now survives the boundary.
         return failWithPtr<PipelinePtr>(kCreate, r.error().message);
     }
     return static_cast<PipelinePtr*>(*r);
@@ -201,28 +156,6 @@ static PipelinePtr* createGraphicsPipelineErased(const mcdr_pipeline_desc* desc,
 
 PipelinePtr* MCDR_CALL mcdr_dx12CreateGraphicsPipelineWithConstants(const mcdr_pipeline_desc* desc, int32_t byteSize) {
     return createGraphicsPipelineErased(desc, byteSize, nullptr);
-}
-
-PipelinePtr* MCDR_CALL mcdr_dx12CreateOitNormalizationPipelineV1(const mcdr_pipeline_desc* descriptor,
-    const mcdr_oit_normalization_pipeline_v1* certification) {
-    constexpr const char* operation = "mcdr_dx12CreateOitNormalizationPipelineV1";
-    if (!descriptor || !certification)
-        return mcdr::abi::failWithPtr<PipelinePtr>(operation, "Missing normalization descriptor or certification");
-    try {
-        std::shared_ptr<const void> provenance;
-        const int result = d3d12_mc::oit::createNormalizationPipelineCertification(*descriptor, *certification, &provenance);
-        if (result != 1 || !provenance) {
-            mcdr::abi::setLastErrorf(operation, "Normalization certification failed (%d)", result);
-            return nullptr;
-        }
-        return createGraphicsPipelineErased(descriptor, 0, nullptr, std::move(provenance));
-    } catch (const std::bad_alloc&) {
-        return mcdr::abi::failWithPtr<PipelinePtr>(operation, "Normalization pipeline allocation failed");
-    } catch (const std::exception& failure) {
-        return mcdr::abi::failWithPtr<PipelinePtr>(operation, failure.what());
-    } catch (...) {
-        return mcdr::abi::failWithPtr<PipelinePtr>(operation, "Normalization pipeline creation failed");
-    }
 }
 
 PipelinePtr* MCDR_CALL mcdr_dx12CreateOitLaneOperationPipelineV1(const mcdr_pipeline_desc* desc,
@@ -334,4 +267,4 @@ int32_t MCDR_CALL mcdr_dx12EnsureGraphicsState(mcdr_command_ctx* rawContext) {
     return 2;
 }
 
-}  // extern "C"
+}

@@ -64,7 +64,7 @@
          The project is C++23 (/std:c++latest) on MSVC v145 by requirement; the
          D3D12/DXGI headers are clean at /W3 under it. -->
     <ClCompile>
-      <WarningLevel>Level3</WarningLevel>
+      <WarningLevel>EnableAllWarnings</WarningLevel>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpplatest</LanguageStandard>
@@ -218,20 +218,20 @@
          plain C header on purpose: language-linkage (extern "C") entities cannot be
          exported from a C++ module, and the Kotlin side must keep including it. -->
     <ClInclude Include="include\mcdr_abi.h" />
+    <ClInclude Include="include\mcdr_oit_execution.h" />
     <ClInclude Include="include\mcdr_oit_shader.h" />
     <ClInclude Include="include\mcdr_oit_resolve_shader.h" />
     <ClInclude Include="include\mcdr_graphics_capture.h" />
     <ClInclude Include="include\mcdr_graphics_recording.h" />
     <ClInclude Include="include\mcdr_terrain_tile.h" />
     <ClInclude Include="include\mcdr_oit_budget.h" />
-    <ClInclude Include="include\mcdr_oit_execution.h" />
-    <ClInclude Include="include\mcdr_oit_normalization.h" />
     <ClInclude Include="include\mcdr_dlss_impl.h" />
     <ClInclude Include="include\mcdr_hdr_state.h" />
     <ClInclude Include="include\mcdr_rtx_support.h" />
     <ClInclude Include="include\mcdr_rt_state.h" />
     <ClInclude Include="include\mcdr_smaa_luts.h" />
     <ClInclude Include="include\mcdr_surface_opts_state.h" />
+    <ClInclude Include="include\mcdr_terrain_tile_adapter.h" />
     <ClInclude Include="include\mcdr_window_host.h" />
     <ClInclude Include="include\_d3d12_module_prelude.h" />
     <ClInclude Include="src\render\vanilla\vanilla_pass_scheduler.h" />
@@ -298,7 +298,6 @@
       <CompileAs>CompileAsCppModule</CompileAs>
     </ClCompile>
     <ClCompile Include="src\render\reconstruction\d3d12_oit_records.cpp" />
-    <ClCompile Include="src\render\reconstruction\d3d12_oit_normalization.cpp" />
     <ClCompile Include="src\c_abi\abi_oit.cpp" />
     <ClCompile Include="src\module\render\frameprep\d3d12_frameprep.cppm">
       <CompileAs>CompileAsCppModule</CompileAs>
@@ -348,8 +347,6 @@
     <None Include=".gitmodules" />
     <None Include="AGENTS.MD" />
     <None Include="cpp.hint" />
-    <None Include="docs\oit-4k-layout-proposal.md" />
-    <None Include="docs\oit-record-budget-native-status.md" />
     <None Include="docs\oit-records.md" />
     <None Include="docs\organization.md" />
     <None Include="docs\overview.md" />

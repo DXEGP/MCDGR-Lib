@@ -85,10 +85,6 @@ struct StageBindingV2 {
     ResourceRef renderTargets[5]{};
 };
 
-// V2 keeps the original Batch ABI intact and supplies the resources that are
-// required after the sealed OIT frame has handed ownership to native. Every
-// object is an opaque mcdr_object handle; native validates kind, range, state
-// and lifetime before recording anything.
 struct BatchV2 {
     uint32_t schemaVersion = 2;
     uint32_t structSize = 0;
@@ -169,7 +165,6 @@ struct ConstantAddresses {
 };
 using PacketPreparationV2 = Result (*)(void* context, const std::shared_ptr<const void>& packet,
     const BatchV2& batch, ConstantAddresses constants, std::shared_ptr<const void>* replayPlan);
-
 
 static_assert(sizeof(DrawRoute) == 16);
 static_assert(sizeof(Tile) == 16);

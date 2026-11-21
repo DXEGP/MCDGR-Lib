@@ -163,8 +163,6 @@ typedef struct mcdr_oit_execution_operation_receipt_v1 {
 #define MCDR_OIT_OPERATION_ADAPTER_UNSUPPORTED_BINDING 3u
 #define MCDR_OIT_OPERATION_ADAPTER_UNSUPPORTED_ADDRESSING 4u
 
-// A texture OBJECT_ONLY row can use the backing object handle as
-// resourceIdentity and leave ownerIdentity/ownerGeneration/contentVersion zero.
 typedef struct mcdr_oit_execution_resource_v2 {
     uint32_t schemaVersion, structSize, role, roleIndex;
     uint32_t access, contentRequirement, firstSubresource, subresourceCount;

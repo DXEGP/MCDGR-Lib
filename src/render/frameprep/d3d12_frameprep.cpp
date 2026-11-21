@@ -678,7 +678,7 @@ std::shared_ptr<Owner> createProgramOwner(void* context, uint64_t generation, ui
     return staged;
 }
 
-}  // namespace
+}
 
 int produceExposure(const ExposureRequest& request) {
     auto* context = static_cast<CommandContext*>(request.context);
@@ -1181,5 +1181,4 @@ void reset(void* context) {
     if (context) static_cast<CommandContext*>(context)->frameprepState.reset();
 }
 
-
-}  // namespace d3d12_mc::frameprep
+}

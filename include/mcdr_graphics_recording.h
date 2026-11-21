@@ -10,8 +10,6 @@ enum class ContentState : uint32_t { Unfrozen = 0, Frozen = 1, Unsupported = 2, 
 enum class AdapterState : uint32_t { Unavailable = 0, Ready = 1, UnsupportedTopology = 2, UnsupportedBinding = 3, UnsupportedShaderAddressing = 4 };
 enum class AdapterRegistration : uint32_t { Unavailable = 0, Registered = 1, Stale = 2 };
 enum class Completion : uint32_t { Succeeded, Failed };
-// Content capture is opt-in. Ordinary operation recording must remain a facts-only
-// path until an executor has a real adapter and will consume the frozen bindings.
 enum class ContentPolicy : uint32_t { FactsOnly = 0, FreezeBindings = 1 };
 enum class TileDrawScope : uint32_t { DepthBounds = 0, Transmittance = 1, Accumulate = 2, Seed, None };
 

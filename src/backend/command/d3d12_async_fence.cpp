@@ -15,27 +15,25 @@ UINT64 nowMsSteady() {
     return static_cast<UINT64>(duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
 }
 
-// HRESULT -> "0x%08X"（模块单元不得 import 设备模块，实现单元各自持有一份）。
 std::string hrText(HRESULT hr) {
     char buf[16]{};
     std::snprintf(buf, sizeof(buf), "0x%08X", static_cast<unsigned>(hr));
     return std::string(buf);
 }
 
-}  // namespace
+}
 
 AsyncFenceManager::~AsyncFenceManager() { shutdown(); }
 
 mcdr::Result<void> AsyncFenceManager::init(ID3D12Device* device, ID3D12CommandQueue* queue) {
     if (!device || !queue) return mcdr::err("AsyncFenceManager::init", "device/queue is null");
-    if (m_running.load()) return {};  // 已初始化
+    if (m_running.load()) return {};
 
     m_queue = queue;
     const HRESULT hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence));
     if (FAILED(hr)) {
         return mcdr::err("AsyncFenceManager::init", "CreateFence failed: " + hrText(hr));
     }
-    // manual-reset：登记新回调时唤醒监控线程。
     m_wakeEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!m_wakeEvent) {
         m_fence.Reset();
@@ -74,7 +72,6 @@ void AsyncFenceManager::registerCallback(UINT64 fenceValue, FenceCallback callba
         ++m_stats.totalCallbacks;
     }
 
-    // 已完成：立即回调（不进入监控线程）。
     if (isFenceComplete(fenceValue)) {
         {
             std::lock_guard<std::mutex> lk(m_statsMutex);
@@ -83,7 +80,6 @@ void AsyncFenceManager::registerCallback(UINT64 fenceValue, FenceCallback callba
         callback(fenceValue, true);
         return;
     }
-    // 未运行（未 init 或已 shutdown）：以失败收尾。
     if (!m_running.load()) {
         callback(fenceValue, false);
         return;
@@ -162,7 +158,6 @@ void AsyncFenceManager::processCompletedFences() {
             m_stats.avgWaitTimeUs = (m_stats.avgWaitTimeUs + c.waitedUs) / 2;
         }
     }
-    // 回调在锁外调用：允许回调内再次 register/unregister，避免自锁死。
     for (Completed& c : toInvoke) {
         if (c.callback) c.callback(c.value, c.success);
     }
@@ -172,7 +167,6 @@ void AsyncFenceManager::monitorThread() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 
     while (m_running.load()) {
-        // 找最早的待完成 fence value。
         UINT64 minValue = UINT64_MAX;
         {
             std::lock_guard<std::mutex> lk(m_mutex);
@@ -182,7 +176,6 @@ void AsyncFenceManager::monitorThread() {
         }
 
         if (minValue == UINT64_MAX) {
-            // 无待处理回调：睡到有新登记（wakeEvent）或超时再检查。
             WaitForSingleObject(m_wakeEvent, 100);
             ResetEvent(m_wakeEvent);
             continue;
@@ -199,7 +192,6 @@ void AsyncFenceManager::monitorThread() {
             continue;
         }
 
-        // 精准等待：fence 完成 或 有新登记 或 超时（用于重算最早值/处理超时）。
         HANDLE handles[2] = {ev, m_wakeEvent};
         DWORD r = WaitForMultipleObjects(2, handles, FALSE, 100);
         CloseHandle(ev);
@@ -209,7 +201,6 @@ void AsyncFenceManager::monitorThread() {
         } else if (r == WAIT_OBJECT_0 + 1) {
             ResetEvent(m_wakeEvent);
         }
-        // WAIT_TIMEOUT：直接下一轮重算（可能处理超时回调）。
     }
 }
 
@@ -254,4 +245,4 @@ void AsyncFenceManager::shutdown() {
     m_queue.Reset();
 }
 
-}  // namespace d3d12_mc
+}

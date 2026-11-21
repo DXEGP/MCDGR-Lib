@@ -250,7 +250,6 @@
     </ClCompile>
     <ClCompile Include="src\module\render\oit\d3d12_oit.cppm" />
     <ClCompile Include="src\render\reconstruction\d3d12_oit_records.cpp" />
-    <ClCompile Include="src\render\reconstruction\d3d12_oit_normalization.cpp" />
     <ClCompile Include="src\c_abi\abi_oit.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -316,9 +315,7 @@
     <None Include=".gitmodules">
       <Filter>Git</Filter>
     </None>
-    <None Include="docs\oit-4k-layout-proposal.md" />
     <None Include="docs\oit-records.md" />
-    <None Include="docs\oit-record-budget-native-status.md" />
     <None Include="docs\organization.md" />
     <None Include="docs\overview.md" />
     <None Include="docs\README_ZH.MD" />
@@ -357,13 +354,13 @@
     <ClInclude Include="src\render\vanilla\vanilla_pass_scheduler.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="include\mcdr_oit_execution.h" />
     <ClInclude Include="include\mcdr_oit_shader.h" />
     <ClInclude Include="include\mcdr_oit_resolve_shader.h" />
     <ClInclude Include="include\mcdr_graphics_capture.h" />
     <ClInclude Include="include\mcdr_graphics_recording.h" />
     <ClInclude Include="include\mcdr_terrain_tile.h" />
     <ClInclude Include="include\mcdr_oit_budget.h" />
-    <ClInclude Include="include\mcdr_oit_execution.h" />
-    <ClInclude Include="include\mcdr_oit_normalization.h" />
+    <ClInclude Include="include\mcdr_terrain_tile_adapter.h" />
   </ItemGroup>
 </Project>

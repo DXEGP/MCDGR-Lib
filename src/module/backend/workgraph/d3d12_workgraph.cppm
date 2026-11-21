@@ -34,10 +34,6 @@ mcdr::Result<void> dispatch(void* context, void* program, const void* records,
                            const uint64_t* rootAddresses, uint32_t addressCount);
 mcdr::Result<void> dispatchGpu(void* context, void* program, uint64_t inputAddress,
                               const uint64_t* rootAddresses, uint32_t addressCount);
-// Schema 1: D3D12_NODE_GPU_INPUT at inputOffset, with all referenced records
-// contained in the declared input span. The trusted GPU producer owns that
-// descriptor's contents; this validates/pins the resource spans, not GPU bytes.
-// No GPU virtual address is accepted from the host-facing caller.
 mcdr::Result<void> dispatchGpuBuffers(void* context, void* program, uint32_t inputSchema,
                                      void* inputBuffer, uint64_t inputOffset, uint64_t inputBytes,
                                      void* const* buffers, const uint64_t* offsets,

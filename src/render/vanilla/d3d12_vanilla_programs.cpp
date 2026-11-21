@@ -77,8 +77,7 @@ int validateProgramBoundary(void* opaqueContext) {
 
 std::string frameProgramsFailureText() { return programsFailure; }
 
-int prepareFramePrograms(void* opaqueContext, uint64_t generation, uint32_t flags, void** candidate,
-    const mcdr_oit_normalization_program_v1 (*normalization)[3]) {
+int prepareFramePrograms(void* opaqueContext, uint64_t generation, uint32_t flags, void** candidate) {
     if (!candidate) return recordProgramsFailure(MCDR_FRAME_PROGRAMS_INVALID_REQUEST);
     *candidate = nullptr;
     if (generation == 0 || (flags & ~3u) != 0)
@@ -97,7 +96,7 @@ int prepareFramePrograms(void* opaqueContext, uint64_t generation, uint32_t flag
     if (frameprep != MCDR_FRAME_PROGRAMS_SUCCESS) return recordProgramsFailure(frameprep);
     const auto display = display::preparePrograms(opaqueContext, generation, &prepared->display);
     if (display != MCDR_FRAME_PROGRAMS_SUCCESS) return recordProgramsFailure(display);
-    const auto oit = oit::preparePrograms(opaqueContext, generation, &prepared->oit, normalization);
+    const auto oit = oit::preparePrograms(opaqueContext, generation, &prepared->oit);
     if (oit != MCDR_FRAME_PROGRAMS_SUCCESS) return recordProgramsFailure(oit);
     *candidate = prepared.release();
     return recordProgramsFailure(MCDR_FRAME_PROGRAMS_SUCCESS);

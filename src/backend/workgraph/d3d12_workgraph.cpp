@@ -438,9 +438,6 @@ mcdr::Result<void> dispatchGpuBuffers(void* opaqueContext, void* opaqueProgram, 
             return mcdr::err("workgraph.dispatchGpuBuffers", "Misaligned GPU consumer buffer binding");
         }
     }
-    // All host-visible validation precedes pins and state mutations. GPU
-    // descriptor entry/count/address/stride are a trusted-producer contract;
-    // inspecting them on the CPU would require a synchronization/readback.
     retainObjectForRecording(context, input);
     transitionBufferTo(context, input, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     for (uint32_t index = 0; index < bindingCount; ++index) {
@@ -448,8 +445,6 @@ mcdr::Result<void> dispatchGpuBuffers(void* opaqueContext, void* opaqueProgram, 
         retainObjectForRecording(context, buffer);
         const auto kind = handle->program->bindings[index].kind;
         if (buffer->heapType != D3D12_HEAP_TYPE_UPLOAD) {
-            // Input can also be bound as CBV/SRV; preserve its required SRV
-            // access on the shared resource. UAV alias was rejected above.
             auto state = kind == 0 ? D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER :
                 (kind == 1 ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             if (buffer->resource.Get() == input->resource.Get()) state |= D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;

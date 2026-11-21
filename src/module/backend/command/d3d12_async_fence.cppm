@@ -1,20 +1,10 @@
-// dx12-mc 异步渲染基础设施（P33）：Fence 管理器
-//
-// 用 SetEventOnCompletion + 专用等待线程替代 1ms 轮询：
-//   - registerCallback(value, cb[, timeoutMs])：登记完成回调；
-//   - 监控线程用 WaitForMultipleObjects(fenceEvent, wakeEvent) 精准等待“最早的
-//     待完成 fence”，完成的 fence 一次性批量回调（不轮询）；
-//   - waitFence：阻塞等待（同样基于 SetEventOnCompletion，非轮询）；
-//   - signal：queue->Signal 便捷封装。
-// 回调在锁外调用，允许回调内部再次注册/注销，避免自锁死。
-
 module;
 
 #include "_d3d12_module_prelude.h"
 
 export module mcdr.d3d12.async_fence;
 
-import mcdr.error;  // mcdr::Result<T> / mcdr::Error / mcdr::err()：失败上报改走 std::expected
+import mcdr.error;
 
 export namespace d3d12_mc {
 
@@ -22,7 +12,6 @@ using Microsoft::WRL::ComPtr;
 
 class AsyncFenceManager {
 public:
-    // success=false 表示超时或被 shutdown 取消。
     using FenceCallback = std::function<void(UINT64 fenceValue, bool success)>;
 
     AsyncFenceManager() = default;
@@ -31,11 +20,9 @@ public:
     AsyncFenceManager(const AsyncFenceManager&) = delete;
     AsyncFenceManager& operator=(const AsyncFenceManager&) = delete;
 
-    // 创建内部 ID3D12Fence（初值 0）并启动监控线程。失败返回 mcdr::Error。
     mcdr::Result<void> init(ID3D12Device* device, ID3D12CommandQueue* queue);
     bool valid() const { return m_fence != nullptr; }
 
-    // queue->Signal(m_fence, fenceValue)。
     bool signal(UINT64 fenceValue);
     UINT64 completedValue() const;
 
@@ -44,7 +31,6 @@ public:
     void unregisterCallback(UINT64 fenceValue);
     bool isFenceComplete(UINT64 fenceValue) const;
 
-    // 阻塞等待 fence 达到 fenceValue；timeoutMs==0 表示无限等待。
     bool waitFence(UINT64 fenceValue, UINT64 timeoutMs);
 
     struct Stats {
@@ -56,14 +42,13 @@ public:
     };
     Stats getStats() const;
 
-    // 停止监控线程；未触发的回调以 success=false 收尾。可重复调用。
     void shutdown();
 
 private:
     struct PendingCallback {
         UINT64 fenceValue = 0;
         FenceCallback callback;
-        UINT64 timeoutMs = 0;   // 0 = 无超时
+        UINT64 timeoutMs = 0;
         UINT64 startTimeMs = 0;
     };
 
@@ -79,10 +64,10 @@ private:
 
     std::thread m_monitorThread;
     std::atomic<bool> m_running{false};
-    HANDLE m_wakeEvent = nullptr;  // manual-reset：有新登记时唤醒监控线程
+    HANDLE m_wakeEvent = nullptr;
 
     mutable Stats m_stats;
     mutable std::mutex m_statsMutex;
 };
 
-}  // namespace d3d12_mc
+}

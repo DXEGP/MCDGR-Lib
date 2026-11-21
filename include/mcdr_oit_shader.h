@@ -272,16 +272,13 @@ void AppendV1(McdrOitFragmentV1 fragment) {
         if (observed == packed) break;
         packed = observed;
     }
-    uint index = McdrOitAllocatorV1.Load(0u);
-    for (;;) {
-        if (index >= McdrOitExtent.z) {
-            McdrOitPixelsV1.InterlockedOr(pixelAddress + 4u, 1u << MCDR_OIT_PIXEL_STATUS_SHIFT, ignored);
-            return;
-        }
-        uint observed;
-        McdrOitAllocatorV1.InterlockedCompareExchange(0u, index, index + 1u, observed);
-        if (observed == index) break;
-        index = observed;
+    // One atomic per fragment: a compare-exchange retry loop on this single word serialises every
+    // captured fragment in the frame through the same cache line.
+    uint index = 0u;
+    McdrOitAllocatorV1.InterlockedAdd(0u, 1u, index);
+    if (index >= McdrOitExtent.z) {
+        McdrOitPixelsV1.InterlockedOr(pixelAddress + 4u, 1u << MCDR_OIT_PIXEL_STATUS_SHIFT, ignored);
+        return;
     }
     bool terrain = (fragment.primitiveIndex & 0x80000000u) != 0u;
     uint primitiveFlags = terrain ? McdrOitTerrainV2.Load(primitiveAddress + 44u) :

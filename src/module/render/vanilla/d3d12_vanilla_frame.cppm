@@ -111,15 +111,12 @@ using PostAdapter = int (*)(void* context, void* payload);
 std::string lastFailureText();
 uint64_t frozenResourceVersion(void* context);
 bool matchesFrozenFrame(void* context, const void* identity, uint64_t historyGeneration);
-int prepareFramePrograms(void* context, uint64_t generation, uint32_t flags, void** candidate,
-    const mcdr_oit_normalization_program_v1 (*normalization)[3] = nullptr);
+int prepareFramePrograms(void* context, uint64_t generation, uint32_t flags, void** candidate);
 int commitFramePrograms(void* context, void* candidate);
 void abortFramePrograms(void* candidate) noexcept;
 std::string frameProgramsFailureText();
 
 enum class ResourceAccess : uint32_t { Read = 1, Write = 2, ReadWrite = 3, Uav = 4 };
-// Tracked validates backend state; Adopt publishes a known SDK exit state without
-// emitting a transition. Unknown resource effects must be rejected before recording.
 enum class ExternalResourceState : uint32_t { Tracked, Adopt, Unknown };
 
 struct PassResourceUse {
@@ -137,11 +134,6 @@ struct PassResourceUse {
 
 struct DeclaredPassToken;
 
-
-// Version is the frozen frame resource manifest. UINT32_MAX/zero range means all;
-// otherwise range indexes include mip/layer/plane. graphicsEffects bit0 invalidates
-// graphics bindings, bit1 invalidates descriptor heap/tables. Provider internals
-// and history remain adapter-owned, outside these outer resource declarations.
 int beginFrame(void* context, const void* input, uint32_t byteCount);
 int registerWorldDepthV1(void* context, void* depth);
 bool matchesWorldDepthRegistrationV1(const void* context, const void* depth);

@@ -1,35 +1,20 @@
-// dx12-mc 异步渲染基础设施（P33）：主 Command List 执行器
-//
-// 职责：
-//   1. tryBeginFrame()：非阻塞开始一帧。目标 allocator 槽对应的上一帧若仍在
-//      GPU 执行（fence 未达），返回 false（调用方跳过本帧/下一帧重试），
-//      绝不阻塞主线程等待 GPU。
-//   2. addBundle()：聚合各 worker 录制好的 bundle。
-//   3. addResourceBarrier()/addTransition()：在主列表执行 barrier（bundle
-//      内禁止 barrier，故统一在此执行）。
-//   4. endFrame()：执行 barrier + ExecuteBundle 聚合，Close，提交到队列并 Signal。
-//
-// allocator ring：kFramesInFlight 组 (allocator, commandList)，逐帧轮转；
-// 复用某槽前要求该槽上一次提交的 fence 已完成（非阻塞判断）。
-
 module;
 
 #include "_d3d12_module_prelude.h"
 
 export module mcdr.d3d12.async_executor;
 
-import mcdr.error;  // mcdr::Result<T> / mcdr::Error / mcdr::err()：失败上报改走 std::expected
+import mcdr.error;
 
 namespace {
 
-// HRESULT -> "0x%08X"（模块单元不得 import 设备模块，实现单元各自持有一份）。
 std::string hrText(HRESULT hr) {
     char buf[16]{};
     std::snprintf(buf, sizeof(buf), "0x%08X", static_cast<unsigned>(hr));
     return std::string(buf);
 }
 
-}  // namespace
+}
 
 export namespace d3d12_mc {
 
@@ -45,31 +30,23 @@ public:
     MainCommandExecutor(const MainCommandExecutor&) = delete;
     MainCommandExecutor& operator=(const MainCommandExecutor&) = delete;
 
-    // heaps 传入父列表使用的 shader-visible 描述符堆（bundle 内禁止 SetDescriptorHeaps，
-    // 故必须在父列表 Reset 后立刻绑定）；可为 nullptr。失败返回 mcdr::Error。
     mcdr::Result<void> init(ID3D12Device* device, ID3D12CommandQueue* queue,
                             ID3D12DescriptorHeap* heaps = nullptr);
     bool valid() const { return m_slots[0].commandList != nullptr; }
 
-    // 非阻塞开始一帧；失败（上一帧未完成 / 已在帧中 / Reset 失败）返回 false。
     bool tryBeginFrame();
 
-    // 聚合待执行的 bundle（当前帧内有效）。
     bool addBundle(ID3D12GraphicsCommandList* bundle);
     bool addBundles(ID3D12GraphicsCommandList* const* bundles, UINT count);
 
-    // 主列表上的资源屏障（bundle 内禁止，故集中管理）。
     bool addResourceBarrier(const D3D12_RESOURCE_BARRIER& barrier);
     bool addTransition(ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after);
 
-    // 关闭主列表 -> 执行 barrier + bundle -> 提交 -> Signal。
-    // 返回本次提交的 fence 值；失败返回 0。
     UINT64 endFrame();
 
     bool isFrameInProgress() const { return m_frameInProgress; }
     UINT64 lastFenceValue() const { return m_lastFenceValue; }
 
-    // 阻塞等待 fence 达到 fenceValue；timeoutMs==0 表示无限等待。
     bool waitForFrame(UINT64 fenceValue, UINT64 timeoutMs);
 
     struct Stats {
@@ -92,7 +69,6 @@ private:
     ComPtr<ID3D12Device> m_device;
     ComPtr<ID3D12CommandQueue> m_queue;
     ComPtr<ID3D12Fence> m_fence;
-    // init 时记下的 shader-visible 描述符堆：父列表 Reset 后必须立刻重新绑定（bundle 内禁止 SetDescriptorHeaps）。
     ID3D12DescriptorHeap* m_heap = nullptr;
 
     FrameSlot m_slots[kFramesInFlight];
@@ -106,11 +82,6 @@ private:
     mutable std::mutex m_mutex;
     mutable Stats m_stats;
 };
-
-
-// ===========================================================================
-// 实现（原 dx12_async_executor.cpp，随头文件一并并入模块接口单元）
-// ===========================================================================
 
 mcdr::Result<void> MainCommandExecutor::init(ID3D12Device* device, ID3D12CommandQueue* queue,
                                             ID3D12DescriptorHeap* heaps) {
@@ -157,7 +128,6 @@ bool MainCommandExecutor::tryBeginFrame() {
     if (!valid() || m_frameInProgress) return false;
 
     FrameSlot& slot = m_slots[m_slotIndex];
-    // 非阻塞：该槽上一帧尚未完成则本帧跳过（绝不等待 GPU）。
     if (slot.submittedFenceValue > 0 && m_fence->GetCompletedValue() < slot.submittedFenceValue) {
         return false;
     }
@@ -167,7 +137,6 @@ bool MainCommandExecutor::tryBeginFrame() {
     hr = slot.commandList->Reset(slot.allocator.Get(), nullptr);
     if (FAILED(hr)) return false;
 
-    // bundle 内禁止 SetDescriptorHeaps，须由父列表设置（bundle 复用其堆）。
     ID3D12DescriptorHeap* heap = m_heap;
     if (heap) {
         ID3D12DescriptorHeap* heaps[] = {heap};
@@ -244,14 +213,12 @@ UINT64 MainCommandExecutor::endFrame() {
         bundles.swap(m_bundles);
     }
 
-    // barrier 统一在主列表执行（bundle 内禁止 barrier），须在 ExecuteBundle 之前。
     if (!barriers.empty()) {
         slot.commandList->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
         std::lock_guard<std::mutex> lk(m_mutex);
         m_stats.barriersExecuted += barriers.size();
     }
 
-    // 按加入顺序回放 bundle（顺序影响重叠/blend 几何的绘制结果）。
     for (ID3D12GraphicsCommandList* b : bundles) {
         if (b) slot.commandList->ExecuteBundle(b);
     }
@@ -297,4 +264,4 @@ MainCommandExecutor::Stats MainCommandExecutor::getStats() const {
     return m_stats;
 }
 
-}  // namespace d3d12_mc
+}

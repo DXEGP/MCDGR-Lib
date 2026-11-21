@@ -26,20 +26,11 @@ std::string hexHr(HRESULT hr) {
     return buf;
 }
 
-// 多行 DXC 诊断只留第一行（日志/JSON 里不宜铺开）。
-
-
-// 2026-10-14 现代化改造：从被调方的 mcdr::Error 里取出纯文本 message。
-// 调用方一律自己补 "函数名: " 前缀（与改造前 err 里直接写整句的习惯一致），
-// 因此这里刻意不用 mcdr::describe()——那会带出被调方的 where 前缀。
-
-
 bool fileExists(const std::wstring& path) {
     const DWORD attr = GetFileAttributesW(path.c_str());
     return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
-// MCDR.dll 自身所在目录（将来随模组分发 dxcompiler.dll/dxil.dll 时放这里）。
 std::wstring moduleDirectory() {
     HMODULE self = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
@@ -57,7 +48,6 @@ std::wstring moduleDirectory() {
     return slash == std::wstring::npos ? std::wstring() : dir.substr(0, slash);
 }
 
-// Windows SDK 里版本号最大的 bin\<ver>\x64（含 dxcompiler.dll/dxil.dll 的那一份）。
 std::wstring sdkDxcDirectory() {
     const std::wstring root = L"C:\\Program Files (x86)\\Windows Kits\\10\\bin\\";
     std::wstring best;
@@ -82,7 +72,6 @@ std::wstring sdkDxcDirectory() {
     return best.empty() ? std::wstring() : root + best + L"\\x64";
 }
 
-// 搜索顺序：MCDR_DXC_DIR 环境变量 → MCDR.dll 同目录 → SDK 最新版本。
 std::wstring findDxcDirectory() {
     std::vector<std::wstring> candidates;
     if (const wchar_t* env = _wgetenv(L"MCDR_DXC_DIR")) {
@@ -106,7 +95,6 @@ std::wstring findDxcDirectory() {
     return std::wstring();
 }
 
-
 std::wstring toWide(const std::string& s) {
     if (s.empty()) {
         return std::wstring();
@@ -120,11 +108,6 @@ std::wstring toWide(const std::string& s) {
     return out;
 }
 
-
-
-// 用 DXC 把 HLSL 编到 DXIL；成功时 outDxil 收到字节码，失败时返回 mcdr::Error（诊断首行）。
-// P72：入口点与源码长度都变成显式参数（原实现写死 entry="main" 且要求 NUL 结尾），
-// 这样 as_6_x / ms_6_x / ps_6_x 都可以走同一条编译路径。
 mcdr::Result<void> compileWithDxc(IDxcUtils* utils, IDxcCompiler3* compiler, const char* source,
                                   size_t sourceLen, const std::string& entry, const std::string& target,
                                   std::vector<uint8_t>& outDxil) {
@@ -174,17 +157,6 @@ mcdr::Result<void> compileWithDxc(IDxcUtils* utils, IDxcCompiler3* compiler, con
     return {};
 }
 
-// ---------------------------------------------------------------------------
-// P99（DXIL 磁盘缓存）：把 DXC 的编译结果缓存到磁盘。
-// 动机（用户报告「启动加载界面冻结 / 加载世界弹出瞬间帧时间骤增」）：DXC 每次编译
-// 实测 0.4-3 s 且全部落在主线程；一个会话要编译几十个着色器（主图形管线 + blit +
-// 速度/后处理），启动阶段累计停顿十几秒（P98 日志：519/697/553/423/726/496/2020/
-// 3079/2938 ms 等 gap）。同一份 HLSL + 同一 profile + 同一 dxcompiler.dll 产出的 DXIL
-// 是确定的，因此第二次启动可直接读回缓存、跳过 DXC。
-// 键 = FNV-1a 64(dxc 版本标签 + profile + entry + HLSL 源码)；dxcompiler.dll 被替换
-// （大小/时间戳变化）时键自动变化，旧缓存自然失效。
-// 开关：MCDR_DXIL_CACHE=0 关闭；MCDR_DXIL_CACHE_DIR=<dir> 指定目录（默认 MCDR.dll
-// 同目录下的 MCDR_dxil_cache）。
 std::wstring dxilCacheDirectory() {
     if (const char* env = std::getenv("MCDR_DXIL_CACHE_DIR")) {
         if (env[0] != '\0') return toWide(env);
@@ -251,7 +223,7 @@ bool dxilCacheLoad(const std::wstring& dir, uint64_t key, std::vector<uint8_t>& 
 
 void dxilCacheStore(const std::wstring& dir, uint64_t key, const std::vector<uint8_t>& dxil) {
     if (dir.empty() || dxil.empty()) return;
-    CreateDirectoryW(dir.c_str(), nullptr);  // 已存在时返回 ERROR_ALREADY_EXISTS，忽略
+    CreateDirectoryW(dir.c_str(), nullptr);
     static std::atomic<uint64_t> serial{0};
     const std::wstring target = dxilCachePath(dir, key);
     const std::wstring temporary = target + L"." + std::to_wstring(GetCurrentProcessId()) +
@@ -268,9 +240,8 @@ void dxilCacheStore(const std::wstring& dir, uint64_t key, const std::vector<uin
     }
 }
 
-}  // namespace
-#endif  // MCDR_HAVE_DXCAPI
-
+}
+#endif
 
 void probeDxc(DeviceContext::Capabilities& caps) {
 #if !MCDR_HAVE_DXCAPI
@@ -310,9 +281,6 @@ void probeDxc(DeviceContext::Capabilities& caps) {
 #endif
 }
 
-// ---------------------------------------------------------------------------
-// P72：可复用的 DXC 编译入口（mesh shader 基础）
-// ---------------------------------------------------------------------------
 mcdr::Result<void> compileHlslToDxil(const std::string& source, const std::string& entry,
                                     const std::string& profile, std::vector<uint8_t>& outDxil) {
 #if !MCDR_HAVE_DXCAPI
@@ -328,16 +296,8 @@ mcdr::Result<void> compileHlslToDxil(const std::string& source, const std::strin
         ComPtr<IDxcCompiler3> compiler;
         bool tried = false;
         std::string note;
-        // P99：dxcompiler.dll 的版本标签（大小 + 最后写入时间），参与 DXIL 缓存键。
         std::string versionTag;
     };
-    // 进程级单例；C++11 起函数内 static 初始化线程安全。
-    // 故意 new 出来且永不 delete（等价于"进程级泄漏"）：**绝不能让这个单例在进程退出时被析构**。
-    // 析构里对 DXC 的 COM 对象做 Release，会在 CRT 退出阶段触发 ucrtbase 的 fail-fast
-    // （事件日志：java.exe / 出错模块 ucrtbase.dll / 异常代码 0xc0000409 / BEX64），
-    // 于是"渲染完全正常、destroyDevice: done"之后整个进程仍以 -1073740791 退出，
-    // Gradle 报 BUILD FAILED。与 dxcore.dll 故意不 FreeLibrary（见下方 queryDxCoreInfo）同理。
-    // 取证：MCDR\src\core\d3d12_device.cpp 本函数 + _port\gsm68_*_info.err.log + 事件日志 Id=1000。
     static CachedDxc& cached = *new CachedDxc();
     if (!cached.tried) {
         cached.tried = true;
@@ -346,7 +306,6 @@ mcdr::Result<void> compileHlslToDxil(const std::string& source, const std::strin
             cached.note = "dxcompiler.dll not found (MCDR_DXC_DIR / MCDR.dll dir / Windows SDK)";
         } else {
             const std::wstring dllPath = dir + L"\\dxcompiler.dll";
-            // P99：记录 dxcompiler.dll 的大小+写入时间，作为 DXIL 缓存键的一部分。
             WIN32_FILE_ATTRIBUTE_DATA fad{};
             if (GetFileAttributesExW(dllPath.c_str(), GetFileExInfoStandard, &fad)) {
                 cached.versionTag = std::to_string(fad.nFileSizeHigh) + ":" +
@@ -386,7 +345,6 @@ mcdr::Result<void> compileHlslToDxil(const std::string& source, const std::strin
     }
     const std::string entryName = profile.starts_with("lib_") ? std::string() :
         (entry.empty() ? std::string("main") : entry);
-    // P99：先查 DXIL 磁盘缓存（键含 dxcompiler.dll 版本 + profile + entry + 源码）。
     const char* cacheEnv = std::getenv("MCDR_DXIL_CACHE");
     const bool cacheEnabled = !(cacheEnv != nullptr && cacheEnv[0] == '0');
     const std::wstring cacheDir = cacheEnabled ? dxilCacheDirectory() : std::wstring();
@@ -414,7 +372,6 @@ mcdr::Result<void> compileHlslToDxil(const std::string& source, const std::strin
                                        source.size(), entryName, profile, outDxil);
         if (!compiled) return std::unexpected<mcdr::Error>(std::move(compiled.error()));
     }
-    // P98：把编译耗时打出来——这是启动/入场冻结的主要来源之一（缓存未命中时 0.4-3 s）。
     dbgLogInfo("compileHlslToDxil: %s entry=%s -> %zu bytes DXIL (took %.0f ms)", profile.c_str(),
                entryName.c_str(), outDxil.size(), nowMs() - p98CompileT0);
     if (cacheEnabled) {
@@ -423,7 +380,6 @@ mcdr::Result<void> compileHlslToDxil(const std::string& source, const std::strin
     return {};
 #endif
 }
-
 
 mcdr::Result<void> validateCapturePixelShader(const void* bytecode, uint32_t bytes) {
 #if !MCDR_HAVE_DXCAPI
@@ -507,8 +463,6 @@ std::string graphicsShaderModelProfile() {
     return "6_9";
 }
 
-// 6.9 硬要求满足不了时的统一说明：把"缺 DXC / DXC 不认 6.9 / 设备只到 6.x"分开说清楚，
-// 否则现场只剩一句 CreatePipelineState 失败，排查要重新走一遍 P84 那套。
 std::string sm69RequirementText() {
     if (!deviceContext().caps.dxcAvailable) {
         return "shader model 6.9 is required and there is no SM 5.1 fallback any more, but "
@@ -518,7 +472,6 @@ std::string sm69RequirementText() {
            "reports SM " + std::string(shaderModelName(deviceContext().caps.shaderModel)) +
            " (Agility SDK 619's D3D12Core.dll must sit next to MCDR.dll and be opted in)";
 }
-
 
 std::string firstLine(const std::string& text) {
     const size_t nl = text.find_first_of("\r\n");

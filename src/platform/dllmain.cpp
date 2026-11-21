@@ -1,4 +1,3 @@
-// DLL 入口点
 extern "C" {
 
 #include <windows.h>
@@ -12,4 +11,4 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ulReasonForCall, LPVOID lpReserved)
     return TRUE;
 }
 
-}  // extern "C"
+}
